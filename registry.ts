@@ -1,117 +1,265 @@
-/**
- * Shared tool-call registry for pi-tool-tree.
- *
- * State lives on `globalThis` under a well-known symbol so every module
- * instance shares a single registry — including `withToolTree()` helpers
- * imported by other plugins through their own module resolution.
- */
+/** Shared live state for run-level tool trees. */
 
 export interface ToolCallRecord {
-	/** Unique tool execution id. */
 	toolCallId: string;
-	/** Tool name, when known. */
+	runId?: string;
 	toolName?: string;
-	/** Arguments snapshot (used to summarize the call line). */
 	args?: unknown;
-	/** Summarized call text (plain, single line). Written by the row's renderCall. */
 	callText?: string;
-	/** Result suffix (plain text, e.g. "14 matches"). Written by the row's renderResult. */
 	suffix?: string;
-	/** Group id: shared by all tool calls of one assistant message. */
-	groupId?: string;
-	/** Position within the sibling group (0-based). */
-	index?: number;
-	/** Sibling group size. */
-	total?: number;
-	/** Whether a collapsed thinking block visually precedes this tool group. */
-	hasThinkingBefore?: boolean;
-	/** Whether this call opted into tree rendering. */
-	treeEnabled?: boolean;
-	/** Whether execution is currently running. */
 	running?: boolean;
-	/** Wall-clock execution start for the live elapsed timer. */
-	startedAt?: number;
-	/** Wall-clock completion time, retained so the final duration stays visible. */
-	endedAt?: number;
-	/** Whether the result was an error. */
 	isError?: boolean;
+	startedAt?: number;
+	endedAt?: number;
+	partialResult?: any;
+	result?: any;
+	detailComponent?: any;
+	showDetails?: boolean;
 }
 
-const KEY = Symbol.for("pi-tool-tree.registry.v1");
+export interface ThinkingRecord {
+	thinkingId: string;
+	runId: string;
+	text: string;
+	startedAt: number;
+	endedAt?: number;
+	collapsed: boolean;
+}
+
+export type RunItem =
+	| { kind: "thinking"; id: string }
+	| { kind: "tool"; id: string };
+
+export interface RunRecord {
+	runId: string;
+	hasEntry: boolean;
+	active: boolean;
+	items: RunItem[];
+	activeThinkingId?: string;
+	activeToolId?: string;
+}
 
 interface Store {
+	runs: Map<string, RunRecord>;
 	calls: Map<string, ToolCallRecord>;
+	thinking: Map<string, ThinkingRecord>;
+	currentRunId?: string;
+	thinkingSequence: number;
 }
+
+const KEY = Symbol.for("pi-tool-tree.registry.v3");
 
 function store(): Store {
-	const g = globalThis as Record<symbol, unknown>;
-	if (!g[KEY]) {
-		g[KEY] = { calls: new Map<string, ToolCallRecord>() };
+	const global = globalThis as Record<symbol, unknown>;
+	if (!global[KEY]) {
+		global[KEY] = {
+			runs: new Map<string, RunRecord>(),
+			calls: new Map<string, ToolCallRecord>(),
+			thinking: new Map<string, ThinkingRecord>(),
+			thinkingSequence: 0,
+		};
 	}
-	return g[KEY] as Store;
-}
-
-export function getRecord(toolCallId: string): ToolCallRecord | undefined {
-	return store().calls.get(toolCallId);
-}
-
-export function updateRecord(toolCallId: string, patch: Partial<ToolCallRecord>): ToolCallRecord {
-	const calls = store().calls;
-	const existing = calls.get(toolCallId);
-	// `undefined` patch values mean "leave unchanged"
-	const clean: Partial<ToolCallRecord> = {};
-	for (const [k, v] of Object.entries(patch)) {
-		if (v !== undefined) (clean as Record<string, unknown>)[k] = v;
-	}
-	const merged: ToolCallRecord = { toolCallId, ...existing, ...clean };
-	calls.set(toolCallId, merged);
-	return merged;
-}
-
-/**
-	* Add tool calls to a tree group. Repeated streaming snapshots update existing
-	* calls; later assistant turns append new calls to the same agent-run group.
-	*/
-export function setGroup(
-	calls: Array<{ id: string; name?: string; args?: unknown }>,
-	hasThinkingBefore = false,
-	groupId = calls[0]?.id,
-): void {
-	if (calls.length === 0 || !groupId) return;
-
-	const orderedIds = groupMembers(groupId).map((record) => record.toolCallId);
-	for (const call of calls) {
-		if (!orderedIds.includes(call.id)) orderedIds.push(call.id);
-		updateRecord(call.id, {
-			groupId,
-			hasThinkingBefore,
-			toolName: call.name,
-			args: call.args,
-		});
-	}
-
-	const thinking =
-		hasThinkingBefore || orderedIds.some((id) => getRecord(id)?.hasThinkingBefore === true);
-	orderedIds.forEach((id, index) => {
-		updateRecord(id, {
-			groupId,
-			index,
-			total: orderedIds.length,
-			hasThinkingBefore: thinking,
-		});
-	});
-}
-
-/** All records belonging to a group, ordered by index. */
-export function groupMembers(groupId: string): ToolCallRecord[] {
-	const out: ToolCallRecord[] = [];
-	for (const rec of store().calls.values()) {
-		if (rec.groupId === groupId) out.push(rec);
-	}
-	out.sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
-	return out;
+	return global[KEY] as Store;
 }
 
 export function clearRegistry(): void {
-	store().calls.clear();
+	const state = store();
+	state.runs.clear();
+	state.calls.clear();
+	state.thinking.clear();
+	state.currentRunId = undefined;
+	state.thinkingSequence = 0;
+}
+
+export function beginRun(runId: string, hasEntry: boolean): RunRecord {
+	const state = store();
+	const previous = state.currentRunId ? state.runs.get(state.currentRunId) : undefined;
+	if (previous && previous.runId !== runId) collapseRun(previous.runId);
+	const run = state.runs.get(runId) ?? {
+		runId,
+		hasEntry,
+		active: true,
+		items: [],
+	};
+	run.hasEntry ||= hasEntry;
+	run.active = true;
+	state.runs.set(runId, run);
+	state.currentRunId = runId;
+	return run;
+}
+
+export function getRun(runId: string): RunRecord | undefined {
+	return store().runs.get(runId);
+}
+
+export function getCurrentRun(): RunRecord | undefined {
+	const state = store();
+	return state.currentRunId ? state.runs.get(state.currentRunId) : undefined;
+}
+
+export function settleCurrentRun(): void {
+	const state = store();
+	if (!state.currentRunId) return;
+	collapseRun(state.currentRunId);
+	const run = state.runs.get(state.currentRunId);
+	if (run) run.active = false;
+	state.currentRunId = undefined;
+}
+
+export function collapseRun(runId: string): void {
+	const state = store();
+	const run = state.runs.get(runId);
+	if (!run) return;
+	for (const item of run.items) {
+		if (item.kind === "thinking") {
+			const thinking = state.thinking.get(item.id);
+			if (thinking) {
+				thinking.collapsed = true;
+				thinking.endedAt ??= Date.now();
+			}
+		} else {
+			const call = state.calls.get(item.id);
+			if (call) {
+				call.showDetails = false;
+				if (call.running !== false) {
+					call.running = false;
+					call.endedAt ??= Date.now();
+				}
+			}
+		}
+	}
+	run.activeThinkingId = undefined;
+	run.activeToolId = undefined;
+}
+
+function addItem(run: RunRecord, item: RunItem): void {
+	if (!run.items.some((existing) => existing.kind === item.kind && existing.id === item.id)) {
+		run.items.push(item);
+	}
+}
+
+export function getTool(toolCallId: string): ToolCallRecord | undefined {
+	return store().calls.get(toolCallId);
+}
+
+export function updateTool(toolCallId: string, patch: Partial<ToolCallRecord>): ToolCallRecord {
+	const state = store();
+	const existing = state.calls.get(toolCallId);
+	const run = existing?.runId
+		? state.runs.get(existing.runId)
+		: state.currentRunId
+			? state.runs.get(state.currentRunId)
+			: undefined;
+	const clean: Partial<ToolCallRecord> = {};
+	for (const [key, value] of Object.entries(patch)) {
+		if (value !== undefined) (clean as Record<string, unknown>)[key] = value;
+	}
+	const merged: ToolCallRecord = {
+		toolCallId,
+		...existing,
+		...(run ? { runId: run.runId } : {}),
+		...clean,
+	};
+	state.calls.set(toolCallId, merged);
+	if (run) addItem(run, { kind: "tool", id: toolCallId });
+	return merged;
+}
+
+export function startTool(toolCallId: string, patch: Partial<ToolCallRecord>): ToolCallRecord {
+	const state = store();
+	const run = getCurrentRun();
+	if (run) {
+		for (const item of run.items) {
+			if (item.kind === "tool") {
+				const previous = state.calls.get(item.id);
+				if (previous) previous.showDetails = false;
+			}
+		}
+		run.activeToolId = toolCallId;
+	}
+	return updateTool(toolCallId, {
+		...patch,
+		running: true,
+		startedAt: Date.now(),
+		showDetails: true,
+	});
+}
+
+export function finishTool(toolCallId: string, patch: Partial<ToolCallRecord>): ToolCallRecord {
+	return updateTool(toolCallId, {
+		...patch,
+		running: false,
+		endedAt: Date.now(),
+		showDetails: true,
+	});
+}
+
+export function beginThinking(text = ""): ThinkingRecord | undefined {
+	const state = store();
+	const run = getCurrentRun();
+	if (!run?.hasEntry) return undefined;
+	if (run.activeThinkingId) {
+		const active = state.thinking.get(run.activeThinkingId);
+		if (active) {
+			if (text) active.text = text;
+			return active;
+		}
+	}
+
+	// A new thinking block collapses the previous thinking and active tool detail.
+	for (const item of run.items) {
+		if (item.kind === "thinking") {
+			const previous = state.thinking.get(item.id);
+			if (previous) previous.collapsed = true;
+		} else {
+			const call = state.calls.get(item.id);
+			if (call) call.showDetails = false;
+		}
+	}
+
+	const thinkingId = `${run.runId}:thinking:${++state.thinkingSequence}`;
+	const record: ThinkingRecord = {
+		thinkingId,
+		runId: run.runId,
+		text,
+		startedAt: Date.now(),
+		collapsed: false,
+	};
+	state.thinking.set(thinkingId, record);
+	addItem(run, { kind: "thinking", id: thinkingId });
+	run.activeThinkingId = thinkingId;
+	run.activeToolId = undefined;
+	return record;
+}
+
+export function updateActiveThinking(text: string): ThinkingRecord | undefined {
+	const run = getCurrentRun();
+	const record = run?.activeThinkingId ? store().thinking.get(run.activeThinkingId) : beginThinking(text);
+	if (record) record.text = text;
+	return record;
+}
+
+export function endActiveThinking(text?: string): ThinkingRecord | undefined {
+	const run = getCurrentRun();
+	if (!run?.activeThinkingId) return undefined;
+	const record = store().thinking.get(run.activeThinkingId);
+	if (record) {
+		if (text !== undefined) record.text = text;
+		record.endedAt = Date.now();
+	}
+	run.activeThinkingId = undefined;
+	return record;
+}
+
+export function getThinking(thinkingId: string): ThinkingRecord | undefined {
+	return store().thinking.get(thinkingId);
+}
+
+export function findThinkingByText(text: string): ThinkingRecord | undefined {
+	const state = store();
+	const records = Array.from(state.thinking.values());
+	for (let i = records.length - 1; i >= 0; i--) {
+		if (records[i].text === text) return records[i];
+	}
+	return undefined;
 }

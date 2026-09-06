@@ -1,20 +1,29 @@
 {
   "name": "pi-tool-tree",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Claude-style tool call tree rendering for pi — groups thinking and tools into compact agent-run trees",
   "license": "MIT",
   "type": "module",
   "main": "index.ts",
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "dependencies": {
     "pi-hashline-edit": "0.8.3"
   },
-  "bundledDependencies": ["pi-hashline-edit"],
+  "bundledDependencies": [
+    "pi-hashline-edit"
+  ],
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
   },
-  "keywords": ["pi-package", "pi", "extension", "tool-tree"]
+  "keywords": [
+    "pi-package",
+    "pi",
+    "extension",
+    "tool-tree"
+  ]
 }

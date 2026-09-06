@@ -1,18 +1,11 @@
 /**
- * pi-tool-tree — Claude-style tool call tree rendering for pi.
+ * pi-tool-tree — one live, compact transcript tree per agent run.
  *
- * Every tool call renders as a single terminal line. Calls across all assistant
- * turns in one agent run form a tree block:
- *
- *   ● refactor session-state module        ← assistant text (untouched)
- *    ╭─ Thinking... 2.4s
- *    ├─ ✓ read src/session/state.ts · 0.3s
- *    ├─ ✓ grep /setLoading/ in src/ → 14 matches · 0.6s
- *    ╰─ ✗ bash npm test → exit 1 · 3.1s
- *
- * Built-in tools are wrapped automatically (execution inherited). Third-party
- * plugin tools opt in with the exported withToolTree() helper. ctrl+o expands
- * result output (and restores custom tools' original renderers).
+ *   ╭─ Thinking... 2.4s
+ *   │  live reasoning tokens…
+ *   ├─ ✓ read src/session/state.ts · 0.3s
+ *   ╰─ … bash npm test · 1.8s
+ *      live command output…
  */
 import hashlineEdit from "pi-hashline-edit";
 import {
@@ -26,13 +19,31 @@ import {
 	createWriteTool,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
-import { clearRegistry, setGroup, updateRecord } from "./registry.ts";
-import { treeRenderCall, treeRenderResult, type ToolTreeSpec } from "./render.ts";
-import { formatDuration, summarizeCall, summarizeResult } from "./summarize.ts";
-
+import {
+	beginRun,
+	beginThinking,
+	clearRegistry,
+	endActiveThinking,
+	finishTool,
+	getCurrentRun,
+	settleCurrentRun,
+	startTool,
+	updateActiveThinking,
+	updateTool,
+} from "./registry.ts";
+import {
+	hideManagedThinking,
+	RunTreeComponent,
+	treeRenderCall,
+	treeRenderResult,
+	type ToolTreeSpec,
+} from "./render.ts";
+import { summarizeCall, summarizeResult } from "./summarize.ts";
 import { withToolTree } from "./with-tool-tree.ts";
+
 export { withToolTree, type WithToolTreeOptions } from "./with-tool-tree.ts";
 
+const RUN_ENTRY_TYPE = "pi-tool-tree-run";
 type ToolFactory = (cwd: string) => any;
 
 const TOOL_FACTORIES: Record<string, ToolFactory> = {
@@ -49,40 +60,38 @@ const TOOL_FACTORIES: Record<string, ToolFactory> = {
 const builtinCache = new Map<string, Record<string, any>>();
 
 function builtinsFor(cwd: string): Record<string, any> {
-	let defs = builtinCache.get(cwd);
-	if (!defs) {
-		defs = {};
+	let definitions = builtinCache.get(cwd);
+	if (!definitions) {
+		definitions = {};
 		for (const [name, factory] of Object.entries(TOOL_FACTORIES)) {
 			try {
-				defs[name] = factory(cwd);
+				definitions[name] = factory(cwd);
 			} catch {
 				// e.g. powershell unavailable on this platform
 			}
 		}
-		builtinCache.set(cwd, defs);
+		builtinCache.set(cwd, definitions);
 	}
-	return defs;
+	return definitions;
 }
 
 export default function piToolTree(pi: ExtensionAPI) {
 	wrapBuiltins(pi);
 	registerHashlineTools(pi);
-	wireRegistryEvents(pi);
-	wireThinkingRenderer(pi);
+	registerRunRenderer(pi);
+	wireLifecycle(pi);
 }
 
-/** Re-register built-in tools with tree rendering; execution stays built-in. */
+/** Re-register stock tools with execution unchanged and source rows hidden. */
 function wrapBuiltins(pi: ExtensionAPI) {
 	for (const name of Object.keys(TOOL_FACTORIES)) {
 		const base = builtinsFor(process.cwd())[name];
 		if (!base) continue;
-
 		const spec: ToolTreeSpec = {
 			toolName: name,
 			originalRenderCall: base.renderCall,
 			originalRenderResult: base.renderResult,
 		};
-
 		pi.registerTool({
 			name,
 			label: base.label ?? name,
@@ -90,8 +99,7 @@ function wrapBuiltins(pi: ExtensionAPI) {
 			parameters: base.parameters,
 			renderShell: "self",
 			execute(toolCallId: string, params: any, signal: any, onUpdate: any, ctx: any) {
-				const tool = builtinsFor(ctx.cwd)[name];
-				return tool.execute(toolCallId, params, signal, onUpdate);
+				return builtinsFor(ctx.cwd)[name].execute(toolCallId, params, signal, onUpdate);
 			},
 			renderCall(args: any, theme: any, context: any) {
 				return treeRenderCall(spec, args, theme, context);
@@ -103,7 +111,7 @@ function wrapBuiltins(pi: ExtensionAPI) {
 	}
 }
 
-/** Register hashline's read/edit/grep implementations through our renderer. */
+/** Preserve hashline read/edit/grep behavior while wrapping its render slots. */
 function registerHashlineTools(pi: ExtensionAPI) {
 	const treePi = new Proxy(pi as any, {
 		get(target, property, receiver) {
@@ -117,164 +125,142 @@ function registerHashlineTools(pi: ExtensionAPI) {
 	hashlineEdit(treePi);
 }
 
-/** Feed the shared registry from pi's lifecycle events. */
-function wireRegistryEvents(pi: ExtensionAPI) {
-	let activeRunId: string | undefined;
+function registerRunRenderer(pi: ExtensionAPI) {
+	pi.registerEntryRenderer<{ runId: string }>(RUN_ENTRY_TYPE, (entry, { expanded }, theme) => {
+		const runId = entry.data?.runId;
+		return runId ? new RunTreeComponent(runId, expanded, theme) : undefined;
+	});
+}
+
+function wireLifecycle(pi: ExtensionAPI) {
 	let runSequence = 0;
 
-	const recordGroups = (event: any) => {
-		const message = event?.message;
-		if (!message || message.role !== "assistant" || !Array.isArray(message.content)) return;
-		const calls = message.content.filter((c: any) => c?.type === "toolCall" && c.id);
-		if (calls.length === 0) return;
-		const hasThinking = message.content.some(
-			(c: any) => c?.type === "thinking" && typeof c.thinking === "string" && c.thinking.trim(),
-		);
-		activeRunId ??= `run:${Date.now()}:${++runSequence}`;
-		setGroup(
-			calls.map((c: any) => ({ id: c.id, name: c.name, args: c.arguments })),
-			hasThinking,
-			activeRunId,
-		);
-	};
-
-	pi.on("agent_start" as any, async () => {
-		activeRunId ??= `run:${Date.now()}:${++runSequence}`;
-	});
-	pi.on("agent_settled" as any, async () => {
-		activeRunId = undefined;
-	});
-	pi.on("message_update" as any, recordGroups as any);
-	pi.on("message_end" as any, recordGroups as any);
-
-	pi.on("tool_execution_start" as any, async (event: any) => {
-		updateRecord(event.toolCallId, {
-			toolName: event.toolName,
-			running: true,
-			startedAt: Date.now(),
-		});
-	});
-
-	pi.on("tool_execution_end" as any, async (event: any) => {
-		updateRecord(event.toolCallId, {
-			running: false,
-			isError: event.isError,
-			endedAt: Date.now(),
-		});
-	});
-
-	pi.on("session_start" as any, async (_event: any, ctx: any) => {
-		activeRunId = undefined;
+	pi.on("session_start", async (_event, ctx) => {
 		clearRegistry();
 		rebuildFromSession(ctx.sessionManager.getEntries());
 	});
+
+	pi.on("agent_start", async (_event, ctx) => {
+		// Auto-retries can emit another agent_start before agent_settled.
+		if (getCurrentRun()) return;
+		const runId = `run:${Date.now()}:${++runSequence}`;
+		const hasEntry = ctx.mode === "tui";
+		beginRun(runId, hasEntry);
+		if (hasEntry) pi.appendEntry(RUN_ENTRY_TYPE, { runId });
+	});
+
+	pi.on("agent_settled", async () => {
+		settleCurrentRun();
+	});
+
+	pi.on("message_update", async (event: any) => {
+		const message = event.message;
+		if (message?.role === "assistant" && Array.isArray(message.content)) {
+			for (const content of message.content) {
+				if (content?.type === "toolCall" && content.id) {
+					updateTool(content.id, {
+						toolName: content.name,
+						args: content.arguments,
+						callText: summarizeCall(content.name, content.arguments),
+					});
+				}
+			}
+		}
+
+		const stream = event.assistantMessageEvent;
+		if (stream?.type === "thinking_start") {
+			const text = thinkingAt(message, stream.contentIndex);
+			beginThinking(text);
+		} else if (stream?.type === "thinking_delta") {
+			updateActiveThinking(thinkingAt(message, stream.contentIndex));
+		} else if (stream?.type === "thinking_end") {
+			endActiveThinking(stream.content);
+		}
+	});
+
+	pi.on("message_end", async (event: any) => {
+		const message = event.message;
+		if (message?.role !== "assistant" || !Array.isArray(message.content)) return;
+		for (const content of message.content) {
+			if (content?.type === "toolCall" && content.id) {
+				updateTool(content.id, {
+					toolName: content.name,
+					args: content.arguments,
+					callText: summarizeCall(content.name, content.arguments),
+				});
+			}
+		}
+	});
+
+	pi.on("tool_execution_start", async (event: any) => {
+		startTool(event.toolCallId, {
+			toolName: event.toolName,
+			args: event.args,
+			callText: summarizeCall(event.toolName, event.args),
+		});
+	});
+
+	pi.on("tool_execution_update", async (event: any) => {
+		updateTool(event.toolCallId, { partialResult: event.partialResult, showDetails: true });
+	});
+
+	pi.on("tool_execution_end", async (event: any) => {
+		finishTool(event.toolCallId, {
+			toolName: event.toolName,
+			result: event.result,
+			partialResult: null,
+			isError: event.isError,
+			suffix: summarizeResult(event.toolName, event.result, event.isError) ?? "",
+		});
+	});
+
+	pi.registerMarkdownTransformer((markdown, options) => {
+		if (options.messageType !== "assistant-thinking") return markdown;
+		return hideManagedThinking(markdown, options.isStreaming);
+	});
 }
 
-/**
- * Rebuild the registry from persisted session entries so restored sessions
- * render the same collapsed trees instead of falling back to single rows.
- */
-function rebuildFromSession(entries: any[]) {
-	let restoredRunId: string | undefined;
-	for (const entry of entries) {
-		const message = entry?.message;
-		if (!message) continue;
+function thinkingAt(message: any, contentIndex: number): string {
+	const content = message?.content?.[contentIndex];
+	return content?.type === "thinking" && typeof content.thinking === "string" ? content.thinking : "";
+}
 
-		if (message.role === "user") {
-			restoredRunId = `restored:${entry.id}`;
+/** Rehydrate trees for sessions that already contain pi-tool-tree run entries. */
+function rebuildFromSession(entries: any[]) {
+	for (const entry of entries) {
+		if (entry?.type === "custom" && entry.customType === RUN_ENTRY_TYPE && entry.data?.runId) {
+			beginRun(entry.data.runId, true);
 			continue;
 		}
+		const message = entry?.message;
+		const run = getCurrentRun();
+		if (!message || !run?.hasEntry) continue;
+
 		if (message.role === "assistant" && Array.isArray(message.content)) {
-			const calls = message.content.filter((c: any) => c?.type === "toolCall" && c.id);
-			if (calls.length > 0) {
-				const hasThinking = message.content.some(
-					(c: any) =>
-						c?.type === "thinking" && typeof c.thinking === "string" && c.thinking.trim(),
-				);
-				const groupId = restoredRunId ?? `restored:${calls[0].id}`;
-				setGroup(
-					calls.map((c: any) => ({ id: c.id, name: c.name, args: c.arguments })),
-					hasThinking,
-					groupId,
-				);
-				for (const c of calls) {
-					updateRecord(c.id, { callText: summarizeCall(c.name, c.arguments) });
+			for (const content of message.content) {
+				if (content?.type === "thinking" && typeof content.thinking === "string" && content.thinking.trim()) {
+					const thinking = beginThinking(content.thinking.trim());
+					endActiveThinking(content.thinking.trim());
+					if (thinking) thinking.collapsed = true;
+				} else if (content?.type === "toolCall" && content.id) {
+					updateTool(content.id, {
+						toolName: content.name,
+						args: content.arguments,
+						callText: summarizeCall(content.name, content.arguments),
+						running: false,
+					});
 				}
 			}
 		} else if (message.role === "toolResult" && message.toolCallId) {
-			updateRecord(message.toolCallId, {
+			updateTool(message.toolCallId, {
 				toolName: message.toolName,
+				result: message,
 				running: false,
 				isError: message.isError,
 				suffix: summarizeResult(message.toolName, message, message.isError) ?? "",
+				showDetails: false,
 			});
 		}
 	}
-}
-
-/** Collapse visible reasoning into one timed tree row without changing context. */
-function wireThinkingRenderer(pi: ExtensionAPI) {
-	let startedAt: number | undefined;
-	let endedAt: number | undefined;
-	const finalizedDurations = new Map<string, number>();
-
-	pi.on("session_start" as any, async () => {
-		startedAt = undefined;
-		endedAt = undefined;
-		finalizedDurations.clear();
-	});
-
-	pi.on("message_start" as any, async (event: any) => {
-		if (event?.message?.role !== "assistant") return;
-		startedAt = undefined;
-		endedAt = undefined;
-	});
-
-	pi.on("message_update" as any, async (event: any) => {
-		const streamEvent = event?.assistantMessageEvent;
-		if (streamEvent?.type === "thinking_start") {
-			startedAt ??= Date.now();
-			endedAt = undefined;
-		} else if (streamEvent?.type === "thinking_end" && startedAt !== undefined) {
-			endedAt = Date.now();
-		}
-	});
-
-	pi.on("message_end" as any, async (event: any) => {
-		const message = event?.message;
-		if (message?.role !== "assistant") return;
-		if (startedAt !== undefined) {
-			const elapsed = (endedAt ?? Date.now()) - startedAt;
-			for (const run of thinkingRuns(message.content)) finalizedDurations.set(run, elapsed);
-		}
-		startedAt = undefined;
-		endedAt = undefined;
-	});
-
-	pi.registerMarkdownTransformer((markdown: string, options: any) => {
-		if (options.messageType !== "assistant-thinking") return markdown;
-
-		if (options.isStreaming && startedAt === undefined) startedAt = Date.now();
-		const elapsed =
-			finalizedDurations.get(markdown) ??
-			(startedAt === undefined ? undefined : (endedAt ?? Date.now()) - startedAt);
-		return `╭─ Thinking...${elapsed === undefined ? "" : ` ${formatDuration(elapsed)}`}`;
-	});
-}
-
-/** Match AssistantMessageComponent's grouping of consecutive thinking blocks. */
-function thinkingRuns(content: any): string[] {
-	if (!Array.isArray(content)) return [];
-	const runs: string[] = [];
-	for (let i = 0; i < content.length; i++) {
-		if (content[i]?.type !== "thinking") continue;
-		const blocks: string[] = [];
-		for (; i < content.length && content[i]?.type === "thinking"; i++) {
-			const text = typeof content[i].thinking === "string" ? content[i].thinking.trim() : "";
-			if (text) blocks.push(text);
-		}
-		i--;
-		if (blocks.length > 0) runs.push(blocks.join("\n\n"));
-	}
-	return runs;
+	settleCurrentRun();
 }

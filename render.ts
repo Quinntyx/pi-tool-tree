@@ -1,50 +1,55 @@
-import { Text } from "@earendil-works/pi-tui";
-import { getRecord, groupMembers, updateRecord, type ToolCallRecord } from "./registry.ts";
-import { formatDuration, summarizeCall, summarizeResult, truncate } from "./summarize.ts";
+import { Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import {
+	findThinkingByText,
+	getRun,
+	getThinking,
+	getTool,
+	updateActiveThinking,
+	updateTool,
+	type RunItem,
+	type ThinkingRecord,
+	type ToolCallRecord,
+} from "./registry.ts";
+import { formatDuration, summarizeCall, summarizeResult } from "./summarize.ts";
 
-
-/** Everything the row renderers need to know about one tool definition. */
 export interface ToolTreeSpec {
 	toolName: string;
-	/** Custom call summarizer; falls back to pi-tool-tree's per-tool summary. */
 	summarizeCall?: (args: any) => string | undefined;
-	/** Custom result summarizer; falls back to pi-tool-tree's per-tool summary. */
 	summarizeResult?: (result: any, isError: boolean) => string | undefined;
-	/** Original renderers, used when the row is expanded (ctrl+o). */
 	originalRenderCall?: ((args: any, theme: any, context: any) => any) | undefined;
 	originalRenderResult?: ((result: any, options: any, theme: any, context: any) => any) | undefined;
 }
 
-/**
- * renderCall slot: registers this call's summary in the shared registry and
- * returns the tree row component. In collapsed mode the FIRST sibling's row
- * draws the whole group's tree; later siblings' rows render zero lines.
- * In expanded mode (ctrl+o) the original renderer takes over, if any.
- */
+class EmptyComponent {
+	invalidate(): void {}
+	render(): string[] {
+		return [];
+	}
+}
+
+/** Hide the ordinary tool row when a run-level entry owns its rendering. */
 export function treeRenderCall(spec: ToolTreeSpec, args: any, theme: any, context: any) {
 	const custom = spec.summarizeCall?.(args);
 	const callText = custom !== undefined ? custom : summarizeCall(spec.toolName, args);
-	updateRecord(context.toolCallId, { toolName: spec.toolName, callText, treeEnabled: true });
+	const record = updateTool(context.toolCallId, {
+		toolName: spec.toolName,
+		args,
+		callText,
+	});
+	const run = record.runId ? getRun(record.runId) : undefined;
+	if (run?.hasEntry) return new EmptyComponent();
 
-	if (context.expanded) {
-		if (spec.originalRenderCall) return spec.originalRenderCall(args, theme, context);
-		// Built-ins rely on Pi's internal fallback renderer rather than exposing
-		// renderCall. Keep every expanded call visible as an individual tree row.
-		return new TreeRow(context.toolCallId, theme, true);
+	if (context.expanded && spec.originalRenderCall) {
+		return spec.originalRenderCall(args, theme, context);
 	}
-	return new TreeRow(context.toolCallId, theme);
+	return new LegacyToolRow(context.toolCallId, theme);
 }
 
-/**
- * renderResult slot: records the result suffix/status in the registry
- * (read live by TreeRow on the next frame) and renders nothing in collapsed
- * mode — the group row owns the whole tree. Expanded mode delegates to the
- * original renderer, or falls back to dimmed raw text.
- */
+/** Capture result/detail rendering for the run-level tree and hide the source row. */
 export function treeRenderResult(
 	spec: ToolTreeSpec,
 	result: any,
-	options: { expanded?: boolean },
+	options: { expanded?: boolean; isPartial?: boolean },
 	theme: any,
 	context: any,
 ) {
@@ -52,116 +57,192 @@ export function treeRenderResult(
 	const suffix = spec.summarizeResult
 		? spec.summarizeResult(result, isError)
 		: summarizeResult(spec.toolName, result, isError);
-	updateRecord(context.toolCallId, { suffix: suffix ?? "", isError, running: false });
+	let detailComponent: any;
+	if (spec.originalRenderResult) {
+		try {
+			detailComponent = spec.originalRenderResult(result, options, theme, context);
+		} catch {
+			detailComponent = undefined;
+		}
+	}
+	const record = updateTool(context.toolCallId, {
+		suffix: suffix ?? "",
+		isError,
+		partialResult: options.isPartial ? result : null,
+		result: options.isPartial ? undefined : result,
+		detailComponent,
+	});
+	const run = record.runId ? getRun(record.runId) : undefined;
+	if (run?.hasEntry) return new EmptyComponent();
 
 	if (options.expanded) {
-		if (spec.originalRenderResult) return spec.originalRenderResult(result, options, theme, context);
-		return expandedFallback(result, theme);
+		if (detailComponent) return detailComponent;
+		return rawResultComponent(result, theme);
 	}
 	return new Text("", 0, 0);
 }
 
-/** Dimmed raw output when a tool has no original renderResult to expand into. */
-function expandedFallback(result: any, theme: any): any {
-	const content = result?.content;
-	const text = Array.isArray(content)
-		? content
-				.filter((c: any) => c?.type === "text" && c.text)
-				.map((c: any) => c.text as string)
-				.join("\n")
-		: "";
-	if (!text) return new Text("", 0, 0);
-	const lines = text.split("\n").slice(0, 40).map((line) => theme.fg("toolOutput", line));
-	return new Text(lines.join("\n"), 0, 0);
+/** Display-only thinking transform: the run component renders managed thinking. */
+export function hideManagedThinking(markdown: string, isStreaming: boolean): string {
+	const record = isStreaming ? updateActiveThinking(markdown) : findThinkingByText(markdown);
+	return record && getRun(record.runId)?.hasEntry ? "" : markdown;
 }
 
-/**
- * The tree row. Reads the shared registry at render time so suffixes,
- * statuses, and glyphs stay live without explicit invalidation.
- *
- * When this row is NOT the first member of its sibling group it renders zero
- * lines: the first sibling's row draws the entire group's tree (that's what
- * keeps a parallel batch to a single block with one leading blank line).
- */
-class TreeRow {
-	private toolCallId: string;
+export class RunTreeComponent {
+	private runId: string;
+	private expanded: boolean;
 	private theme: any;
-	private individual: boolean;
 
-	constructor(toolCallId: string, theme: any, individual = false) {
-		this.toolCallId = toolCallId;
+	constructor(runId: string, expanded: boolean, theme: any) {
+		this.runId = runId;
+		this.expanded = expanded;
 		this.theme = theme;
-		this.individual = individual;
 	}
 
 	invalidate(): void {}
 
 	render(width: number): string[] {
-		const self = getRecord(this.toolCallId);
-		if (!self) return [];
-		if (this.individual) {
-			const total = self.total ?? 1;
-			const index = self.index ?? 0;
-			return [
-				this.memberLine(self, index === 0, index === total - 1, self.hasThinkingBefore ?? false, width),
-			];
-		}
-
-		const members = (self.groupId ? groupMembers(self.groupId) : [self]).filter((m) => m.treeEnabled);
-		if (members.length === 0) return [];
-		// Only the first tree-enabled sibling draws the tree. Unsupported custom
-		// tool blocks remain visible and cannot accidentally hide supported rows.
-		if (members[0].toolCallId !== this.toolCallId) return [];
-		const hasThinkingBefore = members.some((m) => m.hasThinkingBefore);
-		return members.map((m, i) =>
-			this.memberLine(m, i === 0, i === members.length - 1, hasThinkingBefore, width),
-		);
+		if (width <= 0) return [];
+		const run = getRun(this.runId);
+		if (!run) return [];
+		const items = run.items.filter((item) => this.resolveItem(item) !== undefined);
+		const lines: string[] = [];
+		items.forEach((item, index) => {
+			const glyph = items.length === 1 ? "╰─" : index === 0 ? "╭─" : index === items.length - 1 ? "╰─" : "├─";
+			if (item.kind === "thinking") {
+				const thinking = getThinking(item.id);
+				if (thinking) lines.push(...this.renderThinking(thinking, glyph, width));
+			} else {
+				const tool = getTool(item.id);
+				if (tool) lines.push(...this.renderTool(tool, glyph, width));
+			}
+		});
+		// Hard safety boundary: a custom component must never exceed terminal width.
+		return lines.map((line) => safeLine(line, width));
 	}
 
-	private memberLine(
-		m: ToolCallRecord,
-		isFirst: boolean,
-		isLast: boolean,
-		hasThinkingBefore: boolean,
-		width: number,
-	): string {
-		const theme = this.theme;
-		const glyph = isLast ? "╰─" : isFirst && !hasThinkingBefore ? "╭─" : "├─";
-		const status = m.running !== false
-			? theme.fg("muted", "…")
-			: m.isError
-				? theme.fg("error", "✗")
-				: theme.fg("dim", "✓");
+	private resolveItem(item: RunItem): ThinkingRecord | ToolCallRecord | undefined {
+		return item.kind === "thinking" ? getThinking(item.id) : getTool(item.id);
+	}
 
-		// Plain-text layout first so truncation is width-exact, then colorize.
-		let name = m.toolName ?? "tool";
-		let arg = m.callText ?? summarizeCall(m.toolName ?? "", m.args);
-		const elapsed = m.startedAt === undefined ? undefined : (m.endedAt ?? Date.now()) - m.startedAt;
-		let suffix = m.suffix ? ` → ${m.suffix}` : "";
+	private renderThinking(record: ThinkingRecord, glyph: string, width: number): string[] {
+		const elapsed = (record.endedAt ?? Date.now()) - record.startedAt;
+		const label = record.endedAt === undefined ? "Thinking..." : "Thought for";
+		const header = `${this.theme.fg("dim", glyph)} ${this.theme.italic(
+			this.theme.fg("thinkingText", `${label} ${formatDuration(elapsed)}`),
+		)}`;
+		const lines = [header];
+		if ((!record.collapsed || this.expanded) && record.text.trim()) {
+			lines.push(...this.nestedText(record.text, "thinkingText", width));
+		}
+		return lines;
+	}
+
+	private renderTool(record: ToolCallRecord, glyph: string, width: number): string[] {
+		const running = record.running !== false;
+		const status = running
+			? this.theme.fg("muted", "…")
+			: record.isError
+				? this.theme.fg("error", "✗")
+				: this.theme.fg("dim", "✓");
+		const elapsed = record.startedAt === undefined ? undefined : (record.endedAt ?? Date.now()) - record.startedAt;
+		let suffix = record.suffix ? ` → ${record.suffix}` : "";
 		if (elapsed !== undefined) suffix += ` · ${formatDuration(elapsed)}`;
-
-		// " " + subdued glyph + " " + status + " "
-		const prefixWidth = 1 + glyph.length + 1 + 1 + 1;
-		const bodyBudget = Math.max(0, width - prefixWidth);
-		const bodyWidth = () => name.length + (arg ? 1 + arg.length : 0) + suffix.length;
-
-		// Preserve tool name and result status; shrink the argument first.
-		if (bodyWidth() > bodyBudget && arg) {
-			const argBudget = bodyBudget - name.length - 1 - suffix.length;
-			arg = argBudget > 4 ? truncate(arg, argBudget) : "";
-		}
-		if (bodyWidth() > bodyBudget && suffix) {
-			const suffixBudget = bodyBudget - name.length;
-			suffix = suffixBudget > 4 ? truncate(suffix, suffixBudget) : "";
-		}
-		if (bodyWidth() > bodyBudget) {
-			name = bodyBudget > 2 ? truncate(name, bodyBudget) : "";
-			arg = "";
-			suffix = "";
-		}
-
-		const argText = arg ? ` ${theme.fg("accent", arg)}` : "";
-		const suffixText = suffix ? theme.fg("dim", suffix) : "";
-		return ` ${theme.fg("dim", glyph)} ${status} ${theme.fg("toolTitle", theme.bold(name))}${argText}${suffixText}`;
+		const name = record.toolName ?? "tool";
+		const arg = record.callText ?? summarizeCall(name, record.args);
+		const header = `${this.theme.fg("dim", glyph)} ${status} ${this.theme.fg(
+			"toolTitle",
+			this.theme.bold(name),
+		)}${arg ? ` ${this.theme.fg("accent", arg)}` : ""}${suffix ? this.theme.fg("dim", suffix) : ""}`;
+		const lines = [header];
+		if (record.showDetails || this.expanded) lines.push(...this.renderToolDetails(record, width));
+		return lines;
 	}
+
+	private renderToolDetails(record: ToolCallRecord, width: number): string[] {
+		const prefix = this.theme.fg("dim", "│  ");
+		const prefixWidth = visibleWidth(prefix);
+		const contentWidth = Math.max(1, width - prefixWidth);
+		let detailLines: string[] = [];
+
+		if (record.detailComponent?.render) {
+			try {
+				detailLines = record.detailComponent.render(contentWidth);
+			} catch {
+				detailLines = [];
+			}
+		}
+		if (detailLines.length === 0) {
+			const result = record.partialResult ?? record.result;
+			const text = textResult(result);
+			if (text) {
+				for (const sourceLine of text.split("\n")) {
+					const colored = this.theme.fg("toolOutput", sourceLine);
+					detailLines.push(...wrapTextWithAnsi(colored, contentWidth));
+				}
+			}
+		}
+
+		const limit = this.expanded ? 200 : 12;
+		const hidden = Math.max(0, detailLines.length - limit);
+		if (hidden > 0) detailLines = detailLines.slice(-limit);
+		const output = detailLines.map((line) => `${prefix}${truncateToWidth(line, contentWidth)}`);
+		if (hidden > 0) {
+			output.unshift(`${prefix}${this.theme.fg("dim", `… ${hidden} earlier lines`)}`);
+		}
+		return output;
+	}
+
+	private nestedText(text: string, color: string, width: number): string[] {
+		const prefix = this.theme.fg("dim", "│  ");
+		const contentWidth = Math.max(1, width - visibleWidth(prefix));
+		const lines: string[] = [];
+		for (const sourceLine of text.split("\n")) {
+			const styled = this.theme.italic(this.theme.fg(color, sourceLine));
+			for (const line of wrapTextWithAnsi(styled, contentWidth)) lines.push(`${prefix}${line}`);
+		}
+		return lines;
+	}
+}
+
+class LegacyToolRow {
+	private toolCallId: string;
+	private theme: any;
+	constructor(toolCallId: string, theme: any) {
+		this.toolCallId = toolCallId;
+		this.theme = theme;
+	}
+	invalidate(): void {}
+	render(width: number): string[] {
+		const record = getTool(this.toolCallId);
+		if (!record) return [];
+		const status = record.running !== false ? "…" : record.isError ? "✗" : "✓";
+		const text = ` ${this.theme.fg("dim", "╰─")} ${this.theme.fg(
+			record.isError ? "error" : "dim",
+			status,
+		)} ${this.theme.fg("toolTitle", this.theme.bold(record.toolName ?? "tool"))} ${this.theme.fg(
+			"accent",
+			record.callText ?? "",
+		)}`;
+		return [safeLine(text, width)];
+	}
+}
+
+function rawResultComponent(result: any, theme: any): Text {
+	const text = textResult(result);
+	return new Text(text ? theme.fg("toolOutput", text) : "", 0, 0);
+}
+
+function textResult(result: any): string {
+	return Array.isArray(result?.content)
+		? result.content
+				.filter((item: any) => item?.type === "text" && typeof item.text === "string")
+				.map((item: any) => item.text)
+				.join("\n")
+		: "";
+}
+
+function safeLine(line: string, width: number): string {
+	const safeWidth = Math.max(0, width);
+	return visibleWidth(line) <= safeWidth ? line : truncateToWidth(line, safeWidth);
 }
