@@ -23,10 +23,16 @@ export interface ToolCallRecord {
 	index?: number;
 	/** Sibling group size. */
 	total?: number;
+	/** Whether a collapsed thinking block visually precedes this tool group. */
+	hasThinkingBefore?: boolean;
 	/** Whether this call opted into tree rendering. */
 	treeEnabled?: boolean;
 	/** Whether execution is currently running. */
 	running?: boolean;
+	/** Wall-clock execution start for the live elapsed timer. */
+	startedAt?: number;
+	/** Wall-clock completion time, retained so the final duration stays visible. */
+	endedAt?: number;
 	/** Whether the result was an error. */
 	isError?: boolean;
 }
@@ -63,15 +69,36 @@ export function updateRecord(toolCallId: string, patch: Partial<ToolCallRecord>)
 }
 
 /**
- * Record sibling groups from one assistant message's tool calls.
- * All calls in a message share a groupId; index/total position them in
- * assistant source order (which is how pi emits tool_execution_start).
- */
-export function setGroup(calls: Array<{ id: string; name?: string; args?: unknown }>): void {
-	if (calls.length === 0) return;
-	const groupId = calls[0].id;
-	calls.forEach((c, i) => {
-		updateRecord(c.id, { groupId, index: i, total: calls.length, toolName: c.name, args: c.args });
+	* Add tool calls to a tree group. Repeated streaming snapshots update existing
+	* calls; later assistant turns append new calls to the same agent-run group.
+	*/
+export function setGroup(
+	calls: Array<{ id: string; name?: string; args?: unknown }>,
+	hasThinkingBefore = false,
+	groupId = calls[0]?.id,
+): void {
+	if (calls.length === 0 || !groupId) return;
+
+	const orderedIds = groupMembers(groupId).map((record) => record.toolCallId);
+	for (const call of calls) {
+		if (!orderedIds.includes(call.id)) orderedIds.push(call.id);
+		updateRecord(call.id, {
+			groupId,
+			hasThinkingBefore,
+			toolName: call.name,
+			args: call.args,
+		});
+	}
+
+	const thinking =
+		hasThinkingBefore || orderedIds.some((id) => getRecord(id)?.hasThinkingBefore === true);
+	orderedIds.forEach((id, index) => {
+		updateRecord(id, {
+			groupId,
+			index,
+			total: orderedIds.length,
+			hasThinkingBefore: thinking,
+		});
 	});
 }
 

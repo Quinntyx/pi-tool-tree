@@ -1,6 +1,6 @@
 import { Text } from "@earendil-works/pi-tui";
 import { getRecord, groupMembers, updateRecord, type ToolCallRecord } from "./registry.ts";
-import { summarizeCall, summarizeResult, truncate } from "./summarize.ts";
+import { formatDuration, summarizeCall, summarizeResult, truncate } from "./summarize.ts";
 
 
 /** Everything the row renderers need to know about one tool definition. */
@@ -102,7 +102,9 @@ class TreeRow {
 		if (this.individual) {
 			const total = self.total ?? 1;
 			const index = self.index ?? 0;
-			return [this.memberLine(self, index === 0, index === total - 1, total > 1, width)];
+			return [
+				this.memberLine(self, index === 0, index === total - 1, self.hasThinkingBefore ?? false, width),
+			];
 		}
 
 		const members = (self.groupId ? groupMembers(self.groupId) : [self]).filter((m) => m.treeEnabled);
@@ -110,8 +112,9 @@ class TreeRow {
 		// Only the first tree-enabled sibling draws the tree. Unsupported custom
 		// tool blocks remain visible and cannot accidentally hide supported rows.
 		if (members[0].toolCallId !== this.toolCallId) return [];
+		const hasThinkingBefore = members.some((m) => m.hasThinkingBefore);
 		return members.map((m, i) =>
-			this.memberLine(m, i === 0, i === members.length - 1, members.length > 1, width),
+			this.memberLine(m, i === 0, i === members.length - 1, hasThinkingBefore, width),
 		);
 	}
 
@@ -119,11 +122,11 @@ class TreeRow {
 		m: ToolCallRecord,
 		isFirst: boolean,
 		isLast: boolean,
-		multi: boolean,
+		hasThinkingBefore: boolean,
 		width: number,
 	): string {
 		const theme = this.theme;
-		const glyph = !multi ? "╰─" : isFirst ? "╭─" : isLast ? "╰─" : "├─";
+		const glyph = isLast ? "╰─" : isFirst && !hasThinkingBefore ? "╭─" : "├─";
 		const status = m.running !== false
 			? theme.fg("muted", "…")
 			: m.isError
@@ -133,9 +136,12 @@ class TreeRow {
 		// Plain-text layout first so truncation is width-exact, then colorize.
 		let name = m.toolName ?? "tool";
 		let arg = m.callText ?? summarizeCall(m.toolName ?? "", m.args);
+		const elapsed = m.startedAt === undefined ? undefined : (m.endedAt ?? Date.now()) - m.startedAt;
 		let suffix = m.suffix ? ` → ${m.suffix}` : "";
+		if (elapsed !== undefined) suffix += ` · ${formatDuration(elapsed)}`;
 
-		const prefixWidth = 1 + glyph.length + 1 + 1; // " " + glyph + status + " "
+		// " " + subdued glyph + " " + status + " "
+		const prefixWidth = 1 + glyph.length + 1 + 1 + 1;
 		const bodyBudget = Math.max(0, width - prefixWidth);
 		const bodyWidth = () => name.length + (arg ? 1 + arg.length : 0) + suffix.length;
 
@@ -156,6 +162,6 @@ class TreeRow {
 
 		const argText = arg ? ` ${theme.fg("accent", arg)}` : "";
 		const suffixText = suffix ? theme.fg("dim", suffix) : "";
-		return ` ${glyph}${status} ${theme.fg("toolTitle", theme.bold(name))}${argText}${suffixText}`;
+		return ` ${theme.fg("dim", glyph)} ${status} ${theme.fg("toolTitle", theme.bold(name))}${argText}${suffixText}`;
 	}
 }

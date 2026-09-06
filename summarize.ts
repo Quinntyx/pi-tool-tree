@@ -18,6 +18,16 @@ export function truncate(s: string, max: number): string {
 	return max > 1 ? s.slice(0, max - 1) + "…" : s.slice(0, max);
 }
 
+/** Compact human-readable elapsed time for thinking and tool rows. */
+export function formatDuration(milliseconds: number): string {
+	const seconds = Math.max(0.1, milliseconds / 1000);
+	if (seconds < 10) return `${seconds.toFixed(1)}s`;
+	if (seconds < 60) return `${Math.round(seconds)}s`;
+	const minutes = Math.floor(seconds / 60);
+	const remainder = Math.round(seconds % 60);
+	return `${minutes}m ${remainder}s`;
+}
+
 function textOf(result: { content?: Array<{ type: string; text?: string }> }): string {
 	if (!result?.content) return "";
 	return result.content

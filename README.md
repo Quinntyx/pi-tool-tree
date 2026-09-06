@@ -2,29 +2,40 @@
 
 Claude-style tool call tree rendering for [pi](https://github.com/earendil-works/pi-mono).
 
-Every tool call renders as a **single terminal line**. Sibling tool calls from
-one assistant message form a tree block, and successful output collapses away:
+Thinking and every tool call render as compact tree rows. Tool calls across all
+assistant turns in one agent run form a single tree, and successful output collapses away:
 
 ```
 ● refactor session-state module        ← assistant text (untouched)
- ╭─✓ read src/session/state.ts
- ├─✓ grep /setLoading/ in src/ → 14 matches
- ╰─✗ bash npm test → exit 1
+ ╭─ Thinking... 2.4s
+ ├─ ✓ read src/session/state.ts · 0.3s
+ ├─ ✓ grep /setLoading/ in src/ → 14 matches · 0.6s
+ ╰─ ✗ bash npm test → exit 1 · 3.1s
 ```
 
-- A whole parallel batch costs **one blank line + N lines** (previously each
-  tool row was boxed with padding above and below).
-- Result status is inlined (`→ 14 matches`, `exit 1`).
-- `ctrl+o` expands built-ins to raw result output and restores custom tools' original renderers.
+- A whole agent run costs **one blank line + N tool lines** (previously each
+  tool row was boxed separately with padding above and below).
+- Result status and elapsed time are inlined (`→ 14 matches · 0.6s`).
+- Thinking renders as `Thinking...` with a live streamed duration that freezes on `thinking_end`.
+- The thinking transform is display-only; original reasoning remains unchanged in session/model context.
+- `ctrl+o` expands built-in results and restores custom tools' original renderers.
 - Errors punch through with a red `✗` even when collapsed.
 
 ## Install
 
-```bash
-ln -s ~/docs/src/pi-tool-tree/main ~/.pi/agent/extensions/pi-tool-tree
+Add the git package to Pi's `settings.json`:
+
+```json
+{
+  "packages": ["git:git.quinntyx.dev/quinntyx/pi-tool-tree"],
+  "hideThinkingBlock": false
+}
 ```
 
-(or copy / npm-publish later — the package declares `"pi": { "extensions": ["./index.ts"] }`.)
+The package declares `"pi": { "extensions": ["./index.ts"] }`.
+It embeds `pi-hashline-edit@0.8.3` and registers its `read`, `edit`, and `grep` tools
+through the tree renderer. Remove any separate `npm:pi-hashline-edit` package entry
+to avoid duplicate tool registrations.
 
 ## Repository layout
 
@@ -47,9 +58,9 @@ git worktree add <name> -b <branch> main
 
 | File | Purpose |
 |------|---------|
-| `index.ts` | Entry point: wraps built-in tools, wires registry events |
+| `index.ts` | Entry point: wraps built-ins/hashline tools, thinking, and run lifecycle |
 | `registry.ts` | Shared tool-call state (globalThis-symbol keyed, so all module instances share it) |
-| `render.ts` | Tree row rendering; the first sibling draws the whole group, later siblings collapse to zero lines |
+| `render.ts` | Tree rendering; the first call draws the run, later call rows collapse to zero lines |
 | `summarize.ts` | Per-tool one-line call summaries and result suffixes |
 | `with-tool-tree.ts` | `withToolTree()` opt-in helper for third-party plugin tools |
 
@@ -81,9 +92,8 @@ pi.registerTool(withToolTree(myToolDefinition, {
 
 - Tree row components read the shared registry on every TUI render pass, so
   statuses, suffixes, and tree glyphs update without explicit invalidation.
-- The registry is fed from `message_update`/`message_end` (sibling groups in
-  assistant source order), `tool_execution_start`/`end` (running/error
-  status), and rebuilt from session entries on `session_start` so restored
-  sessions render collapsed trees too.
+- The registry is fed from `agent_start`/`agent_settled`, assistant messages, and
+  tool execution events. Calls append in assistant source order across every turn in
+  the run; restored sessions rebuild run boundaries from user-message entries.
 - Collapsed rows render zero-height output; pi hides rows whose renderers
   produce no lines, which is what merges a batch into one block.
