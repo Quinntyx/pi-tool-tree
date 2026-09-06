@@ -1,0 +1,12 @@
+{
+  "name": "pi-tool-tree",
+  "version": "0.1.0",
+  "description": "Claude-style tool call tree rendering for pi — collapses tool calls into compact sibling tree rows",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.ts",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "keywords": ["pi", "extension", "tool-tree"]
+}
