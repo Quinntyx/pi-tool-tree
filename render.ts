@@ -2,11 +2,6 @@ import { Text } from "@earendil-works/pi-tui";
 import { getRecord, groupMembers, updateRecord, type ToolCallRecord } from "./registry.ts";
 import { summarizeCall, summarizeResult, truncate } from "./summarize.ts";
 
-const ANSI_RE = /\x1b\[[0-9;]*m/g;
-
-function visibleWidth(s: string): number {
-	return s.replace(ANSI_RE, "").length;
-}
 
 /** Everything the row renderers need to know about one tool definition. */
 export interface ToolTreeSpec {
@@ -29,10 +24,13 @@ export interface ToolTreeSpec {
 export function treeRenderCall(spec: ToolTreeSpec, args: any, theme: any, context: any) {
 	const custom = spec.summarizeCall?.(args);
 	const callText = custom !== undefined ? custom : summarizeCall(spec.toolName, args);
-	updateRecord(context.toolCallId, { toolName: spec.toolName, callText });
+	updateRecord(context.toolCallId, { toolName: spec.toolName, callText, treeEnabled: true });
 
-	if (context.expanded && spec.originalRenderCall) {
-		return spec.originalRenderCall(args, theme, context);
+	if (context.expanded) {
+		if (spec.originalRenderCall) return spec.originalRenderCall(args, theme, context);
+		// Built-ins rely on Pi's internal fallback renderer rather than exposing
+		// renderCall. Keep every expanded call visible as an individual tree row.
+		return new TreeRow(context.toolCallId, theme, true);
 	}
 	return new TreeRow(context.toolCallId, theme);
 }
@@ -51,9 +49,10 @@ export function treeRenderResult(
 	context: any,
 ) {
 	const isError = result?.isError ?? context.isError ?? false;
-	const custom = spec.summarizeResult?.(result, isError);
-	const suffix = custom !== undefined ? custom : summarizeResult(spec.toolName, result, isError);
-	updateRecord(context.toolCallId, { suffix, isError, running: false });
+	const suffix = spec.summarizeResult
+		? spec.summarizeResult(result, isError)
+		: summarizeResult(spec.toolName, result, isError);
+	updateRecord(context.toolCallId, { suffix: suffix ?? "", isError, running: false });
 
 	if (options.expanded) {
 		if (spec.originalRenderResult) return spec.originalRenderResult(result, options, theme, context);
@@ -87,28 +86,45 @@ function expandedFallback(result: any, theme: any): any {
 class TreeRow {
 	private toolCallId: string;
 	private theme: any;
+	private individual: boolean;
 
-	constructor(toolCallId: string, theme: any) {
+	constructor(toolCallId: string, theme: any, individual = false) {
 		this.toolCallId = toolCallId;
 		this.theme = theme;
+		this.individual = individual;
 	}
 
 	invalidate(): void {}
 
 	render(width: number): string[] {
 		const self = getRecord(this.toolCallId);
-		const members = self?.groupId ? groupMembers(self.groupId) : self ? [self] : [];
+		if (!self) return [];
+		if (this.individual) {
+			const total = self.total ?? 1;
+			const index = self.index ?? 0;
+			return [this.memberLine(self, index === 0, index === total - 1, total > 1, width)];
+		}
+
+		const members = (self.groupId ? groupMembers(self.groupId) : [self]).filter((m) => m.treeEnabled);
 		if (members.length === 0) return [];
-		// Only the first sibling draws the group; the rest stay hidden.
+		// Only the first tree-enabled sibling draws the tree. Unsupported custom
+		// tool blocks remain visible and cannot accidentally hide supported rows.
 		if (members[0].toolCallId !== this.toolCallId) return [];
-		return members.map((m, i) => this.memberLine(m, i === members.length - 1, width));
+		return members.map((m, i) =>
+			this.memberLine(m, i === 0, i === members.length - 1, members.length > 1, width),
+		);
 	}
 
-	private memberLine(m: ToolCallRecord, isLast: boolean, width: number): string {
+	private memberLine(
+		m: ToolCallRecord,
+		isFirst: boolean,
+		isLast: boolean,
+		multi: boolean,
+		width: number,
+	): string {
 		const theme = this.theme;
-		const multi = (m.total ?? 1) > 1;
-		const glyph = multi ? (isLast ? "└─" : "├─") : "⎿";
-		const status = m.running
+		const glyph = !multi ? "╰─" : isFirst ? "╭─" : isLast ? "╰─" : "├─";
+		const status = m.running !== false
 			? theme.fg("muted", "…")
 			: m.isError
 				? theme.fg("error", "✗")
@@ -117,23 +133,29 @@ class TreeRow {
 		// Plain-text layout first so truncation is width-exact, then colorize.
 		let name = m.toolName ?? "tool";
 		let arg = m.callText ?? summarizeCall(m.toolName ?? "", m.args);
-		const suffix = m.suffix ? ` → ${m.suffix}` : "";
+		let suffix = m.suffix ? ` → ${m.suffix}` : "";
 
 		const prefixWidth = 1 + glyph.length + 1 + 1; // " " + glyph + status + " "
-		const budget = Math.max(0, width - 1 - prefixWidth);
-		// Reserve room for name + separator + suffix; arg gets what's left.
-		const fixed = visibleWidth(name) + 1 + suffix.length;
-		if (prefixWidth + fixed + arg.length > budget) {
-			const argBudget = budget - fixed;
+		const bodyBudget = Math.max(0, width - prefixWidth);
+		const bodyWidth = () => name.length + (arg ? 1 + arg.length : 0) + suffix.length;
+
+		// Preserve tool name and result status; shrink the argument first.
+		if (bodyWidth() > bodyBudget && arg) {
+			const argBudget = bodyBudget - name.length - 1 - suffix.length;
 			arg = argBudget > 4 ? truncate(arg, argBudget) : "";
 		}
-		if (prefixWidth + name.length + 1 + arg.length + suffix.length > budget) {
-			const nameBudget = budget - 1 - arg.length - suffix.length;
-			name = nameBudget > 2 ? truncate(name, nameBudget) : "";
+		if (bodyWidth() > bodyBudget && suffix) {
+			const suffixBudget = bodyBudget - name.length;
+			suffix = suffixBudget > 4 ? truncate(suffix, suffixBudget) : "";
+		}
+		if (bodyWidth() > bodyBudget) {
+			name = bodyBudget > 2 ? truncate(name, bodyBudget) : "";
+			arg = "";
+			suffix = "";
 		}
 
-		const argText = arg ? theme.fg("accent", arg) : "";
+		const argText = arg ? ` ${theme.fg("accent", arg)}` : "";
 		const suffixText = suffix ? theme.fg("dim", suffix) : "";
-		return ` ${glyph}${status} ${theme.fg("toolTitle", theme.bold(name))} ${argText}${suffixText}`;
+		return ` ${glyph}${status} ${theme.fg("toolTitle", theme.bold(name))}${argText}${suffixText}`;
 	}
 }

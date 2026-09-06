@@ -23,6 +23,8 @@ export interface ToolCallRecord {
 	index?: number;
 	/** Sibling group size. */
 	total?: number;
+	/** Whether this call opted into tree rendering. */
+	treeEnabled?: boolean;
 	/** Whether execution is currently running. */
 	running?: boolean;
 	/** Whether the result was an error. */

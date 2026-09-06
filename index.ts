@@ -5,13 +5,13 @@
  * (from one assistant message) form a tree block:
  *
  *   ● refactor session-state module        ← assistant text (untouched)
- *    ⎿✓ read src/session/state.ts
+ *    ╭─✓ read src/session/state.ts
  *    ├─✓ grep /setLoading/ in src/ → 14 matches
- *    └─✗ bash npm test → exit 1
+ *    ╰─✗ bash npm test → exit 1
  *
  * Built-in tools are wrapped automatically (execution inherited). Third-party
  * plugin tools opt in with the exported withToolTree() helper. ctrl+o expands
- * rows back to pi's full default rendering.
+ * result output (and restores custom tools' original renderers).
  */
 import {
 	createBashTool,
@@ -35,12 +35,12 @@ type ToolFactory = (cwd: string) => any;
 const TOOL_FACTORIES: Record<string, ToolFactory> = {
 	read: createReadTool,
 	bash: createBashTool,
-	powershell: createPowerShellTool,
 	edit: createEditTool,
 	write: createWriteTool,
 	grep: createGrepTool,
 	find: createFindTool,
 	ls: createLsTool,
+	...(process.platform === "win32" ? { powershell: createPowerShellTool } : {}),
 };
 
 const builtinCache = new Map<string, Record<string, any>>();
@@ -147,7 +147,7 @@ function rebuildFromSession(entries: any[]) {
 				toolName: message.toolName,
 				running: false,
 				isError: message.isError,
-				suffix: summarizeResult(message.toolName, message, message.isError),
+				suffix: summarizeResult(message.toolName, message, message.isError) ?? "",
 			});
 		}
 	}
