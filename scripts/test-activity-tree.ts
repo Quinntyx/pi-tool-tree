@@ -98,6 +98,12 @@ parent.addChild(terminal);
 parent.addChild(tool("four", "print('next')", true));
 output = plain(parent.render(100));
 assert.ok(output.indexOf("User boundary") < output.indexOf("print('next')"));
+// Malformed numeric path arguments must not crash rendering (glm-5.3-flash produced path: 5).
+const numeric = new ToolExecutionComponent("read", "bad-args", { path: 5, offset: 1 } as any, {}, undefined as any, ui as any, process.cwd());
+numeric.markExecutionStarted();
+numeric.updateResult({ content: [{ type: "text", text: "ok" }], isError: false } as any, false);
+parent.addChild(numeric);
+assert.doesNotThrow(() => plain(parent.render(100)), "numeric path args must not crash");
 for (const width of [1, 2, 4, 8, 20, 60, 100, 145]) {
 	for (const line of parent.render(width)) assert.ok(visibleWidth(line) <= width, `overflow at ${width}: ${visibleWidth(line)}`);
 }

@@ -624,6 +624,15 @@ function removeGroupedToolPrefix(line: string, groupedLabel?: string): string {
 function getToolArgSummary(tool: any): string {
 	const args = tool?.args ?? {};
 	const name = getToolName(tool);
+	try {
+		return getToolArgSummaryUnsafe(args, name);
+	} catch {
+		// Malformed tool args must never crash the render loop.
+		return "";
+	}
+}
+
+function getToolArgSummaryUnsafe(args: any, name: string): string {
 	if (name === "code_execution") return summarizeText(String(args.code ?? "").trim().split("\n")[0] ?? "", 100);
 	if (name === "read") {
 		let value = shortPath(process.cwd(), args.path ?? "");
@@ -2173,9 +2182,23 @@ function patchToolExecutionRenderers(): void {
 }
 
 function shortPath(cwd: string, filePath: string): string {
+	// Tool arguments come straight from the model — any shape can arrive, and a
+	// throw here crashes the whole TUI render loop.
+	if (typeof filePath !== "string") {
+		if (filePath === undefined || filePath === null) return "";
+		try {
+			filePath = String(filePath);
+		} catch {
+			return "";
+		}
+	}
 	if (!filePath) return "";
-	const rel = relative(cwd, filePath);
-	if (!rel.startsWith("..") && !rel.startsWith("/")) return rel || ".";
+	try {
+		const rel = relative(cwd, filePath);
+		if (!rel.startsWith("..") && !rel.startsWith("/")) return rel || ".";
+	} catch {
+		// Not a comparable path — fall through to the literal value below.
+	}
 	const home = process.env.HOME ?? "";
 	return home ? filePath.replace(home, "~") : filePath;
 }
