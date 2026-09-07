@@ -35,7 +35,6 @@ import {
 	Markdown,
 	ProcessTerminal,
 	Spacer,
-	sliceByColumn,
 	Text,
 	truncateToWidth,
 	visibleWidth,
@@ -743,9 +742,11 @@ function assistantActivityRows(component: any, width: number): ActivityTreeRow[]
 				cached = { text: run.text, body: new ThinkingParagraph(run.text, component.markdownTheme) };
 				thinkingBodyCache.set(child, cached);
 			}
-			// ThinkingParagraph owns a three-cell ∴ gutter; replace it with the tree gutter.
+			// Render the body without the ∴ gutter; the tree supplies its own gutter.
+			// (Column-slicing the gutter line drags its trailing ANSI reset into the
+			// kept text, turning the first body line back to the default color.)
 			const bodyWidth = Math.max(1, width - 5);
-			lines.push(...cached.body.render(bodyWidth + 3).map((line) => sliceByColumn(line, 3, bodyWidth)));
+			lines.push(...cached.body.render(bodyWidth, { noGutter: true }));
 		}
 		rows.push({ kind: "activity", lines });
 	}
@@ -1659,6 +1660,7 @@ class ThinkingParagraph {
 	private cachedWidth?: number;
 	private cachedLines?: string[];
 	private chromeEpoch = -1;
+	private cachedNoGutter?: boolean;
 
 	constructor(
 		text: string,
@@ -1700,13 +1702,16 @@ class ThinkingParagraph {
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
 		this.chromeEpoch = -1;
+		this.cachedNoGutter = undefined;
 	}
 
-	render(width: number): string[] {
+	render(width: number, options?: { noGutter?: boolean }): string[] {
+		const noGutter = options?.noGutter === true;
 		if (
 			this.cachedLines
 			&& this.cachedWidth === width
 			&& this.chromeEpoch === _toolBranchVisualEpoch
+			&& this.cachedNoGutter === noGutter
 		) {
 			return this.cachedLines;
 		}
@@ -1726,7 +1731,15 @@ class ThinkingParagraph {
 			this.cachedLines = [clampLineWidth(` ${prefix} `, safeWidth)];
 			return this.cachedLines;
 		}
-		const lines = sanitizeRenderedTextBlockLines(md.render(safeWidth - PREFIX_W), safeWidth - PREFIX_W);
+		const bodyWidth = noGutter ? safeWidth : safeWidth - PREFIX_W;
+		const lines = sanitizeRenderedTextBlockLines(md.render(bodyWidth), bodyWidth);
+		if (noGutter) {
+			this.cachedWidth = width;
+			this.cachedNoGutter = true;
+			this.cachedLines = lines.map((line) => clampLineWidth(line, safeWidth));
+			this.chromeEpoch = _toolBranchVisualEpoch;
+			return this.cachedLines;
+		}
 		let symbolPlaced = false;
 		const rendered = lines.map((line: string) => {
 			if (!symbolPlaced && stripAnsi(line).trim()) {

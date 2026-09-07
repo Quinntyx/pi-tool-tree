@@ -78,7 +78,16 @@ assert.ok(!output.includes("✓ ✓") && !output.includes("! !"), "status marker
 assert.ok(!output.includes("Reasoning about"), "completed thinking collapses by default");
 assert.equal(output.split("\n").filter((line) => /[├╰] .*Code Execution/.test(line)).length, 3);
 assistant.setHideThinkingBlock(false);
-assert.ok(plain(parent.render(100)).includes("Reasoning about"), "Ctrl+T still expands thoughts");
+const expandedOutput = plain(parent.render(100));
+assert.ok(expandedOutput.includes("Reasoning about"), "Ctrl+T still expands thoughts");
+// Every thinking body line must carry the gray color (the ∴-gutter slice used to
+// drag its ANSI reset onto the first line, turning it black).
+const gray = "\x1b[38;2;";
+for (const line of parent.render(100)) {
+	if (line.includes("Reasoning about") && !line.includes(gray)) {
+		throw new Error(`thinking body line lost its gray color: ${JSON.stringify(line)}`);
+	}
+}
 assistant.setHideThinkingBlock(true);
 assert.ok(!plain(parent.render(100)).includes("Reasoning about"));
 assert.deepEqual(thought.content, [{ type: "thinking", thinking: "Reasoning about 界 and 👩‍💻" }], "grouping must not mutate message content");
