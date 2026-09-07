@@ -671,9 +671,6 @@ function getCompactToolLine(tool: any, width: number, groupedLabel?: string, sho
 	return alignTrailingMarkedLine(content || getToolName(tool), width);
 }
 
-/** Extra gutter separating activity trees from regular assistant prose. */
-const ACTIVITY_TREE_INDENT = 4;
-
 interface ActivityTreeRow {
 	kind: "activity" | "content";
 	lines: string[];
@@ -738,7 +735,7 @@ function assistantActivityRows(component: any, width: number): ActivityTreeRow[]
 				thinkingBodyCache.set(child, cached);
 			}
 			// ThinkingParagraph owns a three-cell ∴ gutter; replace it with the tree gutter.
-			const bodyWidth = Math.max(1, width - 5 - ACTIVITY_TREE_INDENT);
+			const bodyWidth = Math.max(1, width - 5);
 			lines.push(...cached.body.render(bodyWidth + 3).map((line) => sliceByColumn(line, 3, bodyWidth)));
 		}
 		rows.push({ kind: "activity", lines });
@@ -747,7 +744,7 @@ function assistantActivityRows(component: any, width: number): ActivityTreeRow[]
 }
 
 function toolActivityLines(tool: any, width: number): string[] {
-	const childWidth = Math.max(1, width - 5 - ACTIVITY_TREE_INDENT);
+	const childWidth = Math.max(1, width - 5);
 	const status = getToolStatusForGroup(tool);
 	const showDetails = tool.expanded === true || (tool.isPartial === true && tool.executionStarted === true);
 	// Rendering the actual tool component preserves native partial-result animations.
@@ -766,7 +763,7 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 	const output: string[] = [];
 	let pending: string[][] = [];
 	const flush = () => {
-		const margin = " ".repeat(1 + ACTIVITY_TREE_INDENT);
+		const margin = " ";
 		const connector = activityTreeBranchAnsi();
 		for (let i = 0; i < pending.length; i++) {
 			const last = i === pending.length - 1;
@@ -798,14 +795,7 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 				// Empty assistant shells don't split a thinking/tool sequence.
 				if (child instanceof AssistantMessageComponent && row.lines.every((line: string) => isBlankLine(line))) continue;
 				flush();
-				if (child instanceof AssistantMessageComponent) {
-					const prose = trimRenderedBlankLines(row.lines);
-					if (prose.length === 0) continue;
-					if (output.length === 0 || !isBlankLine(output[output.length - 1])) output.push("");
-					output.push(...prose, "");
-				} else {
-					output.push(...row.lines);
-				}
+				output.push(...row.lines);
 			}
 		}
 	}
@@ -1296,21 +1286,11 @@ const MATH_COMMANDS: Record<string, string> = {
 
 const COPY_SAFE_MARKDOWN_LINKS_FLAG = Symbol.for("pi-claude-style-tools:copy-safe-markdown-links");
 
-/** Unordered list marker: monochrome ◉ (fisheye) instead of "- " (thinking blocks skip this). */
-function assistantListBulletMarker(marker: string): string {
-	if (marker.startsWith("- ")) return `◉ ${marker.slice(2)}`;
-	return marker;
-}
-
 function copySafeMarkdownTheme(theme: MarkdownThemeLike): MarkdownThemeLike {
-	const listBullet = theme.listBullet;
 	return {
 		...theme,
 		link: (text: string) => stripAnsi(text),
 		linkUrl: (text: string) => stripAnsi(text),
-		listBullet: listBullet
-			? (marker: string) => listBullet(assistantListBulletMarker(marker))
-			: (marker: string) => assistantListBulletMarker(marker),
 	};
 }
 
@@ -1636,7 +1616,7 @@ class DottedParagraph {
 			if (isCodeBoxChromeLine(line)) return `   ${line}`;
 			if (!dotPlaced) {
 				dotPlaced = true;
-				return ` ● ${line}`;
+				return ` ${activityTreeBranchAnsi()}●${TRANSPARENT_RESET} ${line}`;
 			}
 			return `   ${line}`;
 		}).map((line) => {

@@ -72,8 +72,8 @@ assistant.updateContent(after, false);
 parent.addChild(tool("three", "print('third')", true, true));
 output = plain(parent.render(100));
 assert.ok(output.includes("├ Thought for"));
-assert.ok(output.split("\n").some((line) => /^ {5}[├╰] ✓ Code Execution/.test(line)), "success uses an indented checkmark");
-assert.ok(output.split("\n").some((line) => /^ {5}[├╰] ! Code Execution/.test(line)), "failure uses an indented exclamation mark");
+assert.ok(output.split("\n").some((line) => /^ [├╰] ✓ Code Execution/.test(line)), "success uses a checkmark");
+assert.ok(output.split("\n").some((line) => /^ [├╰] ! Code Execution/.test(line)), "failure uses an exclamation mark");
 assert.ok(!output.includes("✓ ✓") && !output.includes("! !"), "status markers must not be duplicated");
 assert.ok(!output.includes("Reasoning about"), "completed thinking collapses by default");
 assert.equal(output.split("\n").filter((line) => /[├╰] .*Code Execution/.test(line)).length, 3);
@@ -90,10 +90,8 @@ const mixed = new AssistantMessageComponent({
 parent.addChild(mixed);
 output = plain(parent.render(100));
 assert.ok(output.lastIndexOf("Visible answer") > output.lastIndexOf("Thought for"));
-const proseLines = output.split("\n");
-const proseIndex = proseLines.findIndex((line) => line.includes("Visible answer"));
-assert.equal(proseLines[proseIndex - 1].trim(), "", "blank line above prose");
-assert.equal(proseLines[proseIndex + 1].trim(), "", "blank line below prose");
+// Prose keeps its original spacing (no injected blank lines) and its dot follows the tree gray.
+assert.ok(output.split("\n").some((line) => / ● /.test(line)), "prose paragraph dot present");
 assert.equal(plain(parent.render(100)), output, "repeated rendering must not accumulate spacing");
 const terminal = new Text("User boundary", 0, 0);
 parent.addChild(terminal);
@@ -103,10 +101,20 @@ assert.ok(output.indexOf("User boundary") < output.indexOf("print('next')"));
 for (const width of [1, 2, 4, 8, 20, 60, 100, 145]) {
 	for (const line of parent.render(width)) assert.ok(visibleWidth(line) <= width, `overflow at ${width}: ${visibleWidth(line)}`);
 }
+// Default Markdown bullets are untouched (no ◉ takeover).
+const listMessage = new AssistantMessageComponent({
+	role: "assistant", stopReason: "stop",
+	content: [{ type: "text", text: "- first item\n- second item" }],
+} as any);
+const listParent = new Container();
+listParent.addChild(listMessage);
+const listOutput = plain(listParent.render(100));
+assert.ok(!listOutput.includes("◉"), "stock list bullets must not be replaced");
+assert.ok(listOutput.includes("first item"));
 // Light-mode tree connectors are quieter without fading the reasoning text.
 initTheme("light", false);
 const ctx = { hasUI: true, ui: { theme, notify() {}, getToolsExpanded: () => false, setToolsExpanded() {} } };
 for (const handler of handlers.get("session_start") ?? []) await handler({ reason: "resume" }, ctx);
 const lightTree = parent.render(100);
 assert.ok(lightTree.some((line) => line.includes("\x1b[38;2;176;176;176m├")), "light gray connectors on a light background");
-console.log("OK: tree indentation, prose spacing, subdued light connectors, ✓/! statuses, live previews, and width safety");
+console.log("OK: spacing reverted, gray prose dots, stock bullets, short connectors, ✓/! statuses, live previews, and width safety");
