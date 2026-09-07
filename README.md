@@ -39,6 +39,7 @@ Claude Code inspired tool rendering for Pi — Shiki-powered diffs, status dots,
 - **Unified activity trees** with a distinct child for every tool call and thinking run, including repeated calls. Assistant prose and user messages remain outside the tree (set `groupToolCalls: false` to disable).
 - **Native custom-tool animations** (including Code Execution) remain visible while running, collapse on completion, and expand again with `Ctrl+O`.
 - **No horizontal tool rules**, including when older settings select `border` or `outlines`.
+- **Quieter layout**: activity trees are indented, with short `├` / `╰` connectors and blank lines around regular assistant output. Settled calls use green `✓` or red `!`; running indicators remain animated.
 - **Extra detail toggle** with `Ctrl+Shift+O`, increasing expanded preview caps without making the default view heavy
 - **Global border patch** for all tool rows, including unknown/custom tools
 
@@ -76,7 +77,7 @@ When `themeAdaptive` is `true` (default), the following colors are derived from 
 | Element | Derived from |
 |---------|--------------|
 | Tool rules, code fences | `dim` → `muted` → `borderMuted` → `thinkingText` |
-| Branch connectors (`╭─`, `├─`, `╰─`, `│`) | **fixed rgb(72)** by default (theme-independent); `/cc-tools branch theme` to follow pi theme |
+| Branch connectors (`├`, `╰`, `│`) | Activity trees use light gray on light themes, dim gray on dark themes; explicit `/cc-tools branch` settings still override this |
 | "✻ Turn took Ns" line (final message only, with session total + turn count) | `muted` |
 | Expanded thinking-block text and `∴` marker | `muted` |
 | Diff add/remove accents | `toolDiffAdded` / `toolDiffRemoved` |

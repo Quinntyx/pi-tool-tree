@@ -429,7 +429,7 @@ function isTerminalImageLine(line: string): boolean {
 }
 
 function normalizeLeadingCheckGlyph(line: string): string {
-	return line.replace(/^((?:\x1b\[[0-9;]*m|[ \t]|[├└│─])*)[✓✔]((?:\x1b\[[0-9;]*m)*)(?=\s)/, "$1●$2");
+	return line.replace(/^((?:\x1b\[[0-9;]*m|[ \t]|[├└│─])*)[✔]((?:\x1b\[[0-9;]*m)*)(?=\s)/, "$1✓$2");
 }
 
 function stripOuterBackgroundAnsi(line: string): string {
@@ -575,7 +575,7 @@ function groupStatusLight(status: ToolStatus, options?: { agentBreathe?: boolean
 		if (options?.agentBreathe) return paintAgentBreatheDot(TOOL_STATUS_SUCCESS);
 		return _globalBlinkPhase ? paintStatusDot(TOOL_STATUS_SUCCESS) : " ";
 	}
-	return paintStatusDot(color);
+	return `${color}${status === "error" ? "!" : "✓"}${TRANSPARENT_RESET}`;
 }
 
 function escapeRegex(text: string): string {
@@ -603,7 +603,7 @@ function stripLeadingToolStatus(line: string): string {
 	// Include Agent breathe glyphs (·) and the blank off-phase (space) so the title
 	// never keeps a leftover marker that shifts when size changes.
 	return line.replace(
-		/^((?:\x1b\[[0-9;]*m|[ \t]|[├└│─])*)(?:\x1b\[[0-9;]*m)*(?:[●○✗■⬤•·]| )(?:\x1b\[[0-9;]*m)*\s+/,
+		/^((?:\x1b\[[0-9;]*m|[ \t]|[├└│─])*)(?:\x1b\[[0-9;]*m)*(?:[●○✗■⬤•·✓✔!]| )(?:\x1b\[[0-9;]*m)*\s+/,
 		"$1",
 	);
 }
@@ -671,6 +671,9 @@ function getCompactToolLine(tool: any, width: number, groupedLabel?: string, sho
 	return alignTrailingMarkedLine(content || getToolName(tool), width);
 }
 
+/** Extra gutter separating activity trees from regular assistant prose. */
+const ACTIVITY_TREE_INDENT = 4;
+
 interface ActivityTreeRow {
 	kind: "activity" | "content";
 	lines: string[];
@@ -735,7 +738,8 @@ function assistantActivityRows(component: any, width: number): ActivityTreeRow[]
 				thinkingBodyCache.set(child, cached);
 			}
 			// ThinkingParagraph owns a three-cell ∴ gutter; replace it with the tree gutter.
-			lines.push(...cached.body.render(Math.max(1, width - 5) + 3).map((line) => sliceByColumn(line, 3, Math.max(1, width - 5))));
+			const bodyWidth = Math.max(1, width - 5 - ACTIVITY_TREE_INDENT);
+			lines.push(...cached.body.render(bodyWidth + 3).map((line) => sliceByColumn(line, 3, bodyWidth)));
 		}
 		rows.push({ kind: "activity", lines });
 	}
@@ -743,7 +747,7 @@ function assistantActivityRows(component: any, width: number): ActivityTreeRow[]
 }
 
 function toolActivityLines(tool: any, width: number): string[] {
-	const childWidth = Math.max(1, width - 5);
+	const childWidth = Math.max(1, width - 5 - ACTIVITY_TREE_INDENT);
 	const status = getToolStatusForGroup(tool);
 	const showDetails = tool.expanded === true || (tool.isPartial === true && tool.executionStarted === true);
 	// Rendering the actual tool component preserves native partial-result animations.
@@ -762,11 +766,13 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 	const output: string[] = [];
 	let pending: string[][] = [];
 	const flush = () => {
+		const margin = " ".repeat(1 + ACTIVITY_TREE_INDENT);
+		const connector = activityTreeBranchAnsi();
 		for (let i = 0; i < pending.length; i++) {
 			const last = i === pending.length - 1;
-			const glyph = last ? "╰─" : i === 0 ? "╭─" : "├─";
-			const prefix = ` ${currentToolBranchAnsi()}${glyph}${TRANSPARENT_RESET} `;
-			const continuation = ` ${currentToolBranchAnsi()}${last ? " " : "│"}${TRANSPARENT_RESET}   `;
+			const glyph = last ? "╰" : "├";
+			const prefix = `${margin}${connector}${glyph}${TRANSPARENT_RESET} `;
+			const continuation = `${margin}${connector}${last ? " " : "│"}${TRANSPARENT_RESET}   `;
 			pending[i].forEach((line, j) => {
 				// Image protocol payloads must not be modified or truncated as text.
 				output.push(isTerminalImageLine(line) ? line : clampLineWidth(`${j === 0 ? prefix : continuation}${line}`, width));
@@ -792,7 +798,14 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 				// Empty assistant shells don't split a thinking/tool sequence.
 				if (child instanceof AssistantMessageComponent && row.lines.every((line: string) => isBlankLine(line))) continue;
 				flush();
-				output.push(...row.lines);
+				if (child instanceof AssistantMessageComponent) {
+					const prose = trimRenderedBlankLines(row.lines);
+					if (prose.length === 0) continue;
+					if (output.length === 0 || !isBlankLine(output[output.length - 1])) output.push("");
+					output.push(...prose, "");
+				} else {
+					output.push(...row.lines);
+				}
 			}
 		}
 	}
@@ -2531,8 +2544,8 @@ function getWriteWasNewFile(ctx: any, cwd: string, filePath: string, reveal = sh
 
 function toolStatusDot(ctx: any, theme: Theme): string {
 	const status = ctx.state?._toolStatus as "pending" | "success" | "error" | "idle" | undefined;
-	if (status === "success") return `${themeStatusDot(theme, "success")} `;
-	if (status === "error") return `${themeStatusDot(theme, "error")} `;
+	if (status === "success") return `${theme.fg("success", "✓")} `;
+	if (status === "error") return `${theme.fg("error", "!")} `;
 	if (status === "idle") return `${themeStatusDot(theme, "dim")} `;
 	return `${blinkDot(ctx, theme)} `;
 }
@@ -3373,6 +3386,16 @@ function currentToolBranchAnsi(theme?: any): string {
 	const chrome = t ? resolveThemeChromeFg(t) : null;
 	if (chrome) return chrome;
 	return toolBranchRgbAnsi(getConfiguredToolBranchGray());
+}
+
+/** Quiet activity connectors; don't brighten thinking text along with the tree. */
+function activityTreeBranchAnsi(): string {
+	const settings = readSettings();
+	const customGray = typeof settings.toolBranchRgbGray === "number" && Number.isFinite(settings.toolBranchRgbGray);
+	if (!customGray && settings.toolBranchColorMode !== "theme" && isLightThemeBackground(_toolBranchThemeHint)) {
+		return toolBranchRgbAnsi(176);
+	}
+	return currentToolBranchAnsi();
 }
 
 /** Code fences, thinking/thought: branch + OUTLINE_CHROME_BRIGHTEN (never same as branch). */

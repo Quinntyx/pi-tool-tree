@@ -285,7 +285,7 @@ const neq = (a: string[], b: string[], label: string) => {
 	if (parent.children.length !== 8) throw new Error("render-only grouping moved the tool components");
 	const clean = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "").replace(/\x1b\][^\x07]*\x07/g, "").trim();
 	const lines = parent.render(W).map(clean).filter(Boolean);
-	if (lines.filter((line) => /^[╭├╰]─/.test(line)).length !== 8) throw new Error("expected eight distinct tree children");
+	if (lines.filter((line) => /^[├╰]/.test(line)).length !== 8) throw new Error("expected eight distinct tree children");
 	console.log("OK  tool grouping: 8 tools render as distinct tree children without a cap");
 }
 
