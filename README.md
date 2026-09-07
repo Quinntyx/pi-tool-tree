@@ -1,5 +1,10 @@
 # pi-claude-code-ui
 
+This fork leaves user-message styling, the prompt editor, and footer/status UI to
+Pi or other extensions such as `pi-opencode-prompt`. The upstream user-message
+patch and spinner/working-message extension have been removed. After updating,
+restart Pi fully: `/reload` cannot undo previously installed prototype patches.
+
 > [!IMPORTANT]
 > **Package renamed in 1.0.69.** This project is now published as [`pi-claude-code-ui`](https://www.npmjs.com/package/pi-claude-code-ui) (was `pi-claude-style-tools`).
 >
@@ -28,7 +33,7 @@ Claude Code inspired tool rendering for Pi — Shiki-powered diffs, status dots,
 - **Subagent completion notifications** restyled to match the same Claude-style tool rows
 - **RTK rewrite integration** that folds rewrite notices into the bash tool row with a muted `(RTK)` badge and expanded-only rewrite details
 - **Transparent tool backgrounds** in `transparent` or `border` mode
-- **Theme-adaptive palette** — borders, branch connectors, dim text, spinner accent, and diff backgrounds automatically follow the active pi theme (set `themeAdaptive: false` to keep the fixed Claude-style palette)
+- **Theme-adaptive palette** — borders, branch connectors, dim text, and diff backgrounds automatically follow the active pi theme (set `themeAdaptive: false` to keep the fixed Claude-style palette)
 - **Light Ghostty-sync themes** — edit/write diffs use `github-light` highlighting and light-tinted diff rows; tool pending dots use softer chrome colors
 - **Transparent edit/write diffs** with universal red/green diff colors
 - **Grouped consecutive tool calls** with single-row summaries for repeated targets and per-tool glance rows for mixed work (set `groupToolCalls: false` to disable)
@@ -68,14 +73,12 @@ When `themeAdaptive` is `true` (default), the following colors are derived from 
 
 | Element | Derived from |
 |---------|--------------|
-| User box, tool rules, code fences | `dim` → `muted` → `borderMuted` → `thinkingText` |
+| Tool rules, code fences | `dim` → `muted` → `borderMuted` → `thinkingText` |
 | Branch connectors (`├`, `└`, `│`) | **fixed rgb(72)** by default (theme-independent); `/cc-tools branch theme` to follow pi theme |
 | "✻ Turn took Ns" line (final message only, with session total + turn count) | `muted` |
 | Expanded thinking-block text and `∴` marker | `muted` |
 | Diff add/remove accents | `toolDiffAdded` / `toolDiffRemoved` |
 | Diff background tints | mixed against `toolSuccessBg` base |
-| Spinner verb text (`Working…`) | `borderAccent` (fallback: `accent`) |
-| Spinner status text | `muted` |
 
 User-supplied `diffTheme` presets and `diffColors` overrides always win over theme-derived defaults. File-type icons (e.g. `ts`, `py`, `rs`) keep their language-identity colors and are not theme-derived.
 
@@ -87,26 +90,13 @@ On `/resume`, `/new`, or `/fork`, tool chrome is rebound from the **current** pi
 
 ```text
 /cc-theme           # show current setting + theme name
-/cc-theme status    # show current setting + color preview (incl. spinner)
+/cc-theme status    # show current setting + color preview
 /cc-theme on        # follow pi theme
 /cc-theme off       # keep fixed Claude palette
 /cc-theme toggle    # flip the current value
 ```
 
 The selection is persisted to `~/.pi/settings.json` and applied to the next rendered tool row. No restart required.
-
-#### Repaint the spinner with `/cc-spinner`
-
-The spinner glyph itself is still colored by pi's loader using `accent`, while the verb text (e.g. `Cooking…`) follows `borderAccent` by default so it stays lively without being the exact same color as the glyph. The status suffix (e.g. `(thinking · ↓ 10 tokens · 2s)`) follows `muted`. Use `/cc-spinner` to bind either text element to any other theme color key:
-
-```text
-/cc-spinner preview          # list every common theme key with a colored sample
-/cc-spinner verb <key>       # change the verb color (e.g. thinkingHigh, mdHeading)
-/cc-spinner status <key>     # change the status suffix color
-/cc-spinner reset            # restore defaults (verb=borderAccent, status=muted)
-```
-
-The selection is persisted as `spinnerVerbColor` / `spinnerStatusColor` in `~/.pi/settings.json` and applied on the next spinner tick.
 
 ### Tool background modes
 

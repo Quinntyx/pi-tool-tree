@@ -14,7 +14,6 @@ import {
 	AssistantMessageComponent,
 	CustomMessageComponent,
 	ToolExecutionComponent,
-	UserMessageComponent,
 	keyHint,
 	keyText,
 	rawKeyHint,
@@ -57,7 +56,7 @@ const RESET = "\x1b[0m";
 const TRANSPARENT_BG = "\x1b[49m";
 const TRANSPARENT_RESET = `${RESET}${TRANSPARENT_BG}`;
 
-// User/code box borders and thinking/thought text: branch color + OUTLINE_CHROME_BRIGHTEN.
+// Code box borders and thinking/thought text: branch color + OUTLINE_CHROME_BRIGHTEN.
 // Branch ├└│ stay at `currentToolBranchAnsi` (see syncOutlineChromeFromBranch).
 let BORDER_COLOR = "\x1b[38;5;238m";
 let CODE_BLOCK_LANG_FG = "\x1b[38;2;95;95;95m";
@@ -73,7 +72,6 @@ const PARENT_TRACKING_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-par
 const TOOL_CACHE_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-tool-cache-invalidation");
 const TOOL_IMAGE_EXPAND_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-read-image-expansion");
 const CUSTOM_MESSAGE_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-custom-message-render");
-const USER_MESSAGE_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-user-message-render");
 const UI_NOTIFY_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-ui-notifications-v2");
 const WRAP_MARK = "\uE000";
 const CLIP_MARK = "\uE001";
@@ -113,19 +111,6 @@ interface SettingsFile {
 	 */
 	themeAdaptive?: boolean;
 	/**
-	 * Theme color key used for the spinner verb (e.g. "Cooking…"). Defaults
-	 * to "accent". Useful when the active theme's accent is overloaded for
-	 * borders, headings, or bash mode and the verb should pop differently.
-	 * Valid keys are any of the pi theme `ThemeColor` names (e.g. accent,
-	 * borderAccent, success, warning, mdHeading, thinkingMedium, bashMode).
-	 */
-	spinnerVerbColor?: string;
-	/**
-	 * Theme color key used for the spinner status suffix (the parenthesized
-	 * "(thinking · ↓ 10 tokens · 2s)" trailer). Defaults to "muted".
-	 */
-	spinnerStatusColor?: string;
-	/**
 	 * Thinking display mode. `live` (default): only the currently-streaming
 	 * thinking is expanded; finished thinking collapses to a one-line
 	 * `Thought for Xs` row (Ctrl+O still expands it). `full`: thinking always
@@ -160,16 +145,6 @@ function readSettings(): SettingsFile {
 	}
 	_settingsCache = { value: merged, timestamp: now };
 	return merged;
-}
-
-// Cross-extension bust signal for spinner.ts — it watches this counter on
-// globalThis and invalidates its settings cache when it changes. Lets
-// /cc-spinner edits take effect on the next 250ms spinner tick instead of
-// waiting for the file-stat TTL.
-const SPINNER_BUST_KEY = Symbol.for("pi-claude-style-tools:spinner-settings-bust");
-function bustSpinnerSettingsCache(): void {
-	const current = ((globalThis as any)[SPINNER_BUST_KEY] as number | undefined) ?? 0;
-	(globalThis as any)[SPINNER_BUST_KEY] = current + 1;
 }
 
 function writeSettingsKey(key: string, value: unknown): void {
@@ -229,7 +204,6 @@ function applyToolBackgroundMode(theme: unknown): void {
 	const globalTheme = getGlobalPiTheme();
 	if (globalTheme) targets.add(globalTheme);
 	for (const t of targets) {
-		setThemeBg(t, "userMessageBg", TRANSPARENT_BG);
 		if (toolBackgroundMode === "default") continue;
 		setThemeBg(t, "toolPendingBg", TRANSPARENT_BG);
 		setThemeBg(t, "toolSuccessBg", TRANSPARENT_BG);
@@ -284,13 +258,6 @@ function isCodeBoxChromeLine(line: string): boolean {
 	return false;
 }
 
-function isUserMessageChromeLine(line: string): boolean {
-	const plain = stripAnsi(line).trim();
-	if (/^╭/.test(plain) && /╮$/.test(plain)) return true;
-	if (/^╰/.test(plain) && /╯$/.test(plain)) return true;
-	return false;
-}
-
 function isBorderedContentLine(line: string): boolean {
 	const plain = stripAnsi(line).trim();
 	return plain.startsWith("│") && plain.endsWith("│") && plain.length > 2;
@@ -336,7 +303,7 @@ function applyTerminalCopyZones(lines: string[]): string[] {
 }
 
 function isCopyExcludedChromeLine(line: string): boolean {
-	return isCodeBoxChromeLine(line) || isUserMessageChromeLine(line);
+	return isCodeBoxChromeLine(line);
 }
 
 function copyPayloadForLine(line: string): string | undefined {
@@ -1395,7 +1362,7 @@ const ASSISTANT_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-assistant
 const ASSISTANT_RENDER_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-assistant-message-render");
 const TOOL_EXECUTION_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-tool-execution");
 
-// Rendered-output cache for assistant/user/custom message components.
+// Rendered-output cache for assistant/custom message components.
 // Keyed by (width, branch visual epoch, tool background mode). The epoch changes on
 // theme / /cc-tools branch / /cc-theme rebinds; the mode is included because subagent
 // (custom-message) framing follows `toolBackgroundMode` via frameToolLikeLines. This avoids
@@ -1403,8 +1370,6 @@ const TOOL_EXECUTION_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-tool
 // border boxing) on every scroll/expand re-render — the dominant CPU cost on long chats,
 // scaling linearly with chat length.
 // Correctness:
-//  - UserMessageComponent content is immutable after construction, so output is deterministic
-//    given (width, epoch, mode).
 //  - AssistantMessageComponent rebuilds children only via updateContent(), which clears the cache.
 //  - CustomMessageComponent rebuilds children only via rebuild(), which clears the cache.
 // The returned arrays are only ever spread-copied by Container.render (never mutated in place),
@@ -2309,39 +2274,6 @@ function stripBackgroundAnsi(text: string): string {
 	});
 }
 
-function roundedUserBorder(width: number, top: boolean): string {
-	if (width <= 1) return `${BORDER_COLOR}│${TRANSPARENT_RESET}`;
-	const left = top ? "╭" : "╰";
-	const right = top ? "╮" : "╯";
-	if (!top || width < 10) {
-		return `${BORDER_COLOR}${left}${"─".repeat(Math.max(0, width - 2))}${right}${TRANSPARENT_RESET}`;
-	}
-	const label = `${WORKED_LINE_FG} User ${TRANSPARENT_RESET}`;
-	const prefix = "─";
-	const suffixWidth = Math.max(0, width - 2 - visibleWidth(prefix) - visibleWidth(label));
-	return `${BORDER_COLOR}${left}${prefix}${TRANSPARENT_RESET}${label}${BORDER_COLOR}${"─".repeat(suffixWidth)}${right}${TRANSPARENT_RESET}`;
-}
-
-function trimAnsiRight(text: string): string {
-	let trimmed = text;
-	while (true) {
-		const next = trimmed.replace(/[ \t]+((?:\x1b\[[0-9;]*m)*)$/g, "$1");
-		if (next === trimmed) return trimmed;
-		trimmed = next;
-	}
-}
-
-function cleanUserMessageLine(line: string): string {
-	return `${TRANSPARENT_BG}${trimAnsiRight(stripBackgroundAnsi(stripOsc133Zones(line)))}${TRANSPARENT_BG}`;
-}
-
-function borderedUserMessageLine(line: string, width: number): string {
-	const innerWidth = Math.max(1, width - 4);
-	const content = clampLineWidth(cleanUserMessageLine(line), innerWidth);
-	const padding = " ".repeat(Math.max(0, innerWidth - visibleWidth(content)));
-	return `${BORDER_COLOR}│${TRANSPARENT_RESET} ${content}${padding} ${BORDER_COLOR}│${TRANSPARENT_RESET}`;
-}
-
 function visitMarkdownDescendants(root: unknown, visit: (md: InstanceType<typeof Markdown>) => void): void {
 	if (!root || typeof root !== "object") return;
 	const node = root as { children?: unknown[] };
@@ -2349,44 +2281,6 @@ function visitMarkdownDescendants(root: unknown, visit: (md: InstanceType<typeof
 		if (isMarkdownComponent(child)) visit(child);
 		else visitMarkdownDescendants(child, visit);
 	}
-}
-
-function patchUserMessageRender(): void {
-	const proto = UserMessageComponent.prototype as any;
-	if (proto[USER_MESSAGE_PATCH_FLAG]) return;
-	const originalRender = proto.render;
-	if (typeof originalRender !== "function") return;
-	proto.render = function patchedUserMessageRender(width: number) {
-		const cached = messageRenderCacheHit(this, width);
-		if (cached) return cached;
-		visitMarkdownDescendants(this, (child) => {
-			const markdownAny = child as any;
-			if (typeof markdownAny.text === "string") {
-				const stripped = stripTransientMagicContextTags(markdownAny.text);
-				if (stripped !== markdownAny.text) {
-					markdownAny.text = stripped;
-					child.invalidate?.();
-				}
-			}
-			makeMarkdownLinksCopySafe(child);
-			if (markdownAny.defaultTextStyle?.bgColor) {
-				markdownAny.defaultTextStyle.bgColor = undefined;
-				child.invalidate?.();
-			}
-		});
-		const borderWidth = Math.max(1, width);
-		const contentWidth = Math.max(1, borderWidth - 4);
-		const lines = originalRender.call(this, contentWidth);
-		if (!Array.isArray(lines) || lines.length === 0) return lines;
-		const rendered = [
-			roundedUserBorder(borderWidth, true),
-			...lines.slice(1, -1).map((line: string) => borderedUserMessageLine(line, borderWidth)),
-			roundedUserBorder(borderWidth, false),
-		];
-		const clamped = rendered.map((line) => clampLineWidth(line, borderWidth));
-		return storeMessageRenderCache(this, width, applyTerminalCopyZones(clamped));
-	};
-	proto[USER_MESSAGE_PATCH_FLAG] = true;
 }
 
 function patchAssistantMessages(): void {
@@ -3829,7 +3723,7 @@ function attenuateChromeAnsi(ansi: string, theme: any): string {
 	return `\x1b[38;2;${mix(rgb.r)};${mix(rgb.g)};${mix(rgb.b)}m`;
 }
 
-/** Shared outline chrome: user box, tool rules, code fences, branch connectors. */
+/** Shared outline chrome: tool rules, code fences, branch connectors. */
 function resolveThemeChromeFg(theme: any): string | null {
 	if (!theme || !themeAdaptiveEnabled()) return null;
 	const dim = safeFgAnsi(theme, "dim");
@@ -3853,7 +3747,7 @@ function currentToolBranchAnsi(theme?: any): string {
 	return toolBranchRgbAnsi(getConfiguredToolBranchGray());
 }
 
-/** User box, code fences, thinking/thought: branch + OUTLINE_CHROME_BRIGHTEN (never same as branch). */
+/** Code fences, thinking/thought: branch + OUTLINE_CHROME_BRIGHTEN (never same as branch). */
 function syncOutlineChromeFromBranch(theme?: any): void {
 	const outline = outlineChromeAnsiFromBranch(theme);
 	const prevBorder = BORDER_COLOR;
@@ -3930,7 +3824,7 @@ function refreshAllToolBranchVisuals(ctx: any): void {
 	}
 }
 
-/** Re-derive borders, branches, diffs, and spinner keys from the active pi theme (no cross-extension deps). */
+/** Re-derive borders, branches, and diffs from the active pi theme (no cross-extension deps). */
 function rebindUiChromeToTheme(ctx: any): void {
 	if (!ctx?.hasUI) return;
 	_settingsCache = null;
@@ -3939,7 +3833,6 @@ function rebindUiChromeToTheme(ctx: any): void {
 	invalidateThemePaletteCache();
 	clearHighlightCache();
 	applyDiffPalette();
-	bustSpinnerSettingsCache();
 	applyToolBackgroundMode(theme);
 	applyThemePaletteIfNeeded(theme);
 	syncDiffShikiTheme(theme);
@@ -4145,7 +4038,7 @@ function applyThemePaletteIfNeeded(theme: any): void {
 	const muted = safeFgAnsi(theme, "muted");
 	const dim = safeFgAnsi(theme, "dim") ?? muted;
 
-	// User box, code fences, thinking/thought text, and ├ └ │ all follow branch chrome.
+	// Code fences, thinking/thought text, and ├ └ │ all follow branch chrome.
 	applyToolBranchColor(theme);
 
 	const chromeFg = BORDER_COLOR;
@@ -6426,7 +6319,6 @@ export default function (pi: ExtensionAPI) {
 	patchContainerParentTracking();
 	patchGlobalToolBorders();
 	patchCustomMessageRender();
-	patchUserMessageRender();
 	patchAssistantMessages();
 	patchToolExecutionRenderers();
 	applyDiffPalette();
@@ -6660,21 +6552,14 @@ export default function (pi: ExtensionAPI) {
 				const themeName = theme?.name ?? "unknown";
 				const state = current ? "on" : "off";
 				if (raw === "status" && current) {
-					const settings = readSettings();
-					const verbKey = settings.spinnerVerbColor || "borderAccent";
-					const statusKey = settings.spinnerStatusColor || "muted";
-					const verbAnsi = safeFgAnsi(theme, verbKey) ?? safeFgAnsi(theme, "accent");
-					const statusAnsi = safeFgAnsi(theme, statusKey) ?? safeFgAnsi(theme, "muted");
 					const chromePreview = resolveThemeChromeFg(theme);
 					// Print a short preview of what we derived.
 					const preview = [
-						`chrome      : ${chromePreview ? `${chromePreview}─┌ User ├─\x1b[39m` : "(unchanged)"}`,
-						`  (user box, tool rules, branches)`, 
+						`chrome      : ${chromePreview ? `${chromePreview}─┌ ├─\x1b[39m` : "(unchanged)"}`,
+						`  (tool rules, branches)`,
 						`muted text  : ${safeFgAnsi(theme, "muted") ? `${safeFgAnsi(theme, "muted")}example dim text\x1b[39m` : "(unchanged)"}`,
 						`diff add    : ${safeFgAnsi(theme, "toolDiffAdded") ? `${safeFgAnsi(theme, "toolDiffAdded")}+ added line\x1b[39m` : "(unchanged)"}`,
 						`diff del    : ${safeFgAnsi(theme, "toolDiffRemoved") ? `${safeFgAnsi(theme, "toolDiffRemoved")}- removed line\x1b[39m` : "(unchanged)"}`,
-						`spinner verb: ${verbAnsi ? `${verbAnsi}Cooking…\x1b[39m` : "(unchanged)"} (key: ${verbKey})`,
-						`spinner stat: ${statusAnsi ? `${statusAnsi}(thinking · ↓ 10 tokens · 2s)\x1b[39m` : "(unchanged)"} (key: ${statusKey})`,
 					].join("\n  ");
 					ctx.ui.notify(`Theme adaptive: ${state} (theme "${themeName}")\n  ${preview}`, "info");
 				} else {
@@ -6693,7 +6578,6 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			writeSettingsKey("themeAdaptive", next);
-			bustSpinnerSettingsCache();
 			// Invalidate caches so the next render re-derives from the active
 			// theme (or falls back to the fixed Claude palette).
 			invalidateThemePaletteCache();
@@ -6706,104 +6590,6 @@ export default function (pi: ExtensionAPI) {
 			if (ctx.hasUI) {
 				const label = next ? "on — colors follow pi theme" : "off — fixed Claude palette";
 				ctx.ui.notify(`Theme adaptive: ${label}`, "info");
-			}
-		},
-	});
-
-	// /cc-spinner command — pick which theme color keys drive the spinner verb
-	// and status suffix.
-	const COMMON_COLOR_KEYS: readonly string[] = [
-		"accent", "borderAccent", "success", "error", "warning",
-		"muted", "dim", "text", "thinkingText",
-		"toolTitle", "mdHeading", "mdCode", "mdLink", "mdListBullet",
-		"bashMode",
-		"thinkingLow", "thinkingMedium", "thinkingHigh", "thinkingXhigh",
-		"syntaxKeyword", "syntaxFunction", "syntaxString", "syntaxType",
-	];
-	pi.registerCommand("cc-spinner", {
-		description: "Set the spinner verb or status theme color, or preview current values",
-		getArgumentCompletions(prefix) {
-			const subCommands = ["verb", "status", "reset", "preview"];
-			const parts = prefix.split(/\s+/);
-			if (parts.length <= 1) {
-				return subCommands
-					.filter((c) => c.startsWith(parts[0] ?? ""))
-					.map((c) => ({
-						value: c,
-						label: c,
-						description:
-							c === "verb" ? "Set the color key used for the spinner verb (e.g. 'Cooking…')"
-							: c === "status" ? "Set the color key used for the spinner status suffix"
-							: c === "reset" ? "Reset both verb and status to defaults (borderAccent, muted)"
-							: "Preview every theme color key with its current sample",
-					}));
-			}
-			// Second arg: color key completions for verb/status.
-			if (parts[0] === "verb" || parts[0] === "status") {
-				const keyPrefix = (parts[1] ?? "").toLowerCase();
-				return COMMON_COLOR_KEYS
-					.filter((k) => k.toLowerCase().startsWith(keyPrefix))
-					.map((k) => ({ value: k, label: k, description: `theme.fg("${k}", …)` }));
-			}
-			return [];
-		},
-		async handler(args, ctx) {
-			const parts = args.trim().split(/\s+/).filter((p) => p.length > 0);
-			const sub = (parts[0] ?? "").toLowerCase();
-			const theme = ctx.hasUI ? (ctx.ui.theme as any) : null;
-			const settings = readSettings();
-			const currentVerb = settings.spinnerVerbColor || "borderAccent";
-			const currentStatus = settings.spinnerStatusColor || "muted";
-
-			if (!sub || sub === "preview") {
-				if (!ctx.hasUI) return;
-				if (!theme) {
-					ctx.ui.notify(`Spinner verb: ${currentVerb}, status: ${currentStatus} (no theme)`, "info");
-					return;
-				}
-				const lines: string[] = [
-					`Current: verb=${currentVerb}, status=${currentStatus}`,
-					"",
-					"Preview of common theme keys (pick one for verb or status):",
-				];
-				for (const key of COMMON_COLOR_KEYS) {
-					const ansi = safeFgAnsi(theme, key);
-					const marker = key === currentVerb ? "(verb)" : key === currentStatus ? "(status)" : "";
-					const sample = ansi ? `${ansi}Cooking…\x1b[39m` : "(unmapped)";
-					lines.push(`  ${key.padEnd(16)} ${sample} ${marker}`);
-				}
-				ctx.ui.notify(lines.join("\n"), "info");
-				return;
-			}
-
-			if (sub === "reset") {
-				writeSettingsKey("spinnerVerbColor", undefined);
-				writeSettingsKey("spinnerStatusColor", undefined);
-				bustSpinnerSettingsCache();
-				if (ctx.hasUI) ctx.ui.notify("Spinner colors reset to defaults (verb=borderAccent, status=muted)", "info");
-				return;
-			}
-
-			if (sub !== "verb" && sub !== "status") {
-				if (ctx.hasUI) ctx.ui.notify(`Usage: /cc-spinner verb <key> | status <key> | reset | preview`, "error");
-				return;
-			}
-
-			const key = parts[1];
-			if (!key) {
-				if (ctx.hasUI) ctx.ui.notify(`Missing color key. Try /cc-spinner preview to see available keys.`, "error");
-				return;
-			}
-
-			// Validate the key resolves to *some* color in the active theme;
-			// accept anyway if the user insists so themes with custom keys work.
-			const ansi = theme ? safeFgAnsi(theme, key) : null;
-			const settingKey = sub === "verb" ? "spinnerVerbColor" : "spinnerStatusColor";
-			writeSettingsKey(settingKey, key);
-			bustSpinnerSettingsCache();
-			if (ctx.hasUI) {
-				const sample = ansi ? `${ansi}sample\x1b[39m` : "(key unmapped in current theme)";
-				ctx.ui.notify(`Spinner ${sub} → ${key} ${sample}`, "info");
 			}
 		},
 	});
