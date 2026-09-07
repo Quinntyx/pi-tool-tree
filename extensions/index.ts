@@ -35,6 +35,7 @@ import {
 	Markdown,
 	ProcessTerminal,
 	Spacer,
+	sliceByColumn,
 	Text,
 	truncateToWidth,
 	visibleWidth,
@@ -396,10 +397,6 @@ function isBlankLine(text: string): boolean {
 	return stripAnsi(text).trim().length === 0;
 }
 
-function borderLine(width: number): string {
-	return `${BORDER_COLOR}${"─".repeat(Math.max(1, width))}${TRANSPARENT_RESET}`;
-}
-
 function terminalColumnCeiling(): number {
 	const cols = typeof process !== "undefined" ? process.stdout?.columns : undefined;
 	return Number.isFinite(cols) && (cols as number) > 0 ? (cols as number) : 0;
@@ -526,47 +523,8 @@ let TOOL_STATUS_SUCCESS = "\x1b[32m";
 let TOOL_STATUS_ERROR = "\x1b[31m";
 let TOOL_STATUS_PENDING = "\x1b[90m";
 
-function statusText(status: ToolStatus, count: number): string {
-	const label = status === "success" ? "done" : status === "error" ? "failed" : "running";
-	const color = status === "success" ? TOOL_STATUS_SUCCESS : status === "error" ? TOOL_STATUS_ERROR : TOOL_STATUS_PENDING;
-	return `${color}${count}${TRANSPARENT_RESET} ${label}`;
-}
-
-function countToolStatuses(tools: any[]): Record<ToolStatus, number> {
-	return tools.reduce((counts, tool) => {
-		counts[getToolStatusForGroup(tool)]++;
-		return counts;
-	}, { pending: 0, success: 0, error: 0 } as Record<ToolStatus, number>);
-}
-
-function formatToolGroupCounts(tools: any[]): string {
-	const counts = countToolStatuses(tools);
-	const parts: string[] = [];
-	if (counts.pending) parts.push(statusText("pending", counts.pending));
-	if (counts.success) parts.push(statusText("success", counts.success));
-	if (counts.error) parts.push(statusText("error", counts.error));
-	return parts.join(`${TRANSPARENT_RESET} • `);
-}
-
 function getToolName(tool: any): string {
 	return typeof tool?.toolName === "string" && tool.toolName ? tool.toolName : "tool";
-}
-
-function getGroupedToolName(tools: any[]): string | undefined {
-	const first = getToolName(tools[0]);
-	return tools.every((tool) => getToolName(tool) === first) ? first : undefined;
-}
-
-function getToolGroupLabel(tools: any[]): string {
-	const sameName = getGroupedToolName(tools);
-	return sameName ? humanizeToolName(sameName) : "Multiple Tools";
-}
-
-function getToolGroupOverallStatus(tools: any[]): ToolStatus {
-	const counts = countToolStatuses(tools);
-	if (counts.error > 0) return "error";
-	if (counts.pending > 0) return "pending";
-	return "success";
 }
 
 // Claude Code: solid filled circle that is either fully present or fully gone
@@ -620,31 +578,6 @@ function groupStatusLight(status: ToolStatus, options?: { agentBreathe?: boolean
 	return paintStatusDot(color);
 }
 
-function formatToolNameList(tools: any[]): string {
-	const counts = new Map<string, number>();
-	for (const tool of tools) {
-		const name = getToolName(tool);
-		counts.set(name, (counts.get(name) ?? 0) + 1);
-	}
-	return [...counts.entries()]
-		.map(([name, count]) => `${humanizeToolName(name)}${count > 1 ? `×${count}` : ""}`)
-		.join(", ");
-}
-
-function getRepeatedToolSubject(tools: any[], groupedName: string | undefined): string {
-	if (!groupedName || tools.length === 0) return "";
-	if (groupedName === "read") {
-		const paths = tools.map((tool) => String(tool?.args?.path ?? ""));
-		if (paths[0] && paths.every((path) => path === paths[0])) {
-			return shortPath(process.cwd(), paths[0]);
-		}
-	}
-	const summaries = tools.map(getToolArgSummary);
-	return summaries[0] && summaries.every((summary) => summary === summaries[0])
-		? summaries[0]
-		: "";
-}
-
 function escapeRegex(text: string): string {
 	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -688,13 +621,10 @@ function removeGroupedToolPrefix(line: string, groupedLabel?: string): string {
 	return trimAnsiLeft(stripGroupedToolLabel(trimAnsiLeft(stripLeadingToolStatus(line)), groupedLabel));
 }
 
-function tintGroupedToolLine(line: string, _groupedLabel?: string): string {
-	return trimAnsiLeft(line);
-}
-
 function getToolArgSummary(tool: any): string {
 	const args = tool?.args ?? {};
 	const name = getToolName(tool);
+	if (name === "code_execution") return summarizeText(String(args.code ?? "").trim().split("\n")[0] ?? "", 100);
 	if (name === "read") {
 		let value = shortPath(process.cwd(), args.path ?? "");
 		const parts: string[] = [];
@@ -741,296 +671,133 @@ function getCompactToolLine(tool: any, width: number, groupedLabel?: string, sho
 	return alignTrailingMarkedLine(content || getToolName(tool), width);
 }
 
-interface CollapsedToolEntry {
-	tools: any[];
-	name: string;
-	subject: string;
+interface ActivityTreeRow {
+	kind: "activity" | "content";
+	lines: string[];
 }
 
-function collapseRepeatedToolEntries(tools: any[]): CollapsedToolEntry[] {
-	const entries: CollapsedToolEntry[] = [];
-	for (const tool of tools) {
-		const name = getToolName(tool);
-		const subject = getRepeatedToolSubject([tool], name);
-		const previous = entries[entries.length - 1];
-		if (subject && previous?.name === name && previous.subject === subject) {
-			previous.tools.push(tool);
-		} else {
-			entries.push({ tools: [tool], name, subject });
+const thinkingBodyCache = new WeakMap<object, { text: string; body: ThinkingParagraph }>();
+const THINKING_EXPANDED_KEY = Symbol("pi-tool-tree:thinking-expanded");
+
+function thinkingChild(component: any): boolean {
+	// Newer Pi wraps thinking in a MouseRegion; older versions use direct children.
+	if (component?.child) return thinkingChild(component.child);
+	return component instanceof ThinkingParagraph || component instanceof HiddenThinkingSummary
+		|| (isMarkdownComponent(component) && !!(component as any).defaultTextStyle?.italic)
+		|| isHiddenThinkingPlaceholderText(component);
+}
+
+function thinkingRuns(message: any): Array<{ text: string; followedByActivity: boolean }> {
+	const runs: Array<{ text: string; followedByActivity: boolean }> = [];
+	const content = message?.content ?? [];
+	for (let i = 0; i < content.length; i++) {
+		if (content[i]?.type !== "thinking") continue;
+		const texts: string[] = [];
+		while (i < content.length && content[i]?.type === "thinking") {
+			if (content[i].thinking?.trim()) texts.push(stripThinkingPresentationArtifacts(content[i].thinking));
+			i++;
 		}
+		if (texts.length) runs.push({
+			text: texts.join("\n\n"),
+			followedByActivity: content.slice(i).some((block: any) => block?.type === "toolCall" || block?.text?.trim()),
+		});
+		i--;
 	}
-	return entries;
+	return runs;
 }
 
-function stripReadRangeFromToolLine(line: string): string {
-	return line.replace(
-		/\s+(?:\x1b\[[0-9;]*m)*\((?:offset|limit)=\d+(?:,\s*(?:offset|limit)=\d+)*\)(?=(?:\x1b\[[0-9;]*m)*$)/,
-		"",
-	);
+function assistantActivityRows(component: any, width: number): ActivityTreeRow[] {
+	const message = component.lastMessage;
+	const runs = thinkingRuns(message);
+	if (runs.length === 0) return [{ kind: "content", lines: component.render(width) }];
+	const rows: ActivityTreeRow[] = [];
+	let runIndex = 0;
+	for (const child of component.contentContainer?.children ?? []) {
+		if (isSpacerComponent(child)) continue;
+		if (!thinkingChild(child) || runIndex >= runs.length) {
+			rows.push({ kind: "content", lines: applyTerminalCopyZones(child.render(width)) });
+			continue;
+		}
+		const index = runIndex++;
+		const run = runs[index];
+		const live = !run.followedByActivity && index === runs.length - 1 && isLiveThinkingMessage(component, message);
+		const duration = live && thinkingBlockStartMs > 0
+			? Math.max(0, Date.now() - thinkingBlockStartMs)
+			: getMessageThinkingDurationMs(message);
+		const label = live ? `Thinking… ${formatThoughtDuration(duration)}` : `Thought for ${formatThoughtDuration(duration)}`;
+		const lines = [`${WORKED_LINE_FG}${label}${TRANSPARENT_RESET}`];
+		const visibilityOverride = component.thinkingVisibilityOverrides?.get(index);
+		const expanded = visibilityOverride ?? (component[THINKING_EXPANDED_KEY] ?? (getThinkingMode() === "full" || live));
+		if (expanded) {
+			let cached = thinkingBodyCache.get(child);
+			if (!cached || cached.text !== run.text) {
+				cached = { text: run.text, body: new ThinkingParagraph(run.text, component.markdownTheme) };
+				thinkingBodyCache.set(child, cached);
+			}
+			// ThinkingParagraph owns a three-cell ∴ gutter; replace it with the tree gutter.
+			lines.push(...cached.body.render(Math.max(1, width - 5) + 3).map((line) => sliceByColumn(line, 3, Math.max(1, width - 5))));
+		}
+		rows.push({ kind: "activity", lines });
+	}
+	return rows;
 }
 
-function getCollapsedToolEntryLine(entry: CollapsedToolEntry, width: number, groupedLabel?: string): string {
-	if (entry.tools.length === 1) return getCompactToolLine(entry.tools[0], width, groupedLabel);
-	const counts = countToolStatuses(entry.tools);
-	const attentionCounts = counts.pending > 0 || counts.error > 0
-		? ` • ${formatToolGroupCounts(entry.tools)}`
-		: "";
-	const suffix = ` ${FG_DIM}×${entry.tools.length}${TRANSPARENT_RESET}${attentionCounts}`;
-	const firstLine = getCompactToolLine(entry.tools[0], Math.max(1, width - visibleWidth(suffix)), groupedLabel, false);
-	const sharedLine = entry.name === "read" ? stripReadRangeFromToolLine(firstLine) : firstLine;
-	return clampLineWidth(`${sharedLine}${suffix}`, width);
-}
-
-function getCollapsedToolEntryLines(entry: CollapsedToolEntry, width: number, groupedLabel?: string): string[] {
-	const lines = [getCollapsedToolEntryLine(entry, width, groupedLabel)];
-	if (entry.name !== "bash") return lines;
-	const running = [...entry.tools].reverse().find((tool) => getToolStatusForGroup(tool) === "pending");
-	const latestOutput = running ? getLastBashOutputLine(getTextContent(running.result)) : undefined;
-	if (latestOutput) lines.push(`${FG_DIM}${latestOutput}${TRANSPARENT_RESET}`);
+function toolActivityLines(tool: any, width: number): string[] {
+	const childWidth = Math.max(1, width - 5);
+	const status = getToolStatusForGroup(tool);
+	const showDetails = tool.expanded === true || (tool.isPartial === true && tool.executionStarted === true);
+	// Rendering the actual tool component preserves native partial-result animations.
+	// Never memoize an active component: its animation can change without new text.
+	let lines = showDetails ? stripToolChrome(tool.render(childWidth)) : [getCompactToolLine(tool, childWidth)];
+	if (lines.length === 0) lines = [getCompactToolLine(tool, childWidth)];
+	lines[0] = `${groupStatusLight(status, { agentBreathe: isAgentFamilyToolName(getToolName(tool)) })} ${removeGroupedToolPrefix(lines[0])}`;
 	return lines;
 }
 
-function getExpandedToolGroupLines(tool: any, width: number, groupedLabel?: string): string[] {
-	const lines = stripToolChrome(tool.render(Math.max(1, width)))
-		.map((line) => removeGroupedToolPrefix(line, groupedLabel))
-		.map((line) => tintGroupedToolLine(line, groupedLabel));
-	return lines.length > 0 ? lines : [`${FG_DIM}${String(tool?.toolName ?? "tool")}${TRANSPARENT_RESET}`];
-}
-
-function branchPrefix(index: number, total: number, theme?: Theme): string {
-	// Bare tee/corner only — no horizontal ─ arm.
-	const branch = index === total - 1 ? "└" : "├";
-	const rule = currentToolBranchAnsi(theme);
-	return ` ${rule}${branch}${TRANSPARENT_RESET} `;
-}
-
-function branchContinuation(index: number, total: number, theme?: Theme): string {
-	const rule = currentToolBranchAnsi(theme);
-	// Match lead width of ` X ` (3 cols of structure + spaces handled outside).
-	return index === total - 1 ? "   " : ` ${rule}│${TRANSPARENT_RESET} `;
-}
-
-function formatBranchedToolLines(
-	lines: string[],
-	index: number,
-	total: number,
-	width: number,
-	status: ToolStatus,
-	options?: { agentBreathe?: boolean },
-): string[] {
+/** Render-only grouping: keep Pi's child identities, message data and order intact. */
+function renderActivityTranscript(parent: any, width: number): string[] | undefined {
+	if (!toolGroupingEnabled() || !Array.isArray(parent.children)) return undefined;
+	if (!parent.children.some((child: any) => child instanceof ToolExecutionComponent || child instanceof AssistantMessageComponent)) return undefined;
+	if (width <= 0) return [];
 	const output: string[] = [];
-	const content = lines.filter((line) => isTerminalImageLine(line) || stripAnsi(line).trim().length > 0);
-	const safeContent = content.length > 0 ? content : [""];
-	const light = groupStatusLight(status, options);
-	for (let lineIndex = 0; lineIndex < safeContent.length; lineIndex++) {
-		const line = safeContent[lineIndex];
-		if (isTerminalImageLine(line)) {
-			output.push(line);
+	let pending: string[][] = [];
+	const flush = () => {
+		for (let i = 0; i < pending.length; i++) {
+			const last = i === pending.length - 1;
+			const glyph = last ? "╰─" : i === 0 ? "╭─" : "├─";
+			const prefix = ` ${currentToolBranchAnsi()}${glyph}${TRANSPARENT_RESET} `;
+			const continuation = ` ${currentToolBranchAnsi()}${last ? " " : "│"}${TRANSPARENT_RESET}   `;
+			pending[i].forEach((line, j) => {
+				// Image protocol payloads must not be modified or truncated as text.
+				output.push(isTerminalImageLine(line) ? line : clampLineWidth(`${j === 0 ? prefix : continuation}${line}`, width));
+			});
+		}
+		pending = [];
+	};
+	for (const child of parent.children) {
+		if (child instanceof ToolExecutionComponent) {
+			pending.push(toolActivityLines(child, width));
 			continue;
 		}
-		// Always strip any leftover status marker from the child call line before
-		// re-prefixing. Agent breathe used · which the old stripper missed, so the
-		// title walked sideways as size changed inside groups.
-		const body = lineIndex === 0 ? removeGroupedToolPrefix(line) : trimAnsiLeft(line);
-		const prefix = lineIndex === 0 ? `${branchPrefix(index, total)}${light} ` : `${branchContinuation(index, total)}  `;
-		output.push(clampLineWidth(`${prefix}${body}`, width));
-	}
-	return output;
-}
-
-const NON_GROUPABLE_TOOL_NAMES = new Set(["edit", "write", "apply_patch"]);
-const ACTIVE_TOOL_GROUPS = new Set<any>();
-
-function isGroupableTool(value: unknown): value is InstanceType<typeof ToolExecutionComponent> {
-	return value instanceof ToolExecutionComponent && !NON_GROUPABLE_TOOL_NAMES.has(getToolName(value));
-}
-
-class ToolGroupComponent extends Container {
-	private tools: any[] = [];
-	private expanded = false;
-	// Memoize full group output. Grouped history is the long-chat bottleneck:
-	// each warm frame used to re-render every child tool, re-branch lines, and
-	// re-clamp every row even when nothing changed.
-	private dirty = true;
-	private cachedWidth?: number;
-	private cachedEpoch?: number;
-	private cachedMode?: string;
-	private cachedExpanded?: boolean;
-	private cachedBlinkPhase?: boolean;
-	private cachedStatusKey?: string;
-	private cachedToolCount?: number;
-	private cachedLines?: string[];
-
-	private clearRenderCache(): void {
-		this.dirty = true;
-		this.cachedWidth = undefined;
-		this.cachedEpoch = undefined;
-		this.cachedMode = undefined;
-		this.cachedExpanded = undefined;
-		this.cachedBlinkPhase = undefined;
-		this.cachedStatusKey = undefined;
-		this.cachedToolCount = undefined;
-		this.cachedLines = undefined;
-	}
-
-	private statusSnapshot(): { key: string; pending: number; success: number; error: number } {
-		// Status counts + per-tool identity/expanded/partial bits detect membership
-		// and completion changes without walking full child render output. Child
-		// content changes still reach us via clearToolRenderCache → invalidate().
-		const counts = countToolStatuses(this.tools);
-		let idBits = "";
-		for (let i = 0; i < this.tools.length; i++) {
-			const tool = this.tools[i];
-			const id = typeof tool?.toolCallId === "string" ? tool.toolCallId : getToolName(tool);
-			const flags = (tool?.isPartial === true ? 1 : 0)
-				| (tool?.result?.isError ? 2 : 0)
-				| (tool?.expanded ? 4 : 0)
-				| (tool?.argsComplete ? 8 : 0)
-				| (tool?.executionStarted ? 16 : 0);
-			idBits += `${id}:${flags},`;
+		if (isSpacerComponent(child)) {
+			if (pending.length === 0) output.push(...child.render(width));
+			continue;
 		}
-		return {
-			key: `${this.tools.length}:${counts.pending}:${counts.success}:${counts.error}:${idBits}`,
-			pending: counts.pending,
-			success: counts.success,
-			error: counts.error,
-		};
-	}
-
-	addTool(tool: any): void {
-		ACTIVE_TOOL_GROUPS.add(this);
-		this.tools.push(tool);
-		tool[COMPONENT_PARENT] = this;
-		// Don't cascade invalidate into every child — only drop our own cache.
-		// Child tools already rebuild via their own updateDisplay path.
-		this.clearRenderCache();
-	}
-
-	releaseTools(): any[] {
-		const tools = this.tools;
-		this.tools = [];
-		ACTIVE_TOOL_GROUPS.delete(this);
-		this.clearRenderCache();
-		return tools;
-	}
-
-	setExpanded(expanded: boolean): void {
-		if (this.expanded === expanded) return;
-		this.expanded = expanded;
-		for (const tool of this.tools) tool.setExpanded?.(expanded);
-		this.clearRenderCache();
-	}
-
-	invalidate(): void {
-		// Parent/group invalidation should NOT force every child tool through
-		// updateDisplay() (which re-runs call/result renderers). Drop our memo
-		// only; children keep their own ToolText/TOOL_RENDER_CACHE entries and
-		// recompute only when their content actually changes.
-		this.clearRenderCache();
-	}
-
-	render(width: number): string[] {
-		if (this.tools.length === 0) return [];
-		const safeWidth = Number.isFinite(width) ? Math.max(1, Math.floor(width)) : 1;
-		// Fast path: settled groups with a valid memo skip ALL child walks.
-		// Child mutations mark dirty via clearToolRenderCache → invalidate().
-		if (
-			!this.dirty
-			&& this.cachedLines
-			&& this.cachedWidth === safeWidth
-			&& this.cachedEpoch === _toolBranchVisualEpoch
-			&& this.cachedMode === toolBackgroundMode
-			&& this.cachedExpanded === this.expanded
-		) {
-			return this.cachedLines;
-		}
-
-		const status = this.statusSnapshot();
-		// Only memoize fully-settled groups. Pending groups must recompute so
-		// blink dots and live partial child content stay fresh. Long chats are
-		// almost entirely settled history, which is the expensive warm path.
-		const canCache = status.pending === 0;
-
-		const groupedName = getGroupedToolName(this.tools);
-		const label = getToolGroupLabel(this.tools);
-		const names = groupedName ? "" : formatToolNameList(this.tools);
-		const overall: ToolStatus = status.error > 0 ? "error" : status.pending > 0 ? "pending" : "success";
-		// Group header breathes only when every pending member is Agent-family;
-		// mixed groups keep the ordinary on/off light.
-		const pendingTools = this.tools.filter((tool) => getToolStatusForGroup(tool) === "pending");
-		const headerBreathe = pendingTools.length > 0 && pendingTools.every((tool) => isAgentFamilyToolName(getToolName(tool)));
-		const light = groupStatusLight(overall, { agentBreathe: headerBreathe });
-		const summaryLabel = `${label}:`;
-		const countParts: string[] = [];
-		if (status.pending) countParts.push(statusText("pending", status.pending));
-		if (status.success) countParts.push(statusText("success", status.success));
-		if (status.error) countParts.push(statusText("error", status.error));
-		const countsText = countParts.join(`${TRANSPARENT_RESET} • `);
-		const total = this.tools.length;
-		const lines: string[] = [];
-		const subject = this.expanded ? "" : getRepeatedToolSubject(this.tools, groupedName);
-		const collapseToSingleRow = !this.expanded && !!groupedName && !!subject;
-		if (collapseToSingleRow) {
-			const entry = { tools: this.tools, name: groupedName, subject };
-			const entryLine = getCollapsedToolEntryLine(entry, Math.max(1, safeWidth - 3));
-			lines.push(clampLineWidth(
-				` ${light} ${entryLine}${toolOutputDetailHint(undefined as any, false, true)}`,
-				safeWidth,
-			));
-		} else {
-			const summary = ` ${light} ${summaryLabel} ${countsText}${names ? ` ${TRANSPARENT_RESET}• ${names}` : ""}${toolOutputDetailHint(undefined as any, this.expanded, true)}`;
-			lines.push(" ".repeat(safeWidth), clampLineWidth(summary, safeWidth));
-			const childWidth = Math.max(1, safeWidth - 6);
-			if (this.expanded) {
-				for (let index = 0; index < total; index++) {
-					const tool = this.tools[index];
-					const branched = formatBranchedToolLines(
-						getExpandedToolGroupLines(tool, childWidth, groupedName ? label : undefined),
-						index,
-						total,
-						safeWidth,
-						getToolStatusForGroup(tool),
-						{ agentBreathe: isAgentFamilyToolName(getToolName(tool)) },
-					);
-					for (const line of branched) lines.push(clampLineWidth(line, safeWidth));
-				}
-			} else {
-				const entries = collapseRepeatedToolEntries(this.tools);
-				for (let index = 0; index < entries.length; index++) {
-					const entry = entries[index];
-					const branched = formatBranchedToolLines(
-						getCollapsedToolEntryLines(entry, childWidth, groupedName ? label : undefined),
-						index,
-						entries.length,
-						safeWidth,
-						getToolGroupOverallStatus(entry.tools),
-						{ agentBreathe: entry.tools.every((tool) => isAgentFamilyToolName(getToolName(tool))) },
-					);
-					for (const line of branched) lines.push(clampLineWidth(line, safeWidth));
-				}
+		const rows = child instanceof AssistantMessageComponent
+			? assistantActivityRows(child, width)
+			: [{ kind: "content", lines: child.render(width) }];
+		for (const row of rows) {
+			if (row.kind === "activity") pending.push(row.lines);
+			else {
+				// Empty assistant shells don't split a thinking/tool sequence.
+				if (child instanceof AssistantMessageComponent && row.lines.every((line: string) => isBlankLine(line))) continue;
+				flush();
+				output.push(...row.lines);
 			}
 		}
-
-		// Final clamp already applied per-line above; avoid a second full pass.
-		if (canCache) {
-			this.dirty = false;
-			this.cachedWidth = safeWidth;
-			this.cachedEpoch = _toolBranchVisualEpoch;
-			this.cachedMode = toolBackgroundMode;
-			this.cachedExpanded = this.expanded;
-			this.cachedBlinkPhase = true;
-			this.cachedStatusKey = status.key;
-			this.cachedToolCount = total;
-			this.cachedLines = lines;
-		} else {
-			this.clearRenderCache();
-		}
-		return lines;
 	}
-}
-
-function isToolGroupComponent(value: unknown): value is ToolGroupComponent {
-	return value instanceof ToolGroupComponent;
+	flush();
+	return output;
 }
 
 function isSpacerComponent(value: unknown): value is InstanceType<typeof Spacer> {
@@ -1045,127 +812,6 @@ function isMarkdownComponent(value: unknown): value is InstanceType<typeof Markd
 	return value instanceof Markdown || (value as any)?.constructor?.name === "Markdown";
 }
 
-function isIgnorableToolSeparator(value: unknown): boolean {
-	if (isSpacerComponent(value)) return true;
-	if (value instanceof AssistantMessageComponent || (value as any)?.constructor?.name === "AssistantMessageComponent") {
-		// Empty assistant framing stays ignorable so it never splits tool groups.
-		// A rendered thinking row ("Thought for Xs" / live thinking) is a visible
-		// boundary: tool calls that follow it must start a new group instead of
-		// silently joining the batch that ran before the thought.
-		const contentChildren = (value as any).contentContainer?.children;
-		if (!Array.isArray(contentChildren) || contentChildren.length === 0) return true;
-		return contentChildren.every((child: any) => isSpacerComponent(child));
-	}
-	return false;
-}
-
-function findPreviousToolSibling(children: any[], startIndex: number): { child: any; index: number } | undefined {
-	for (let index = startIndex; index >= 0; index--) {
-		const child = children[index];
-		if (isIgnorableToolSeparator(child)) continue;
-		return { child, index };
-	}
-	return undefined;
-}
-
-function ungroupActiveToolGroups(): void {
-	for (const group of [...ACTIVE_TOOL_GROUPS]) {
-		const parent = group?.[COMPONENT_PARENT];
-		const children = parent?.children;
-		if (!Array.isArray(children)) {
-			ACTIVE_TOOL_GROUPS.delete(group);
-			continue;
-		}
-		const index = children.indexOf(group);
-		if (index === -1) {
-			ACTIVE_TOOL_GROUPS.delete(group);
-			continue;
-		}
-		const tools = group.releaseTools();
-		for (const tool of tools) tool[COMPONENT_PARENT] = parent;
-		children.splice(index, 1, ...tools);
-	}
-}
-
-function isThinkingOnlyAssistantComponent(comp: unknown): comp is InstanceType<typeof AssistantMessageComponent> {
-	if (!comp || ((comp as any).constructor?.name !== "AssistantMessageComponent" && !(comp instanceof AssistantMessageComponent))) {
-		return false;
-	}
-	const msg = (comp as any).lastMessage;
-	if (!msg || msg.role !== "assistant" || !Array.isArray(msg.content)) return false;
-	const hasThinking = msg.content.some((c: any) => c?.type === "thinking" && typeof c?.thinking === "string" && c.thinking.trim());
-	if (!hasThinking) return false;
-	const hasText = msg.content.some((c: any) => c?.type === "text" && typeof c?.text === "string" && c.text.trim());
-	if (hasText) return false;
-	const hasToolCalls = msg.content.some((c: any) => c?.type === "toolCall");
-	if (hasToolCalls) return false;
-	if ((comp as any).isStreaming === true || msg[THINKING_ACTIVE_KEY]) return false;
-	return true;
-}
-
-function maybeMergeConsecutiveThinkingMessages(parent: any): void {
-	const children = parent?.children;
-	if (!Array.isArray(children) || children.length < 2) return;
-
-	for (let i = 0; i < children.length; i++) {
-		const current = children[i];
-		if (!isThinkingOnlyAssistantComponent(current)) continue;
-
-		let nextIdx = i + 1;
-		while (nextIdx < children.length && isSpacerComponent(children[nextIdx])) {
-			nextIdx++;
-		}
-		if (nextIdx >= children.length) break;
-
-		const nextComp = children[nextIdx];
-		if (isThinkingOnlyAssistantComponent(nextComp)) {
-			const curMsg = (current as any).lastMessage;
-			const nextMsg = (nextComp as any).lastMessage;
-
-			const durA = getMessageThinkingDurationMs(curMsg);
-			const durB = getMessageThinkingDurationMs(nextMsg);
-			const mergedDuration = durA + durB;
-
-			const nextThinkingBlocks = nextMsg.content.filter((c: any) => c?.type === "thinking");
-			curMsg.content.push(...nextThinkingBlocks);
-			curMsg[THINKING_DURATION_KEY] = mergedDuration;
-
-			(current as any).updateContent(curMsg);
-
-			const removeCount = nextIdx - i;
-			children.splice(i + 1, removeCount);
-			i--;
-		}
-	}
-}
-
-function maybeGroupToolComponent(parent: any, component: any): void {
-	if (!toolGroupingEnabled() || !isGroupableTool(component) || isToolGroupComponent(parent)) return;
-	const children = parent?.children;
-	if (!Array.isArray(children)) return;
-	const index = children.indexOf(component);
-	if (index <= 0) return;
-	const previousEntry = findPreviousToolSibling(children, index - 1);
-	if (!previousEntry) return;
-	const previous = previousEntry.child;
-	if (isToolGroupComponent(previous)) {
-		children.splice(index, 1);
-		previous.addTool(component);
-		maybeMergeConsecutiveThinkingMessages(parent);
-		return;
-	}
-	if (isGroupableTool(previous)) {
-		const group = new ToolGroupComponent();
-		group.setExpanded(Boolean((previous as any).expanded));
-		group.addTool(previous);
-		group.addTool(component);
-		(group as any)[COMPONENT_PARENT] = parent;
-		children[previousEntry.index] = group;
-		children.splice(index, 1);
-		maybeMergeConsecutiveThinkingMessages(parent);
-	}
-}
-
 function patchContainerParentTracking(): void {
 	const proto = Container.prototype as any;
 	if (proto[PARENT_TRACKING_PATCH_FLAG]) return;
@@ -1175,8 +821,6 @@ function patchContainerParentTracking(): void {
 	proto.addChild = function patchedAddChild(component: any) {
 		const result = originalAddChild.call(this, component);
 		if (component && typeof component === "object") component[COMPONENT_PARENT] = this;
-		maybeGroupToolComponent(this, component);
-		maybeMergeConsecutiveThinkingMessages(this);
 		return result;
 	};
 	proto.removeChild = function patchedRemoveChild(component: any) {
@@ -1222,12 +866,12 @@ function patchGlobalToolBorders(): void {
 
 	const originalRender = proto.render;
 	proto.render = function patchedContainerRender(width: number): string[] {
-		maybeMergeConsecutiveThinkingMessages(this);
 		if (isToolExecutionLike(this)) {
 			const cached = (this as any)[TOOL_RENDER_CACHE];
 			const branchKey = toolBranchRenderCacheKey();
 			if (
-				cached?.width === width
+				this.isPartial !== true
+				&& cached?.width === width
 				&& cached?.mode === toolBackgroundMode
 				&& cached?.branchKey === branchKey
 				&& cached?.branchEpoch === _toolBranchVisualEpoch
@@ -1236,7 +880,7 @@ function patchGlobalToolBorders(): void {
 			}
 		}
 
-		const rendered = originalRender.call(this, width);
+		const rendered = renderActivityTranscript(this, width) ?? originalRender.call(this, width);
 		if (!Array.isArray(rendered) || rendered.length === 0) return rendered;
 		const todoOverlay = formatTodoOverlayLines(rendered, width);
 		if (!isToolExecutionLike(this)) return todoOverlay;
@@ -1266,13 +910,7 @@ function patchGlobalToolBorders(): void {
 		const spacerLine = " ".repeat(width);
 		let result: string[];
 
-		if (toolBackgroundMode === "outlines") {
-			const ruleWidth = Math.max(1, width);
-			const framed = core.length > 0 ? [borderLine(ruleWidth), ...core, borderLine(ruleWidth)] : [];
-			result = [spacerLine, ...framed, ...imageLines];
-		} else {
-			result = [spacerLine, ...core, ...imageLines];
-		}
+		result = [spacerLine, ...core, ...imageLines];
 
 		(this as any)[TOOL_RENDER_CACHE] = { width, mode: toolBackgroundMode, lines: result, ...branchCache };
 		return result;
@@ -1339,11 +977,7 @@ function clearStateKeys(state: Record<string, unknown> | undefined, ...keys: str
 function clearToolRenderCache(value: unknown): void {
 	if (!value || typeof value !== "object") return;
 	delete (value as any)[TOOL_RENDER_CACHE];
-	// If this tool lives inside a ToolGroupComponent, drop the group's memo so
-	// settled headers/counts/child lines can't go stale after a child update.
-	// Only the parent group is touched — we do NOT cascade invalidate siblings.
-	const parent = (value as any)[COMPONENT_PARENT];
-	if (isToolGroupComponent(parent)) parent.invalidate();
+
 }
 
 function unrefTimer(timer: ReturnType<typeof setTimeout> | null | undefined): void {
@@ -2002,32 +1636,20 @@ class DottedParagraph {
 	}
 }
 
-function replaceHiddenThinkingPlaceholders(container: { children?: any[] }, message: any): void {
-	if (!container?.children) return;
+function replaceHiddenThinkingPlaceholders(container: { children?: any[]; child?: any }, message: any): void {
 	const summary = hiddenThinkingSummaryForMessage(message);
-	let firstReplaced = false;
-	for (let i = 0; i < container.children.length; i++) {
-		const child = container.children[i];
-		if (child instanceof HiddenThinkingSummary || (child as any)?.constructor?.name === "HiddenThinkingSummary") {
-			if (!firstReplaced) {
-				child.setSummary(summary);
-				firstReplaced = true;
-			} else {
-				container.children.splice(i, 1);
-				i--;
-			}
-			continue;
+	const replace = (child: any): any => {
+		if (child instanceof HiddenThinkingSummary) {
+			child.setSummary(summary);
+			return child;
 		}
-		if (isHiddenThinkingPlaceholderText(child)) {
-			if (!firstReplaced) {
-				container.children[i] = new HiddenThinkingSummary(summary);
-				firstReplaced = true;
-			} else {
-				container.children.splice(i, 1);
-				i--;
-			}
-		}
-	}
+		if (isHiddenThinkingPlaceholderText(child)) return new HiddenThinkingSummary(summary);
+		// Preserve MouseRegion identity and its click handler on newer Pi versions.
+		if (child?.child) child.child = replace(child.child);
+		return child;
+	};
+	if (container.children) container.children = container.children.map(replace);
+	if (container.child) container.child = replace(container.child);
 }
 
 class ThinkingParagraph {
@@ -2190,9 +1812,6 @@ function frameToolLikeLines(lines: string[], width: number): string[] {
 	const core = trimRenderedBlankLines(lines).map((line) => clampLineWidth(line, safeWidth));
 	if (core.length === 0 || toolBackgroundMode === "default") return core;
 	const spacerLine = " ".repeat(safeWidth);
-	if (toolBackgroundMode === "outlines") {
-		return [spacerLine, borderLine(safeWidth), ...core, borderLine(safeWidth)];
-	}
 	return [spacerLine, ...core];
 }
 
@@ -2311,6 +1930,13 @@ function patchAssistantMessages(): void {
 			return storeMessageRenderCache(this, width, applyTerminalCopyZones(lines));
 		};
 		proto[ASSISTANT_RENDER_PATCH_FLAG] = true;
+	}
+	const originalSetHideThinkingBlock = proto.setHideThinkingBlock;
+	if (typeof originalSetHideThinkingBlock === "function") {
+		proto.setHideThinkingBlock = function (hide: boolean) {
+			this[THINKING_EXPANDED_KEY] = !hide;
+			return originalSetHideThinkingBlock.call(this, hide);
+		};
 	}
 	const originalUpdateContent = proto.updateContent;
 	proto.updateContent = function patchedUpdateContent(message: any, isStreaming?: boolean) {
@@ -2527,6 +2153,8 @@ function patchToolExecutionRenderers(): void {
 		if (toolName === "apply_patch") {
 			renderer = (result: any, options: any, theme: Theme, ctx: any) =>
 				renderApplyPatchResult({ content: result.content, details: result.details }, options.isPartial, theme, ctx);
+		} else if (typeof originalGetResultRenderer === "function" && typeof originalGetResultRenderer.call(this) === "function") {
+			renderer = originalGetResultRenderer.call(this);
 		} else if (shouldUseGenericToolRenderer(toolName)) {
 			renderer = (result: any, options: any, theme: Theme, ctx: any) =>
 				renderGenericToolResult(toolName, result, options, theme, ctx);
@@ -6005,6 +5633,7 @@ function summarizeMcpToolCall(args: any, theme: Theme): string {
 }
 
 function summarizeGenericToolCall(name: string, args: any, theme: Theme, sp: (path: string) => string): string {
+	if (name === "code_execution") return summarizeText(String(args?.code ?? "").trim().split("\n")[0] ?? "", 100);
 	if (isMcpToolName(name)) return summarizeMcpToolCall(args, theme);
 	return summarizeOpenAiToolCall(name, args, theme, sp);
 }
@@ -6430,7 +6059,6 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				setToolGroupingEnabled(next);
-				if (!next) ungroupActiveToolGroups();
 				if (ctx.hasUI) {
 					ctx.ui.setToolsExpanded(ctx.ui.getToolsExpanded());
 					ctx.ui.notify(`Tool grouping: ${next ? "on" : "off"}${next ? " (future adjacent tool rows)" : ""}`, "info");

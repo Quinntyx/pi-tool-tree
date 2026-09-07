@@ -144,8 +144,8 @@ const neq = (a: string[], b: string[], label: string) => {
 		const outlines = c.render(W);
 		const outlinesWarm = c.render(W);
 		eq(outlinesWarm, outlines, "custom: warm cache identical in outlines mode");
-		if (!hasFullWidthRule(outlines)) {
-			throw new Error("outlines mode did not produce full-width border rule lines");
+		if (hasFullWidthRule(outlines)) {
+			throw new Error("legacy outlines mode must not draw horizontal rules");
 		}
 
 		// Switch to default mode (no borders). Cache must miss and reframe.
@@ -165,7 +165,8 @@ const neq = (a: string[], b: string[], label: string) => {
 		console.log("OK  custom message: toolBackgroundMode change invalidates framing");
 	} finally {
 		process.env.HOME = realHome;
-		fs.rmSync(tmpHome, { recursive: true, force: true });
+		const { execFileSync } = await import("node:child_process");
+		execFileSync("trash", [tmpHome]);
 	}
 }
 
@@ -281,17 +282,15 @@ const neq = (a: string[], b: string[], label: string) => {
 		(tool as any).updateResult({ content: [{ type: "text", text: "tool " + i + " output\n" }], isError: false });
 		parent.addChild(tool);
 	}
-	if (parent.children.length !== 1) throw new Error(`expected 1 ToolGroup child, got ${parent.children.length}`);
-	const group = parent.children[0] as any;
-	if (group.tools?.length !== 8) throw new Error(`expected 8 tools in group, got ${group.tools?.length}`);
+	if (parent.children.length !== 8) throw new Error("render-only grouping moved the tool components");
 	const clean = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "").replace(/\x1b\][^\x07]*\x07/g, "").trim();
 	const lines = parent.render(W).map(clean).filter(Boolean);
-	if (!lines.some((l) => l.includes("8 done"))) throw new Error(`group header did not report 8 done; got: ${JSON.stringify(lines)}`);
-	console.log("OK  tool grouping: 8 tools group into 1 group without 4-tool cap");
+	if (lines.filter((line) => /^[╭├╰]─/.test(line)).length !== 8) throw new Error("expected eight distinct tree children");
+	console.log("OK  tool grouping: 8 tools render as distinct tree children without a cap");
 }
 
 // ---------------------------------------------------------------------------
-// 10. Merging consecutive thoughts: adjacent thinking-only messages merge into one summary.
+// 10. Consecutive thoughts remain separate tree items without mutating messages.
 // ---------------------------------------------------------------------------
 {
 	const parent = new Container();
@@ -323,13 +322,14 @@ const neq = (a: string[], b: string[], label: string) => {
 	const clean = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "").replace(/\x1b\][^\x07]*\x07/g, "").trim();
 	const lines = parent.render(W).map(clean).filter(Boolean);
 	const thoughtLines = lines.filter((l) => l.includes("Thought for"));
-	if (thoughtLines.length !== 1) {
-		throw new Error(`expected exactly 1 merged thought line, got ${thoughtLines.length}: ${JSON.stringify(thoughtLines)}`);
+	if (thoughtLines.length !== 3) throw new Error(`expected three thinking children, got ${thoughtLines.length}`);
+	for (const [index, seconds] of [3, 1, 7].entries()) {
+		if (!thoughtLines[index].includes(`Thought for ${seconds}s`)) throw new Error("thought duration/order changed");
 	}
-	if (!thoughtLines[0].includes("Thought for 11s")) {
-		throw new Error(`expected Thought for 11s, got: ${thoughtLines[0]}`);
+	for (const comp of [comp1, comp2, comp3]) {
+		if ((comp as any).lastMessage.content.length !== 1) throw new Error("grouping mutated thinking content");
 	}
-	console.log("OK  consecutive thoughts: merged into single Thought for 11s");
+	console.log("OK  consecutive thoughts: distinct tree items with original messages intact");
 }
 
 // ---------------------------------------------------------------------------

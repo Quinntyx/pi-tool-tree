@@ -26,7 +26,7 @@ Claude Code inspired tool rendering for Pi — Shiki-powered diffs, status dots,
 - **Adaptive edit/write diffs** with split or unified layouts, syntax highlighting, and inline word-level emphasis
 - **Diff stat bar** with colored add/remove summary and hunk metadata
 - **Progressive collapsed diff hints** that shorten on narrow terminals
-- **Live-only thinking** (default) — only the actively-streaming thinking renders expanded; finished thinking collapses to a one-line `Thought for Xs` row (`/cc-tools thinking full` restores always-expanded, `Ctrl+O` still expands anything)
+- **Live-only thinking** (default) — thinking streams inside its tree child; finished thinking collapses to a one-line `Thought for Xs` row (`/cc-tools thinking full` restores always-expanded, `Ctrl+T` still expands thinking)
 - **MCP-aware rendering** with hidden, summary, and preview modes
 - **Configurable output modes** for read, search, bash, and MCP results
 - **Live running previews** that show a few output lines for active tool calls (latest lines for bash), persisting until the next tool/text activity
@@ -36,7 +36,9 @@ Claude Code inspired tool rendering for Pi — Shiki-powered diffs, status dots,
 - **Theme-adaptive palette** — borders, branch connectors, dim text, and diff backgrounds automatically follow the active pi theme (set `themeAdaptive: false` to keep the fixed Claude-style palette)
 - **Light Ghostty-sync themes** — edit/write diffs use `github-light` highlighting and light-tinted diff rows; tool pending dots use softer chrome colors
 - **Transparent edit/write diffs** with universal red/green diff colors
-- **Grouped consecutive tool calls** with single-row summaries for repeated targets and per-tool glance rows for mixed work (set `groupToolCalls: false` to disable)
+- **Unified activity trees** with a distinct child for every tool call and thinking run, including repeated calls. Assistant prose and user messages remain outside the tree (set `groupToolCalls: false` to disable).
+- **Native custom-tool animations** (including Code Execution) remain visible while running, collapse on completion, and expand again with `Ctrl+O`.
+- **No horizontal tool rules**, including when older settings select `border` or `outlines`.
 - **Extra detail toggle** with `Ctrl+Shift+O`, increasing expanded preview caps without making the default view heavy
 - **Global border patch** for all tool rows, including unknown/custom tools
 
@@ -74,7 +76,7 @@ When `themeAdaptive` is `true` (default), the following colors are derived from 
 | Element | Derived from |
 |---------|--------------|
 | Tool rules, code fences | `dim` → `muted` → `borderMuted` → `thinkingText` |
-| Branch connectors (`├`, `└`, `│`) | **fixed rgb(72)** by default (theme-independent); `/cc-tools branch theme` to follow pi theme |
+| Branch connectors (`╭─`, `├─`, `╰─`, `│`) | **fixed rgb(72)** by default (theme-independent); `/cc-tools branch theme` to follow pi theme |
 | "✻ Turn took Ns" line (final message only, with session total + turn count) | `muted` |
 | Expanded thinking-block text and `∴` marker | `muted` |
 | Diff add/remove accents | `toolDiffAdded` / `toolDiffRemoved` |
@@ -104,7 +106,7 @@ The selection is persisted to `~/.pi/settings.json` and applied to the next rend
 |-------|----------|
 | `default` | Standard Pi tool backgrounds |
 | `transparent` | Transparent tool backgrounds |
-| `border` | Transparent backgrounds with top/bottom border lines |
+| `border` | Transparent backgrounds (legacy alias; no horizontal rules) |
 
 Use `/cc-tools` to control tool UI at runtime:
 
@@ -135,7 +137,7 @@ Use `/cc-tools` to control tool UI at runtime:
 | `expandedPreviewMaxLines` | `4000` | Max lines when expanded with Ctrl+O |
 | `extraExpandedPreviewMaxLines` | `12000` | Max lines after Ctrl+Shift+O extra-detail mode |
 | `extraToolOutputExpanded` | `false` | Start with Ctrl+Shift+O extra-detail mode enabled |
-| `groupToolCalls` | `true` | Group adjacent/concurrent calls, collapsing repeated targets into one row |
+| `groupToolCalls` | `true` | Group adjacent thinking/tool activity with one child per call |
 | `thinkingMode` | `live` | `live` = only streaming thinking expands (finished collapse to `Thought for Xs`); `full` = always expanded |
 | `bashCollapsedLines` | `10` | Lines for collapsed bash output |
 | `bashCommandPreviewLines` | `8` | Verbatim script lines shown while bash runs or after failure; `0` disables them |
