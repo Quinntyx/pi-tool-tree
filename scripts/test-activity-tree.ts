@@ -19,7 +19,7 @@ const ui = { requestRender() {} };
 let frame = 1;
 let nativeRenders = 0;
 const definition = {
-	name: "code_execution", label: "Code Execution", description: "Test native animation", parameters: {},
+	name: "code_execution", label: "python", description: "Test native animation", parameters: {},
 	renderResult(_result: any, { isPartial }: any) {
 		nativeRenders++;
 		return { invalidate() {}, render: () => [isPartial ? `Executing Python frame ${frame}` : "completed output", "  ▶ preserved indentation"] };
@@ -38,7 +38,7 @@ parent.addChild(first);
 parent.addChild(second);
 let output = plain(parent.render(100));
 assert.equal(parent.children.length, 2, "grouping must not move original components");
-assert.equal(output.split("\n").filter((line) => /[├╰] .*Code Execution/.test(line)).length, 2);
+assert.equal(output.split("\n").filter((line) => /[├╰] .*python/.test(line)).length, 2);
 assert.ok(output.includes("Executing Python frame 1"));
 assert.ok(!output.includes("×2"));
 assert.ok(!output.includes("Code Execution Code Execution"));
@@ -72,11 +72,11 @@ assistant.updateContent(after, false);
 parent.addChild(tool("three", "print('third')", true, true));
 output = plain(parent.render(100));
 assert.ok(output.includes("├ Thought for"));
-assert.ok(output.split("\n").some((line) => /^ [├╰] ✓ Code Execution/.test(line)), "success uses a checkmark");
-assert.ok(output.split("\n").some((line) => /^ [├╰] ! Code Execution/.test(line)), "failure uses an exclamation mark");
+assert.ok(output.split("\n").some((line) => /^ [├╰] ✓ python/.test(line)), "success uses a checkmark");
+assert.ok(output.split("\n").some((line) => /^ [├╰] ! python/.test(line)), "failure uses an exclamation mark");
 assert.ok(!output.includes("✓ ✓") && !output.includes("! !"), "status markers must not be duplicated");
 assert.ok(!output.includes("Reasoning about"), "completed thinking collapses by default");
-assert.equal(output.split("\n").filter((line) => /[├╰] .*Code Execution/.test(line)).length, 3);
+assert.equal(output.split("\n").filter((line) => /[├╰] .*python/.test(line)).length, 3);
 assistant.setHideThinkingBlock(false);
 const expandedOutput = plain(parent.render(100));
 assert.ok(expandedOutput.includes("Reasoning about"), "Ctrl+T still expands thoughts");

@@ -655,8 +655,7 @@ function getToolCallLine(tool: any): string {
 		return line.replaceAll(WRAP_MARK, "").replaceAll(CLIP_MARK, "");
 	}
 	const summary = getToolArgSummary(tool);
-	const label = humanizeToolName(getToolName(tool));
-	return `${label}${summary ? ` ${summary}` : ""}`;
+	return `${getToolName(tool)}${summary ? ` ${summary}` : ""}`;
 }
 
 function alignTrailingMarkedLine(line: string, width: number): string {
@@ -2157,7 +2156,8 @@ function patchToolExecutionRenderers(): void {
 				renderApplyPatchCall(args, theme, ctx, (path: string) => shortPath(ctx.cwd ?? process.cwd(), path));
 		}
 		if (shouldUseGenericToolRenderer(toolName)) {
-			return (args: any, theme: Theme, ctx: any) => renderGenericToolCall(toolName, args, theme, ctx);
+			const registeredLabel = typeof this?.toolDefinition?.label === "string" ? this.toolDefinition.label.trim() : "";
+			return (args: any, theme: Theme, ctx: any) => renderGenericToolCall(toolName, args, theme, ctx, registeredLabel);
 		}
 		return typeof originalGetCallRenderer === "function" ? originalGetCallRenderer.call(this) : undefined;
 	};
@@ -5060,13 +5060,6 @@ function isOpenAiToolCandidate(tool: unknown): boolean {
 	return OPENAI_STYLE_TOOL_NAMES.has(name);
 }
 
-function humanizeToolName(name: string): string {
-	return name
-		.replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-		.replace(/[_-]+/g, " ")
-		.replace(/\b\w/g, (char) => char.toUpperCase());
-}
-
 function isMcpToolName(name: string): boolean {
 	return name === "mcp" || /^mcp[_:-]/i.test(name) || /[_:-]mcp[_:-]/i.test(name);
 }
@@ -5076,19 +5069,20 @@ function shouldUseGenericToolRenderer(name: unknown): boolean {
 }
 
 function genericToolLabel(name: string): string {
-	return isMcpToolName(name) ? "MCP" : humanizeToolName(name);
+	return isMcpToolName(name) ? "mcp" : name.toLowerCase();
 }
 
-function renderGenericToolCall(name: string, args: any, theme: Theme, ctx: any): Text {
+function renderGenericToolCall(name: string, args: any, theme: Theme, ctx: any, preferredLabel?: string): Text {
 	syncToolCallStatus(ctx);
 	ctx.state._openAiPatchFiles = [];
 	// Agent / subagent tools get a size-breathing pending marker, not on/off ●.
 	if (isAgentFamilyToolName(name)) ctx.state._agentBreathe = true;
 	const sp = (path: string) => shortPath(ctx.cwd ?? process.cwd(), path);
 	const summary = stableCallSummary(ctx, "_callSummary", () => summarizeGenericToolCall(name, args, theme, sp));
+	const label = typeof preferredLabel === "string" && preferredLabel.trim() ? preferredLabel.trim() : genericToolLabel(name);
 	return makeText(
 		ctx.lastComponent,
-		toolHeader(genericToolLabel(name), summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme)),
+		toolHeader(label, summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme)),
 	);
 }
 
@@ -5567,7 +5561,7 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 	syncToolCallStatus(ctx);
 	const patchText = getStringArg(args, "patchText", "patch_text");
 	const summary = stableCallSummary(ctx, "_callSummary", () => summarizeOpenAiToolCall("apply_patch", args, theme, sp));
-	const hdr = toolHeader("Apply Patch", summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme));
+	const hdr = toolHeader("apply_patch", summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme));
 
 	if (!ctx.argsComplete) return makeText(ctx.lastComponent, hdr);
 	const preview = getCachedApplyPatchPreview(patchText, sp, ctx);
@@ -5791,7 +5785,7 @@ function summarizeOpenAiToolCall(name: string, args: any, theme: Theme, sp: (pat
 		}
 		default:
 			return summarizeText(
-				getStringArg(args, "path", "file_path", "url", "query", "name", "subject", "tool", "description", "prompt") || humanizeToolName(name),
+				getStringArg(args, "path", "file_path", "url", "query", "name", "subject", "tool", "description", "prompt") || name.toLowerCase(),
 				72,
 			);
 	}
@@ -5930,7 +5924,7 @@ function renderReadImageResult(result: any, expanded: boolean, theme: Theme, ctx
 
 function renderOpenAiToolResult(name: string, result: any, expanded: boolean, isPartial: boolean, theme: Theme, ctx: any): Text {
 	if (isPartial) {
-		return makeText(ctx.lastComponent, runningPreviewBlock(result, theme.fg("dim", `${humanizeToolName(name)}...`), expanded, theme, ctx));
+		return makeText(ctx.lastComponent, runningPreviewBlock(result, theme.fg("dim", `${name.toLowerCase()}...`), expanded, theme, ctx));
 	}
 	clearBlinkTimer(ctx);
 	setToolStatus(ctx, ctx.isError ? "error" : "success");
@@ -6334,7 +6328,7 @@ export default function (pi: ExtensionAPI) {
 			});
 			return makeText(
 				ctx.lastComponent,
-				toolHeader("Read", summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme)),
+				toolHeader("read", summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme)),
 			);
 		},
 		renderResult(result, { expanded, isPartial }, theme, ctx) {
@@ -6378,7 +6372,7 @@ export default function (pi: ExtensionAPI) {
 			const commandBlock = showCommand ? renderBashCommandBlock(command, ctx.expanded === true, theme) : "";
 			const headerSummary = ctx.expanded === true && commandBlock ? describeBashSource(presentation) : summary;
 			const header = toolHeader(
-				"Bash",
+				"bash",
 				`${headerSummary}${rtkBadge}`,
 				theme,
 				toolStatusDot(ctx, theme),
@@ -6447,7 +6441,7 @@ export default function (pi: ExtensionAPI) {
 			});
 			return makeText(
 				ctx.lastComponent,
-				toolHeader("Grep", summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme)),
+				toolHeader("grep", summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme)),
 			);
 		},
 		renderResult(result, { expanded, isPartial }, theme, ctx) {
@@ -6487,7 +6481,7 @@ export default function (pi: ExtensionAPI) {
 			});
 			return makeText(
 				ctx.lastComponent,
-				toolHeader("Find", summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme)),
+				toolHeader("find", summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme)),
 			);
 		},
 		renderResult(result, { expanded, isPartial }, theme, ctx) {
@@ -6534,7 +6528,7 @@ export default function (pi: ExtensionAPI) {
 			const summary = stableCallSummary(ctx, "_callSummary", () => sp(args.path ?? "."));
 			return makeText(
 				ctx.lastComponent,
-				toolHeader("List", summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme)),
+				toolHeader("ls", summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme)),
 			);
 		},
 		renderResult(result, { expanded, isPartial }, theme, ctx) {
@@ -6605,7 +6599,7 @@ export default function (pi: ExtensionAPI) {
 			const revealSummary = shouldRevealCallArgs(ctx) || (!!fp && hasOwnArg(args, "content"));
 			syncToolCallStatus(ctx);
 			const wasNew = getWriteWasNewFile(ctx, cwd, fp, revealSummary);
-			const label = wasNew === true ? "Create" : "Write";
+			const label = "write";
 			const summary = stableCallSummary(ctx, "_callSummary", () => {
 				const base = sp(fp);
 				return shouldRevealCallArgs(ctx) ? `${base} ${theme.fg("muted", `(${lineCount(args.content ?? "")} lines)`)}` : base;
@@ -6733,7 +6727,7 @@ export default function (pi: ExtensionAPI) {
 			const revealSummary = shouldRevealCallArgs(ctx) || (!!fp && hasOwnArg(args, "edits"));
 			const summary = stableCallSummary(ctx, "_callSummary", () => shouldRevealCallArgs(ctx) && operations.length > 1 ? `${sp(fp)} ${theme.fg("muted", `(${operations.length} edits)`)}` : sp(fp), revealSummary);
 			syncToolCallStatus(ctx);
-			const hdr = toolHeader("Edit", summary, theme, ` ${toolStatusDot(ctx, theme)}`, liveLineCountTrailing(ctx, theme));
+			const hdr = toolHeader("edit", summary, theme, ` ${toolStatusDot(ctx, theme)}`, liveLineCountTrailing(ctx, theme));
 			if (!(ctx.argsComplete && operations.length > 0)) return makeText(ctx.lastComponent, hdr);
 			const diffWidth = contextDiffWidth(ctx, 3);
 			const key = `edit:${fp}:${hashText(operations.map((edit) => `${edit.oldText}\u0000${edit.newText}`).join("\u0001"))}:${diffWidth}:${ctx.expanded ? 1 : 0}`;
@@ -6803,7 +6797,7 @@ export default function (pi: ExtensionAPI) {
 			const execute = typeof record.execute === "function" ? (record.execute as any) : null;
 			if (!execute) continue;
 			const rawLabel = typeof record.label === "string" ? record.label.trim() : "";
-			const label = rawLabel && rawLabel !== name && !rawLabel.includes("_") ? rawLabel : humanizeToolName(name);
+			const label = rawLabel && rawLabel !== name && !rawLabel.includes("_") ? rawLabel : name.toLowerCase();
 			const description = typeof record.description === "string" ? record.description : label;
 			(pi as any).registerTool({
 				name,
@@ -6848,7 +6842,7 @@ export default function (pi: ExtensionAPI) {
 			if (!name || wrappedMcpTools.has(name)) continue;
 			const execute = typeof record.execute === "function" ? (record.execute as any) : null;
 			if (!execute) continue;
-			const label = typeof record.label === "string" ? record.label : name === "mcp" ? "MCP" : `MCP ${name}`;
+			const label = typeof record.label === "string" ? record.label : name.toLowerCase();
 			const description = typeof record.description === "string" ? record.description : "MCP tool";
 			(pi as any).registerTool({
 				name,
