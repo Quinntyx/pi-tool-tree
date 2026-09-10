@@ -177,8 +177,10 @@ assert.ok(listOutput.includes("first item"));
 	assert.ok(isPaddingRow(lines[textIndex + 1]), `user bubble keeps its bottom padding row: ${JSON.stringify(lines[textIndex + 1])}`);
 }
 
-// Pending lights default to the circle-breathe cycle, with the braille spinner and
-// the classic blinking dot available through /cc-tools pending.
+// Pending lights belong to the call rows: they default to the circle-breathe cycle, with
+// the braille spinner and the classic blinking dot available through /cc-tools pending. A
+// group header keeps a steady ● — its label already animates (the shimmer sweep), so a
+// second animation on the same line only competes with it.
 {
 	const realNow = Date.now;
 	let fakeNow = 1_700_000_000_000;
@@ -186,9 +188,15 @@ assert.ok(listOutput.includes("first item"));
 	const breathe = "●•· ·•";        // AGENT_BREATHE_GLYPHS
 	const spinner = "⠃⠉⠘⠰⢠⣀⡄⠆";
 	const ctx = { hasUI: true, ui: { theme, notify() {}, getToolsExpanded: () => false, setToolsExpanded() {} } };
+	// A header light sits between the margin and the label; a call row's light sits between
+	// the ├/╰ connector and the tool name.
 	const glyphOf = (parent: Container) => {
 		const line = plain(parent.render(100)).split("\n").find((l) => l.includes("implementing")) ?? "";
 		return line[1] ?? "";
+	};
+	const rowGlyphOf = (parent: Container) => {
+		const line = plain(parent.render(100)).split("\n").find((l) => l.includes("python")) ?? "";
+		return line.trimStart().replace(/^[├╰│] /, "")[0] ?? "";
 	};
 	const pendingTool = (id: string) => {
 		const parent = new Container();
@@ -200,25 +208,30 @@ assert.ok(listOutput.includes("first item"));
 	};
 	try {
 		const breathing = pendingTool("breathe-frame");
-		const first = glyphOf(breathing.parent);
-		assert.ok(breathe.includes(first), `a pending group must breathe by default: ${JSON.stringify(first)}`);
-		// One 500ms beat advances the cycle (big ● → •), clock-driven like the spinner.
+		// The header is a steady ● whether the call is running or settled: the shimmering label
+		// carries the liveness, and the pending cycle lives on the row below.
+		assert.equal(glyphOf(breathing.parent), "●", `a pending group header keeps a steady light: ${JSON.stringify(glyphOf(breathing.parent))}`);
 		fakeNow += 500;
-		const second = glyphOf(breathing.parent);
-		assert.notEqual(second, first, "the breathe glyph must advance with the clock");
-		assert.ok(breathe.includes(second), `breathe frames stay in the cycle: ${JSON.stringify(second)}`);
+		assert.equal(glyphOf(breathing.parent), "●", "the header light must not advance with the clock");
+		// Individual call rows keep the configured pending light, clock-driven like the spinner.
+		const rowFirst = rowGlyphOf(breathing.parent);
+		assert.ok(breathe.includes(rowFirst), `a pending call row breathes by default: ${JSON.stringify(rowFirst)}`);
+		fakeNow += 500;
+		assert.notEqual(rowGlyphOf(breathing.parent), rowFirst, "the row's breathe glyph must advance with the clock");
 		// Settled groups show the static filled light (green ●), never a cycle frame.
 		breathing.component.updateResult({ content: [{ type: "text", text: "ok" }], isError: false } as any, false);
 		assert.equal(glyphOf(breathing.parent), "●", "a settled group shows the static status light");
+		assert.equal(rowGlyphOf(breathing.parent), "✓", "a settled call row shows its ✓");
 
 		const spinnerCase = pendingTool("spinner-frame");
 		await commands.get("cc-tools").handler("pending spinner", ctx);
-		assert.ok(spinner.includes(glyphOf(spinnerCase.parent)), `spinner mode still works: ${JSON.stringify(glyphOf(spinnerCase.parent))}`);
+		assert.ok(spinner.includes(rowGlyphOf(spinnerCase.parent)), `spinner mode drives the call row: ${JSON.stringify(rowGlyphOf(spinnerCase.parent))}`);
+		assert.equal(glyphOf(spinnerCase.parent), "●", "the header stays steady in spinner mode");
 		const dotCase = pendingTool("dot-frame");
 		await commands.get("cc-tools").handler("pending dot", ctx);
-		assert.ok("● ".includes(glyphOf(dotCase.parent)), `dot mode must blink, not cycle: ${JSON.stringify(glyphOf(dotCase.parent))}`);
+		assert.ok("● ".includes(rowGlyphOf(dotCase.parent)), `dot mode must blink the row, not cycle: ${JSON.stringify(rowGlyphOf(dotCase.parent))}`);
 		await commands.get("cc-tools").handler("pending breathe", ctx);
-		assert.ok(breathe.includes(glyphOf(spinnerCase.parent)), "breathe mode comes back as the default");
+		assert.ok(breathe.includes(rowGlyphOf(spinnerCase.parent)), "breathe mode comes back as the default");
 	} finally {
 		Date.now = realNow;
 	}

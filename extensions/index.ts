@@ -95,7 +95,7 @@ interface SettingsFile {
 	groupToolCalls?: boolean;
 	/** Group neighboring tool calls by the model's per-call `activity` label. Default true. */
 	activityGroups?: boolean;
-	/** Pending light: `breathe` (default, circle-breathe ● • ·), `spinner` (braille), or `dot`. */
+	/** Pending light for individual tool calls: `breathe` (default, circle-breathe ● • ·), `spinner` (braille), or `dot`. Group headers stay steady. */
 	pendingIndicator?: "breathe" | "spinner" | "dot";
 	/** Sweep a highlight across the activity label while its group is running. Default true. */
 	activityShimmer?: boolean;
@@ -587,11 +587,12 @@ function paintStatusDot(colorAnsi: string): string {
 }
 
 /**
- * Pending indicator. Default is the circle-breathe cycle (big ● → • → · → invisible →
- * · → •); `pendingIndicator: "spinner"` uses a single-cell braille spinner and
- * `"dot"` restores the classic on/off ●. Frames come from the wall clock (not from a
- * frame counter), so grouped rows, native rows and the group header all show the same
- * frame no matter which of them happened to repaint last.
+ * Pending indicator for individual tool calls. Default is the circle-breathe cycle (big ● →
+ * • → · → invisible → · → •); `pendingIndicator: "spinner"` uses a single-cell braille
+ * spinner and `"dot"` restores the classic on/off ●. Frames come from the wall clock (not
+ * from a frame counter), so grouped rows and native rows show the same frame no matter
+ * which of them happened to repaint last. Group headers do not use this: their light is a
+ * steady ●, because their label already animates.
  */
 const SPINNER_FRAMES = ["⠃", "⠉", "⠘", "⠰", "⢠", "⣀", "⡄", "⠆"] as const;
 /** Spinner cadence; also the repaint beat while a spinner is pending. */
@@ -1199,7 +1200,11 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 		// Only tool calls count as calls — a thought row is not a call.
 		const count = tools.length;
 		const color = failedCount > 0 ? TOOL_STATUS_ERROR : pendingCount > 0 ? TOOL_STATUS_PENDING : TOOL_STATUS_SUCCESS;
-		const dot = pendingCount > 0 ? paintPendingLight(color) : paintStatusDot(color);
+		// The header light is steady. Its label already animates (the shimmer sweep) and every
+		// call row below carries the configured pending light, so a second animation on this
+		// line only competes with the sweep. The color still reads pending (dim) → success
+		// (green) / error (red).
+		const dot = paintStatusDot(color);
 		const parts: string[] = [];
 		// An unlabeled call inherits the previous group's label (see pass 2). When there
 		// is nothing to inherit — the first group of a run, a tool that never declared
@@ -6873,7 +6878,7 @@ export default function (pi: ExtensionAPI) {
 							m === "group" ? "Toggle grouped adjacent/concurrent tool rows"
 							: m === "activity" ? "Toggle the activity label on tool calls"
 							: m === "shimmer" ? "Toggle the highlight sweep on running group labels"
-							: m === "pending" ? "Pending light: circle-breathe (default), braille spinner, or blinking dot"
+							: m === "pending" ? "Per-call pending light: circle-breathe (default), braille spinner, or blinking dot (group headers stay steady)"
 							: m === "thinking" ? "Thinking display: live (default) or full"
 							: m === "detail" ? "Toggle Ctrl+Shift+O extra-detail mode"
 							: m === "branch" ? "├ └ │ gray (0-255), theme, fixed, or reset"
