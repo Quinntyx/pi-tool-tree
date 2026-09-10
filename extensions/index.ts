@@ -40,6 +40,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import { Type } from "@sinclair/typebox";
 
 import * as Diff from "diff";
 import type { BundledLanguage, BundledTheme } from "shiki";
@@ -91,6 +92,10 @@ interface SettingsFile {
 	extraExpandedPreviewMaxLines?: number;
 	extraToolOutputExpanded?: boolean;
 	groupToolCalls?: boolean;
+	/** Group neighboring tool calls by the model's per-call `activity` label. Default true. */
+	activityGroups?: boolean;
+	/** Inject the required `activity` param into every tool schema. Default true. */
+	toolActivityParam?: boolean;
 	bashOutputMode?: "opencode" | "summary" | "preview";
 	bashCollapsedLines?: number;
 	/** Verbatim script lines shown while bash is running or after failure. Defaults to 8. */
@@ -764,49 +769,251 @@ function toolActivityLines(tool: any, width: number): string[] {
 	return lines;
 }
 
+/** Activity labels group neighboring tool calls into model-named phases. */
+const ACTIVITY_PARAM = "activity";
+const ACTIVITY_WRAPPED = Symbol.for("pi-tool-tree:activity-wrapped");
+const DEFAULT_ACTIVITY_LABEL = "working";
+
+function activityGroupsEnabled(): boolean {
+	return readSettings().activityGroups !== false;
+}
+
+function toolActivityParamEnabled(): boolean {
+	return readSettings().toolActivityParam !== false;
+}
+
+function normalizeActivityLabel(raw: unknown): string {
+	if (typeof raw !== "string") return "";
+	return raw.trim().toLowerCase().replace(/\s+/g, " ").slice(0, 24);
+}
+
+function activityLabelOf(tool: any): string {
+	return normalizeActivityLabel(tool?.args?.[ACTIVITY_PARAM]);
+}
+
+/** Live tool durations for group headers. Lost on restart (Pi doesn't persist them). */
+const TOOL_TIMINGS = new Map<string, { start: number; end?: number }>();
+
+function recordToolStart(toolCallId: string): void {
+	if (TOOL_TIMINGS.size > 4096) {
+		let dropped = 0;
+		for (const key of TOOL_TIMINGS.keys()) {
+			TOOL_TIMINGS.delete(key);
+			if (++dropped >= 1024) break;
+		}
+	}
+	TOOL_TIMINGS.set(toolCallId, { start: Date.now() });
+}
+
+function recordToolEnd(toolCallId: string): void {
+	const record = TOOL_TIMINGS.get(toolCallId);
+	if (record) record.end = Date.now();
+}
+
+/** Add the required `activity` param to a tool schema. Returns undefined when the
+ *  schema shape can't safely carry it (then the tool is left unwrapped). */
+function withActivityParam(parameters: any): any | undefined {
+	if (!parameters || typeof parameters !== "object") return undefined;
+	if (parameters.type !== "object" || !parameters.properties || typeof parameters.properties !== "object") return undefined;
+	if (parameters.properties[ACTIVITY_PARAM]) return parameters;
+	if (Array.isArray(parameters.required) && parameters.required.includes(ACTIVITY_PARAM)) return parameters;
+	return {
+		...parameters,
+		properties: {
+			...parameters.properties,
+			[ACTIVITY_PARAM]: Type.String({
+				description:
+					"One or two lowercase words naming the activity this call belongs to (e.g. exploring, implementing, testing). " +
+					"Reuse the previous call's word when continuing the same activity.",
+				default: DEFAULT_ACTIVITY_LABEL,
+			}),
+		},
+		required: [...(Array.isArray(parameters.required) ? parameters.required : []), ACTIVITY_PARAM],
+	};
+}
+
+function stripActivityParam(args: any): any {
+	if (!args || typeof args !== "object" || Array.isArray(args)) return args;
+	if (!(ACTIVITY_PARAM in args)) return args;
+	const { [ACTIVITY_PARAM]: _removed, ...rest } = args;
+	return rest;
+}
+
+/** Wrap a tool definition so the model tags each call with an activity label.
+ *  The label lives in the recorded args (survives resume); execution never sees it. */
+function wrapWithActivity(record: any): any {
+	const parameters = withActivityParam(record.parameters);
+	if (!parameters) return record;
+	const originalExecute = record.execute;
+	const originalPrepare = typeof record.prepareArguments === "function" ? record.prepareArguments : undefined;
+	return {
+		...record,
+		parameters,
+		prepareArguments(args: any) {
+			let prepared = originalPrepare ? originalPrepare(args) : args;
+			// Models occasionally skip optional-feeling fields; default before validation
+			// so a missing label can never fail the call.
+			if (!prepared || typeof prepared !== "object" || Array.isArray(prepared)) prepared = {};
+			if (typeof prepared[ACTIVITY_PARAM] !== "string" || !prepared[ACTIVITY_PARAM].trim()) {
+				prepared[ACTIVITY_PARAM] = DEFAULT_ACTIVITY_LABEL;
+			}
+			return prepared;
+		},
+		async execute(toolCallId: string, params: any, signal: any, onUpdate: any, ctx: any) {
+			return originalExecute(toolCallId, stripActivityParam(params), signal, onUpdate, ctx);
+		},
+		[ACTIVITY_WRAPPED]: true,
+	};
+}
+
+/** Re-register every visible tool with the activity param. Idempotent via flag. */
+function sweepActivityParams(pi: ExtensionAPI): void {
+	if (!toolActivityParamEnabled()) return;
+	let allTools: any[] = [];
+	try {
+		allTools = typeof (pi as any).getAllTools === "function" ? (pi as any).getAllTools() : [];
+	} catch {
+		return;
+	}
+	for (const record of allTools) {
+		const name = typeof record?.name === "string" ? record.name : "";
+		if (!name || typeof record?.execute !== "function" || record[ACTIVITY_WRAPPED]) continue;
+		try {
+			pi.registerTool(wrapWithActivity(record));
+		} catch {
+			// Registration can race with plugins that own the tool mid-session.
+		}
+	}
+}
+
 /** Render-only grouping: keep Pi's child identities, message data and order intact. */
 function renderActivityTranscript(parent: any, width: number): string[] | undefined {
 	if (!toolGroupingEnabled() || !Array.isArray(parent.children)) return undefined;
 	if (!parent.children.some((child: any) => child instanceof ToolExecutionComponent || child instanceof AssistantMessageComponent)) return undefined;
 	if (width <= 0) return [];
-	const output: string[] = [];
-	let pending: string[][] = [];
-	const flush = () => {
-		const margin = " ";
-		const connector = activityTreeBranchAnsi();
-		for (let i = 0; i < pending.length; i++) {
-			const last = i === pending.length - 1;
-			const glyph = last ? "╰" : "├";
-			const prefix = `${margin}${connector}${glyph}${TRANSPARENT_RESET} `;
-			const continuation = `${margin}${connector}${last ? " " : "│"}${TRANSPARENT_RESET}   `;
-			pending[i].forEach((line, j) => {
-				// Image protocol payloads must not be modified or truncated as text.
-				output.push(isTerminalImageLine(line) ? line : clampLineWidth(`${j === 0 ? prefix : continuation}${line}`, width));
-			});
-		}
-		pending = [];
-	};
+
+	type ToolEntry = { kind: "tool"; tool: any; label: string };
+	type ThinkingEntry = { kind: "thinking"; lines: string[]; label: string };
+	type ContentEntry = { kind: "content"; lines: string[] };
+	type Entry = ToolEntry | ThinkingEntry | ContentEntry;
+
+	// Pass 1: classify children (content renders once, here).
+	const entries: Entry[] = [];
 	for (const child of parent.children) {
 		if (child instanceof ToolExecutionComponent) {
-			pending.push(toolActivityLines(child, width));
+			entries.push({ kind: "tool", tool: child, label: activityGroupsEnabled() ? activityLabelOf(child) : "" });
 			continue;
 		}
-		if (isSpacerComponent(child)) {
-			if (pending.length === 0) output.push(...child.render(width));
-			continue;
-		}
+		if (isSpacerComponent(child)) continue;
 		const rows = child instanceof AssistantMessageComponent
 			? assistantActivityRows(child, width)
-			: [{ kind: "content", lines: child.render(width) }];
+			: [{ kind: "content" as const, lines: applyTerminalCopyZones(child.render(width)) }];
 		for (const row of rows) {
-			if (row.kind === "activity") pending.push(row.lines);
+			if (row.kind === "activity") entries.push({ kind: "thinking", lines: row.lines, label: "" });
 			else {
 				// Empty assistant shells don't split a thinking/tool sequence.
 				if (child instanceof AssistantMessageComponent && row.lines.every((line: string) => isBlankLine(line))) continue;
-				flush();
-				output.push(...row.lines);
+				entries.push({ kind: "content", lines: row.lines });
 			}
 		}
+	}
+
+	// Pass 2: resolve labels. Unlabeled tools continue the previous tool's group;
+	// thinking belongs to the group of the call it precedes (a thought justifies
+	// what comes next), falling back to the previous tool's group.
+	let lastLabel = "";
+	for (const entry of entries) {
+		if (entry.kind !== "tool") continue;
+		if (!entry.label) entry.label = lastLabel;
+		lastLabel = entry.label;
+	}
+	lastLabel = "";
+	for (const entry of entries) {
+		if (entry.kind === "thinking") {
+			let nextLabel: string | undefined;
+			for (const later of entries.slice(entries.indexOf(entry) + 1)) {
+				if (later.kind === "tool") {
+					nextLabel = later.label;
+					break;
+				}
+				if (later.kind === "content") break;
+			}
+			entry.label = nextLabel !== undefined ? nextLabel : lastLabel;
+		} else if (entry.kind === "tool") {
+			lastLabel = entry.label;
+		}
+	}
+
+	// Pass 3: emit. Content flushes; consecutive equal-label activity runs form groups.
+	const output: string[] = [];
+	const margin = " ";
+	const connector = activityTreeBranchAnsi();
+	let pending: { label: string; lines: string[]; tool?: any }[] = [];
+
+	const emitGroup = (items: typeof pending): void => {
+		const tools = items.filter((item) => item.tool);
+		const statuses = tools.map((item) => getToolStatusForGroup(item.tool));
+		const pendingCount = statuses.filter((status) => status === "pending").length;
+		const failedCount = statuses.filter((status) => status === "error").length;
+		const count = items.length;
+		const color = failedCount > 0 ? TOOL_STATUS_ERROR : pendingCount > 0 ? TOOL_STATUS_PENDING : TOOL_STATUS_SUCCESS;
+		const dot = pendingCount > 0
+			? (_globalBlinkPhase ? paintStatusDot(color) : " ")
+			: paintStatusDot(color);
+		const parts: string[] = [];
+		const label = items[0].label;
+		if (label) parts.push(label);
+		parts.push(`${count} ${count === 1 ? "call" : "calls"}`);
+		let totalMs = 0;
+		let timed = 0;
+		for (const item of tools) {
+			const timing = TOOL_TIMINGS.get(item.tool.toolCallId);
+			if (timing?.end) {
+				totalMs += Math.max(0, timing.end - timing.start);
+				timed++;
+			}
+		}
+		const complete = pendingCount === 0;
+		if (complete && timed > 0 && totalMs > 0) parts.push(formatBashDuration(totalMs));
+		const labelAndCounts = `${label ? `${label} ` : ""}${FG_DIM}${parts.slice(label ? 1 : 0).join(" · ")}${TRANSPARENT_RESET}`;
+		const header = `${margin}${dot}${TRANSPARENT_RESET} ${labelAndCounts}${
+			failedCount > 0 ? ` ${TOOL_STATUS_ERROR}· ${failedCount} failed${TRANSPARENT_RESET}` : ""
+		}`;
+		if (label || activityGroupsEnabled()) output.push(clampLineWidth(header, width));
+		items.forEach((item, index) => {
+			const last = index === items.length - 1;
+			const glyph = last ? "╰" : "├";
+			const prefix = `${margin}${connector}${glyph}${TRANSPARENT_RESET} `;
+			const continuation = `${margin}${connector}${last ? " " : "│"}${TRANSPARENT_RESET}   `;
+			item.lines.forEach((line, j) => {
+				// Image protocol payloads must not be modified or truncated as text.
+				output.push(isTerminalImageLine(line) ? line : clampLineWidth(`${j === 0 ? prefix : continuation}${line}`, width));
+			});
+		});
+	};
+
+	const flush = () => {
+		const runs: typeof pending[] = [];
+		for (const item of pending) {
+			const last = runs[runs.length - 1];
+			if (last && last[0].label === item.label) last.push(item);
+			else runs.push([item]);
+		}
+		for (const run of runs) emitGroup(run);
+		pending = [];
+	};
+
+	for (const entry of entries) {
+		if (entry.kind === "content") {
+			flush();
+			output.push(...entry.lines);
+			continue;
+		}
+		pending.push({
+			label: entry.label,
+			lines: entry.kind === "tool" ? toolActivityLines(entry.tool, width) : entry.lines,
+			tool: entry.kind === "tool" ? entry.tool : undefined,
+		});
 	}
 	flush();
 	return output;
@@ -6287,6 +6494,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("tool_execution_start", async (event) => {
 		clearPreservedBashPreviews();
+		recordToolStart((event as any)?.toolCallId);
 		const toolName = (event as any)?.toolName;
 		if (toolName !== "bash") return;
 		trackRtkOriginalBashCommand((event as any)?.toolCallId, (event as any)?.args);
@@ -6867,10 +7075,12 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async () => {
 		registerOpenAiToolOverrides();
 		registerMcpToolOverrides();
+		sweepActivityParams(pi);
 	});
 	pi.on("before_agent_start", async () => {
 		registerOpenAiToolOverrides();
 		registerMcpToolOverrides();
+		sweepActivityParams(pi);
 	});
 
 	// Streaming activity keeps the blink timer alive. Do NOT clear blink contexts
@@ -6882,7 +7092,10 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_execution_start", async () => { markBlinkActivity(); });
 	// Partial tool output is the main long-running signal (bash streams for minutes).
 	pi.on("tool_execution_update", async () => { markBlinkActivity(); });
-	pi.on("tool_execution_end", async () => { markBlinkActivity(); });
+	pi.on("tool_execution_end", async (event) => {
+		recordToolEnd((event as any)?.toolCallId);
+		markBlinkActivity();
+	});
 	// agent_end fires when a low-level run finishes (tools for that assistant message
 	// are done). registerThinkingLabels clears currentAgentWorkStartMs on the same
 	// event; defer so we only wipe blink state once the work marker is gone.
