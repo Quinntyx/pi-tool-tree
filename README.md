@@ -156,8 +156,10 @@ settles), so a phase that reasoned 19s before a fast tool reads `· 19s`, not `�
 While a group is still running, its label shimmers: a highlight band sweeps across
 the word (the Claude Code / ChatGPT "working" effect) as a gradient of the label's
 own theme color, then settles to a constant color once the last call finishes. The
-sweep repaints on its own ~80ms beat; the status dot keeps its 500ms blink. Turn it
-off with `/cc-tools shimmer off` or `"activityShimmer": false`.
+transcript arms its own repaint while a group is in flight — 80ms with the shimmer
+on, 500ms for a bare live timer — because grouped rows bypass pi's native tool
+renderer (which is what the ● blink normally rides on; the blink itself stays on its
+500ms beat). Turn it off with `/cc-tools shimmer off` or `"activityShimmer": false`.
 
 Only tool calls are counted, so a thinking row never inflates `N calls`. A run
 without any tool call (a trailing thought, for example) prints its rows without a

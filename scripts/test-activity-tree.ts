@@ -155,6 +155,31 @@ const listOutput = plain(listParent.render(100));
 assert.ok(!listOutput.includes("◉"), "stock list bullets must not be replaced");
 assert.ok(listOutput.includes("first item"));
 
+// The transcript arms its own repaint while a group runs: grouped rows bypass the
+// native tool renderer that would otherwise arm the ● blink / shimmer tick. Without
+// this the label rendered once and froze. Callbacks are never fired here.
+{
+	// Let any live tick armed by an earlier block drain, so the count below is ours.
+	await new Promise((resolve) => setTimeout(resolve, 150));
+	const realSetTimeout = globalThis.setTimeout;
+	const delays: Array<number | undefined> = [];
+	(globalThis as any).setTimeout = ((_fn: any, ms?: number) => {
+		delays.push(ms);
+		return { unref() {}, ref() {}, hasRef: () => false } as any;
+	});
+	try {
+		const cadenceParent = new Container();
+		const tool = new ToolExecutionComponent("code_execution", "cadence", { code: "print(1)", activity: "implementing" }, {}, definition as any, ui as any, process.cwd());
+		tool.markExecutionStarted();
+		tool.updateResult({ content: [{ type: "text", text: "ok" }], isError: false } as any, true);
+		cadenceParent.addChild(tool);
+		cadenceParent.render(100);
+		assert.ok(delays.includes(80), `a running group must arm the ~80ms repaint: ${JSON.stringify(delays)}`);
+	} finally {
+		(globalThis as any).setTimeout = realSetTimeout;
+	}
+}
+
 // A running group's total ticks live off the wall clock, and freezes when it settles.
 {
 	const realNow = Date.now;

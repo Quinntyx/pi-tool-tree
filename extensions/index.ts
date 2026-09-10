@@ -1095,6 +1095,10 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 		// While the group is running its label shimmers; once every call settles the label
 		// returns to the ambient color. Counts stay static metadata.
 		const shimmering = !complete && !!label && activityShimmerEnabled();
+		// The transcript owns this row's light and label, so it also owns the repaint:
+		// ~80ms while the sweep runs, 500ms for a bare live duration. Settled groups
+		// stop asking, which ends the timer chain.
+		if (!complete) requestLiveGroupFrame(() => safeInvalidate(parent), shimmering);
 		const labelAnsi = label ? (shimmering ? shimmerTextAnsi(label) : label) : "";
 		// Secondary text: `N calls · 5s` uses the same theme-derived gray as the
 		// `Thought for Xs` rows (branch chrome + OUTLINE_CHROME_BRIGHTEN) instead of the
@@ -3055,8 +3059,11 @@ let _globalBlinkPhase = true;
 // Wall-clock of the last blink/breathe advance: the timer can tick faster than the
 // dot cycle while a label shimmer is running.
 let _lastBlinkPhaseAt = 0;
+// Live-group repaint: set on every render of a running group, consumed by the tick.
+let _liveTickTimer: ReturnType<typeof setTimeout> | null = null;
+let _liveTickTarget: (() => void) | null = null;
 
-/** True while a tracked tool is still running — the shimmer's reason to re-render fast. */
+/** True while a tracked tool is still running — used by the label shimmer check. */
 function shimmerRunning(): boolean {
 	if (!activityShimmerEnabled()) return false;
 	for (const entry of _blinkContexts.values()) {
@@ -3066,7 +3073,30 @@ function shimmerRunning(): boolean {
 }
 
 function getBlinkIntervalMs(): number {
-	return shimmerRunning() ? SHIMMER_INTERVAL_MS : BLINK_INTERVAL_MS;
+	return BLINK_INTERVAL_MS;
+}
+
+/**
+ * Keep repainting while a group still has calls in flight.
+ *
+ * The grouped transcript draws its own status light and (optionally) its own label
+ * shimmer, so it never goes through the native tool row renderer that arms the ●
+ * blink. Without this loop a running group rendered once and froze. Each frame re-arms
+ * itself from the next render, so the loop stops by itself once every group settles.
+ */
+function requestLiveGroupFrame(invalidate: () => void, fast: boolean): void {
+	_liveTickTarget = invalidate;
+	if (_liveTickTimer) return;
+	_liveTickTimer = setTimeout(() => {
+		_liveTickTimer = null;
+		const target = _liveTickTarget;
+		_liveTickTarget = null;
+		if (!target) return;
+		try {
+			target();
+		} catch { /* the row may be gone after a reload/session switch */ }
+	}, fast ? SHIMMER_INTERVAL_MS : BLINK_INTERVAL_MS);
+	unrefTimer(_liveTickTimer);
 }
 
 function getBlinkKey(ctx: any): any {
