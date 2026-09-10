@@ -137,7 +137,7 @@ Adjacent tool calls are grouped into phases named by the model on each call:
 ```
 
 The seven tools this package owns (`read`, `bash`, `grep`, `find`, `ls`, `write`,
-`edit`) declare a required `activity` param, so the label arrives with every call.
+`edit`) declare an `activity` param, so the label usually arrives with every call.
 It is stripped again before the tool executes, and the recorded message keeps
 exactly the arguments the model sent. Calls from tools that do not opt in (MCP,
 other plugins) inherit the previous group's label instead of starting a new group;
@@ -187,7 +187,7 @@ immediately and to plugin tools the next time they register.
 | `extraToolOutputExpanded` | `false` | Start with Ctrl+Shift+O extra-detail mode enabled |
 | `groupToolCalls` | `true` | Group adjacent thinking/tool activity with one child per call |
 | `activityGroups` | `true` | Label each group with the model-supplied `activity` word |
-| `toolActivityParam` | `true` | Add the required `activity` param to the tools this package owns |
+| `toolActivityParam` | `true` | Add the `activity` param to the tools this package owns (optional; a missing label defaults to `working`) |
 | `thinkingMode` | `live` | `live` = only streaming thinking expands (finished collapse to `Thought for Xs`); `full` = always expanded. Pi's `hideThinkingBlock` (Ctrl+T) wins over both: hidden thinking never streams a body. |
 | `bashCollapsedLines` | `10` | Lines for collapsed bash output |
 | `bashCommandPreviewLines` | `8` | Verbatim script lines shown while bash runs or after failure; `0` disables them |

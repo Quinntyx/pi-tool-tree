@@ -173,11 +173,14 @@ console.log("OK: flush-left prose, blank-line block spacing, tool-only call coun
 	assert.equal(api.defaultLabel, "working");
 	assert.equal(api.enabled(), true);
 
-	// Core tools declare the param, so the model always sees it in the schema.
+	// Core tools declare the param, so the model always sees it in the schema — as an
+	// optional property. Marking it required broke third-party validators that mirror
+	// the advertised schema (pi-ptc-next validates its Python callables with it and
+	// rejected every call that omitted the label).
 	for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
 		const tool = tools.get(name);
 		assert.ok(tool?.parameters?.properties?.activity, `${name} schema must accept activity`);
-		assert.ok(tool.parameters.required.includes("activity"), `${name} must require activity`);
+		assert.ok(!tool.parameters.required.includes("activity"), `${name} must not require activity (breaks mirrored validators)`);
 	}
 
 	// Plugin opt-in: schema gains the param, a missing label defaults, and the
@@ -205,6 +208,8 @@ console.log("OK: flush-left prose, blank-line block spacing, tool-only call coun
 	assert.equal(validated.path, "x");
 	const defaulted = validateToolArguments(readTool, { id: "c2", name: "read", arguments: readTool.prepareArguments({ path: "x" }) } as any);
 	assert.equal(defaulted.activity, "working");
+	const unlabeled = validateToolArguments(readTool, { id: "c2b", name: "read", arguments: { path: "x" } } as any);
+	assert.equal(unlabeled.path, "x", "a validator that mirrors the schema must accept a missing label");
 	assert.throws(
 		() => validateToolArguments(readTool, { id: "c3", name: "read", arguments: { activity: "exploring" } } as any),
 		/Validation failed/,

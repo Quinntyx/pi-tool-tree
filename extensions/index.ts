@@ -866,12 +866,18 @@ function withActivityParam(parameters: any): any | undefined {
 			...parameters.properties,
 			[ACTIVITY_PARAM]: Type.String({
 				description:
-					"One or two lowercase words naming the activity this call belongs to (e.g. exploring, implementing, testing). " +
-					"Reuse the previous call's word when continuing the same activity.",
+					"Always include one or two lowercase words naming the activity this call belongs to " +
+					"(e.g. exploring, implementing, testing). Reuse the previous call's word when continuing " +
+					"the same activity.",
 				default: DEFAULT_ACTIVITY_LABEL,
 			}),
 		},
-		required: [...(Array.isArray(parameters.required) ? parameters.required : []), ACTIVITY_PARAM],
+		// Deliberately NOT appended to `required`: the wrapper defaults a missing label
+		// in `prepareArguments`, so the tool never actually needs it — and consumers that
+		// re-validate arguments against the advertised schema (pi-ptc-next mirrors these
+		// parameters for its Python callables) would otherwise reject every call that
+		// does not pass a label.
+		required: Array.isArray(parameters.required) ? parameters.required : [],
 	};
 }
 
@@ -1050,7 +1056,10 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 		}
 		const complete = pendingCount === 0;
 		if (complete && timed > 0 && totalMs > 0) parts.push(formatBashDuration(totalMs));
-		const labelAndCounts = `${label ? `${label} ` : ""}${FG_DIM}${parts.slice(label ? 1 : 0).join(" · ")}${TRANSPARENT_RESET}`;
+		// Secondary text: `N calls · 5s` uses the same theme-derived gray as the
+		// `Thought for Xs` rows (branch chrome + OUTLINE_CHROME_BRIGHTEN) instead of the
+		// dimmer body-gray, so it reads as metadata next to the label rather than vanishing.
+		const labelAndCounts = `${label ? `${label} ` : ""}${WORKED_LINE_FG}${parts.slice(label ? 1 : 0).join(" · ")}${TRANSPARENT_RESET}`;
 		const header = `${margin}${dot}${TRANSPARENT_RESET} ${labelAndCounts}${
 			failedCount > 0 ? ` ${TOOL_STATUS_ERROR}· ${failedCount} failed${TRANSPARENT_RESET}` : ""
 		}`;

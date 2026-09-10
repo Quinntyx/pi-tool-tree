@@ -51,6 +51,11 @@
 - **Blank lines between transcript blocks** — a blank line follows agent prose and separates consecutive activity groups, so phases read as distinct blocks instead of one wall of rows.
 - **Only tool calls are counted** — a thinking row no longer inflates the group header (one thought plus four calls used to read `5 calls`), and a run with no tool call at all (a trailing thought, say) no longer prints a `N calls` header at all.
 - **Unlabeled groups show `working`** — a group whose calls carry no label (the first group of a run, a tool that never declared `activity`, an MCP call) now falls back to the default label instead of printing a bare `3 calls` header. Calls that can inherit a previous group's label still do.
+- **Group counts use the secondary gray** — `N calls · 5s` now renders in the same theme-derived gray as the `Thought for Xs` rows (`Worked line`/branch chrome) instead of the dimmer body gray, so the counts read as metadata next to the label rather than nearly disappearing on light themes.
+
+### Fixed
+
+- **`activity` is no longer a `required` schema property** — declaring it required broke every consumer that re-validates arguments against the advertised schema: pi-ptc-next mirrors pi's tool parameters for its Python callables, so `read(path=…)` / `bash(command=…)` calls from `code_execution` failed with *must have required properties activity*. The property is still declared (with `default: "working"` and an "Always include…" description), `prepareArguments` still defaults a missing label, and grouping is unaffected — it just no longer lies about being mandatory.
 - **Hidden thinking stays hidden** — `hideThinkingBlock` (Ctrl+T / settings.json) now wins over `thinkingMode`. When thinking is hidden, the newest thought no longer streams a live body into the tree; only its one-line `Thinking… Xs` / `Thought for Xs` summary stays until you explicitly expand it.
 ### Fixed
 
