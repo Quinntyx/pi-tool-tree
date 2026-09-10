@@ -140,7 +140,10 @@ The seven tools this package owns (`read`, `bash`, `grep`, `find`, `ls`, `write`
 `edit`) declare a required `activity` param, so the label arrives with every call.
 It is stripped again before the tool executes, and the recorded message keeps
 exactly the arguments the model sent. Calls from tools that do not opt in (MCP,
-other plugins) inherit the previous group's label instead of starting a new group.
+other plugins) inherit the previous group's label instead of starting a new group;
+a group with nothing to inherit (the first group of a run, or a tool that never
+declared `activity`) falls back to the default label `working` instead of showing a
+bare `N calls` header.
 
 Only tool calls are counted, so a thinking row never inflates `N calls`. A run
 without any tool call (a trailing thought, for example) prints its rows without a

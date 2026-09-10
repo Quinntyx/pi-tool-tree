@@ -50,6 +50,7 @@
 - **Flush-left assistant prose** — assistant text keeps pi's own Markdown rendering again: no ` ● ` dot and no extra three-space indent. Only prose containing display math (`\[…\]`, `$$…$$`) or task-status transcripts still uses the custom paragraph renderer (now flush left, matching pi's one-space assistant padding).
 - **Blank lines between transcript blocks** — a blank line follows agent prose and separates consecutive activity groups, so phases read as distinct blocks instead of one wall of rows.
 - **Only tool calls are counted** — a thinking row no longer inflates the group header (one thought plus four calls used to read `5 calls`), and a run with no tool call at all (a trailing thought, say) no longer prints a `N calls` header at all.
+- **Unlabeled groups show `working`** — a group whose calls carry no label (the first group of a run, a tool that never declared `activity`, an MCP call) now falls back to the default label instead of printing a bare `3 calls` header. Calls that can inherit a previous group's label still do.
 - **Hidden thinking stays hidden** — `hideThinkingBlock` (Ctrl+T / settings.json) now wins over `thinkingMode`. When thinking is hidden, the newest thought no longer streams a live body into the tree; only its one-line `Thinking… Xs` / `Thought for Xs` summary stays until you explicitly expand it.
 ### Fixed
 

@@ -45,6 +45,9 @@ let output = plain(parent.render(100));
 assert.equal(parent.children.length, 2, "grouping must not move original components");
 assert.equal(output.split("\n").filter((line) => /[├╰] .*python/.test(line)).length, 2);
 assert.ok(output.includes("Executing Python frame 1"));
+// Neither tool declares `activity`, so the group has nothing to inherit: it falls
+// back to the default label instead of printing a bare `2 calls` header.
+assert.ok(output.split("\n").some((line) => /^ ● working 2 calls/.test(line)), `unlabeled first group must show the default label: ${JSON.stringify(output.split("\n")[0])}`);
 assert.ok(!output.includes("×2"));
 assert.ok(!output.includes("Code Execution Code Execution"));
 assert.ok(!output.split("\n").some((line) => /^\s*─{5,}\s*$/.test(line)));

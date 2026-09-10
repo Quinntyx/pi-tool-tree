@@ -1032,7 +1032,11 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 			? (_globalBlinkPhase ? paintStatusDot(color) : " ")
 			: paintStatusDot(color);
 		const parts: string[] = [];
-		const label = items[0].label;
+		// An unlabeled call inherits the previous group's label (see pass 2). When there
+		// is nothing to inherit — the first group of a run, a tool that never declared
+		// `activity`, an MCP call — fall back to the default label instead of printing a
+		// bare `3 calls` header.
+		const label = items[0].label || (activityGroupsEnabled() ? DEFAULT_ACTIVITY_LABEL : "");
 		if (label) parts.push(label);
 		if (count > 0) parts.push(`${count} ${count === 1 ? "call" : "calls"}`);
 		let totalMs = 0;
@@ -1052,7 +1056,7 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 		}`;
 		// A run without tool calls has no group to head: emit its rows under the
 		// previous block instead of a bare `label 0 calls` header.
-		if (count > 0 && (label || activityGroupsEnabled())) output.push(clampLineWidth(header, width));
+		if (count > 0) output.push(clampLineWidth(header, width));
 		items.forEach((item, index) => {
 			const last = index === items.length - 1;
 			const glyph = last ? "╰" : "├";
