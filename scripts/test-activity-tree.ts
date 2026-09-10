@@ -47,7 +47,7 @@ assert.equal(output.split("\n").filter((line) => /[├╰] .*python/.test(line))
 assert.ok(output.includes("Executing Python frame 1"));
 // Neither tool declares `activity`, so the group has nothing to inherit: it falls
 // back to the default label instead of printing a bare `2 calls` header.
-assert.ok(output.split("\n").some((line) => /^ ● working 2 calls/.test(line)), `unlabeled first group must show the default label: ${JSON.stringify(output.split("\n")[0])}`);
+assert.ok(output.split("\n").some((line) => /^ [\u2800-\u28FF●] working 2 calls/.test(line)), `unlabeled first group must show the default label: ${JSON.stringify(output.split("\n")[0])}`);
 assert.ok(!output.includes("×2"));
 assert.ok(!output.includes("Code Execution Code Execution"));
 assert.ok(!output.split("\n").some((line) => /^\s*─{5,}\s*$/.test(line)));
@@ -155,6 +155,48 @@ const listOutput = plain(listParent.render(100));
 assert.ok(!listOutput.includes("◉"), "stock list bullets must not be replaced");
 assert.ok(listOutput.includes("first item"));
 
+// Pending lights are a braille spinner by default, indexed off the wall clock, and
+// `/cc-tools pending dot` still offers the classic blinking ●.
+{
+	const realNow = Date.now;
+	let fakeNow = 1_700_000_000_000;
+	Date.now = () => fakeNow;
+	const frames = "⠃⠉⠘⠰⢠⣀⡄⠆";
+	const ctx = { hasUI: true, ui: { theme, notify() {}, getToolsExpanded: () => false, setToolsExpanded() {} } };
+	const glyphOf = (parent: Container) => {
+		const line = plain(parent.render(100)).split("\n").find((l) => l.includes("implementing")) ?? "";
+		return line[1] ?? "";
+	};
+	const pendingTool = (id: string) => {
+		const parent = new Container();
+		const component = new ToolExecutionComponent("code_execution", id, { code: "print(1)", activity: "implementing" }, {}, definition as any, ui as any, process.cwd());
+		component.markExecutionStarted();
+		component.updateResult({ content: [{ type: "text", text: "ok" }], isError: false } as any, true);
+		parent.addChild(component);
+		return { parent, component };
+	};
+	try {
+		const spinning = pendingTool("spinner-frame");
+		const first = glyphOf(spinning.parent);
+		assert.ok(frames.includes(first), `a pending group must spin: ${JSON.stringify(first)}`);
+		fakeNow += 80;
+		const second = glyphOf(spinning.parent);
+		assert.notEqual(second, first, "the spinner frame must advance with the clock");
+		assert.ok(frames.includes(second), `spinner frames stay in the cycle: ${JSON.stringify(second)}`);
+		// Settled groups show the static filled light (green ●), never a spinner frame.
+		spinning.component.updateResult({ content: [{ type: "text", text: "ok" }], isError: false } as any, false);
+		assert.equal(glyphOf(spinning.parent), "●", "a settled group shows the static status light");
+
+		const dotCase = pendingTool("spinner-dot");
+		await commands.get("cc-tools").handler("pending dot", ctx);
+		assert.ok("● ".includes(glyphOf(dotCase.parent)), `dot mode must blink, not spin: ${JSON.stringify(glyphOf(dotCase.parent))}`);
+		await commands.get("cc-tools").handler("pending spinner", ctx);
+		assert.ok(frames.includes(glyphOf(dotCase.parent)), "spinner mode comes back with /cc-tools pending spinner");
+	} finally {
+		Date.now = realNow;
+	}
+}
+
 // The transcript arms its own repaint while a group runs: grouped rows bypass the
 // native tool renderer that would otherwise arm the ● blink / shimmer tick. Without
 // this the label rendered once and froze. Callbacks are never fired here.
@@ -251,10 +293,11 @@ assert.ok(listOutput.includes("first item"));
 		// between its characters (the dot/branch colors before it are not ours).
 		// The gradient interleaves color codes between the label's characters, so the
 		// label is not a contiguous substring of the raw line: strip first, then take
-		// every color between the ● glyph and the counts text.
+		// every color between the status glyph (spinner while running) and the counts.
 		const labelColors = (lines: string[]) => {
 			const line = lines.find((l) => l.replace(/\x1b\[[0-9;]*m/g, "").includes("implementing")) ?? "";
-			const glyphAt = line.indexOf("●");
+			const stripped = line.replace(/\x1b\[[0-9;]*m/g, "");
+			const glyphAt = stripped.search(/[\u2800-\u28FF●]/);
 			const callAt = line.indexOf("1 call");
 			if (glyphAt < 0 || callAt < 0) return [];
 			const region = line.slice(glyphAt + 1, callAt);

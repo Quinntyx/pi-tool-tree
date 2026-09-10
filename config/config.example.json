@@ -10,6 +10,7 @@
   "groupToolCalls": true,
   "activityGroups": true,
   "activityShimmer": true,
+  "pendingIndicator": "spinner",
   "toolActivityParam": true,
   "thinkingMode": "live",
   "bashOutputMode": "opencode",

@@ -39,7 +39,7 @@ Claude Code inspired tool rendering for Pi — Shiki-powered diffs, status dots,
 - **Unified activity trees** with a distinct child for every tool call and thinking run, including repeated calls. Assistant prose and user messages remain outside the tree (set `groupToolCalls: false` to disable).
 - **Native custom-tool animations** (including Code Execution) remain visible while running, collapse on completion, and expand again with `Ctrl+O`.
 - **No horizontal tool rules**, including when older settings select `border` or `outlines`.
-- **Quieter layout**: short `├` / `╰` connectors, assistant prose left in pi's own flush-left Markdown rendering, blank lines between transcript blocks, and default Markdown bullets. Settled calls use green `✓` or red `!`; running indicators remain animated.
+- **Quieter layout**: short `├` / `╰` connectors, assistant prose left in pi's own flush-left Markdown rendering, blank lines between transcript blocks, and default Markdown bullets. Settled calls use green `✓` or red `!`; running calls spin a braille `⠃⠉⠘⠰⢠⣀⡄⠆` light (set `pendingIndicator: "dot"` for the classic blinking `●`).
 - **Extra detail toggle** with `Ctrl+Shift+O`, increasing expanded preview caps without making the default view heavy
 - **Global border patch** for all tool rows, including unknown/custom tools
 
@@ -124,6 +124,7 @@ Use `/cc-tools` to control tool UI at runtime:
 /cc-tools detail toggle   # same mode as Ctrl+Shift+O
 /cc-tools activity toggle # add/remove the model's activity label on tool calls
 /cc-tools shimmer toggle  # sweep a highlight across a running group's label
+/cc-tools pending dot     # pending light: braille spinner (default) or blinking dot
 ```
 
 ### Activity labels
@@ -158,8 +159,12 @@ the word (the Claude Code / ChatGPT "working" effect) as a gradient of the label
 own theme color, then settles to a constant color once the last call finishes. The
 transcript arms its own repaint while a group is in flight — 80ms with the shimmer
 on, 500ms for a bare live timer — because grouped rows bypass pi's native tool
-renderer (which is what the ● blink normally rides on; the blink itself stays on its
-500ms beat). Turn it off with `/cc-tools shimmer off` or `"activityShimmer": false`.
+renderer, which is what the ● blink normally rides on. Turn it off with
+`/cc-tools shimmer off` or `"activityShimmer": false`.
+
+Pending lights spin on the same wall-clock frame index (from `SPINNER_FRAMES`), so
+the group header and its rows always show the same frame. Agent-family calls keep
+their size-breathe light, which stays on its own 500ms beat.
 
 Only tool calls are counted, so a thinking row never inflates `N calls`. A run
 without any tool call (a trailing thought, for example) prints its rows without a
@@ -203,6 +208,7 @@ immediately and to plugin tools the next time they register.
 | `extraToolOutputExpanded` | `false` | Start with Ctrl+Shift+O extra-detail mode enabled |
 | `groupToolCalls` | `true` | Group adjacent thinking/tool activity with one child per call |
 | `activityGroups` | `true` | Label each group with the model-supplied `activity` word |
+| `pendingIndicator` | `spinner` | Pending light: `spinner` (braille `⠃⠉⠘⠰⢠⣀⡄⠆` at 80ms) or `dot` (classic blinking `●`) |
 | `activityShimmer` | `true` | Sweep a highlight across a running group's label; constant color once the group settles. Also drives the ~80ms repaint of the live group timer |
 | `toolActivityParam` | `true` | Add the `activity` param to the tools this package owns (optional; a missing label defaults to `working`) |
 | `thinkingMode` | `live` | `live` = only streaming thinking expands (finished collapse to `Thought for Xs`); `full` = always expanded. Pi's `hideThinkingBlock` (Ctrl+T) wins over both: hidden thinking never streams a body. |
