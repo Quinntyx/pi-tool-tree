@@ -434,18 +434,21 @@ assert.ok(listOutput.includes("first item"));
 		Date.now = realNow;
 	}
 }
-// The sweep's colors come from the active theme: the band peaks at the theme's own
-// accent, pushed past the label in the panel's emphasis direction, over a label faded
-// toward the panel. A hardcoded brightness step cannot be seen, and a same-lightness hue
-// swap barely can, so both halves of the palette math are pinned here.
+// The sweep's color is the active theme's color for the *current thinking level*, so a live
+// label is tinted by how hard the model is being asked to think. Pinned here: the level
+// color is used as-is (no darkening), the resting label is plain theme text (no fade), a
+// runtime level change repaints the running sweep, and a muted level stays visible.
 {
 	const realNow = Date.now;
 	Date.now = () => 1_700_000_000_000;
 	try {
-		// everforest-tui-light: text #5c6a72, accent #35a77c, toolSuccessBg #edf0df.
+		// everforest-tui-light: text #5c6a72, toolSuccessBg #edf0df, and the thinking-level
+		// colors (medium = aqua, max = orange, off = a surface tone that needs the guard).
 		const fg: Record<string, string> = {
 			text: "\x1b[38;2;92;106;114m",
-			accent: "\x1b[38;2;53;167;124m",
+			thinkingMedium: "\x1b[38;2;53;167;124m",
+			thinkingMax: "\x1b[38;2;245;125;38m",
+			thinkingOff: "\x1b[38;2;223;221;200m",
 		};
 		const bg: Record<string, string> = { toolSuccessBg: "\x1b[48;2;237;240;223m" };
 		// Pi publishes the live theme on globalThis and several chrome paths re-derive from
@@ -461,6 +464,7 @@ assert.ok(listOutput.includes("first item"));
 		(globalThis as any)[globalThemeKey] = fakeTheme;
 		const themeCtx = {
 			hasUI: true,
+			thinkingLevel: "medium",
 			ui: { theme: fakeTheme, notify() {}, getToolsExpanded: () => false, setToolsExpanded() {} },
 		};
 		try {
@@ -474,24 +478,50 @@ assert.ok(listOutput.includes("first item"));
 			live.markExecutionStarted();
 			live.updateResult({ content: [{ type: "text", text: "ok" }], isError: false } as any, true);
 			accentParent.addChild(live);
-			const raw =
-				accentParent
-					.render(100)
-					.find((line) => line.replace(/\x1b\[[0-9;]*m/g, "").includes("implementing")) ?? "";
-			// Everything up to the counts is the header: the label's own gradient plus the
-			// light in front of it (whose gray is nowhere near either expected color).
-			const colors = [...raw
-				.slice(0, raw.indexOf("1 call"))
-				.matchAll(/\x1b\[38;2;(\d+);(\d+);(\d+)m/g)
-			].map((m) => [+m[1], +m[2], +m[3]]);
-			const nearest = (target: number[]) =>
-				Math.min(...colors.map((c) => Math.hypot(c[0] - target[0], c[1] - target[1], c[2] - target[2])));
-			// mix(text, panel, 0.18) and mix(accent, near-black, 0.65): the two palette ends the
-			// sweep should reach. The band center misses a character by at most half a cell, so
-			// the reachable peak sits a few units short of the second value.
-			assert.ok(colors.length >= 3, `the gradient must be present: ${JSON.stringify(colors)}`);
-			assert.ok(nearest([118, 130, 134]) <= 6, `the resting label fades toward the panel: ${JSON.stringify(colors)}`);
-			assert.ok(nearest([26, 69, 55]) <= 10, `the band peaks at the theme accent: ${JSON.stringify(colors)}`);
+			// Everything up to the counts is the header: the label's own gradient plus the light
+			// in front of it (whose gray is nowhere near any expected color).
+			const frameColors = () => {
+				const raw =
+					accentParent
+						.render(100)
+						.find((line) => line.replace(/\x1b\[[0-9;]*m/g, "").includes("implementing")) ?? "";
+				return [...raw.slice(0, raw.indexOf("1 call")).matchAll(/\x1b\[38;2;(\d+);(\d+);(\d+)m/g)].map((m) => [
+					+m[1],
+					+m[2],
+					+m[3],
+				]);
+			};
+			const dist = (a: number[], b: number[]) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+			const nearest = (colors: number[][], target: number[]) => Math.min(...colors.map((c) => dist(c, target)));
+			const chooseLevel = async (level: string) => {
+				for (const handler of handlers.get("thinking_level_select") ?? []) await handler({ level }, themeCtx);
+			};
+
+			const medium = frameColors();
+			assert.ok(medium.length >= 3, `the gradient must be present: ${JSON.stringify(medium)}`);
+			assert.ok(nearest(medium, [92, 106, 114]) <= 4, `the resting label is the theme text, with no fade: ${JSON.stringify(medium)}`);
+			assert.ok(nearest(medium, [53, 167, 124]) <= 12, `thinking=medium sweeps in thinkingMedium: ${JSON.stringify(medium)}`);
+
+			// The level changes at runtime (/thinking, Shift+Tab, model switch): a sweep already on
+			// screen has to pick the new color up on the next frame.
+			await chooseLevel("max");
+			const max = frameColors();
+			assert.ok(nearest(max, [245, 125, 38]) <= 12, `thinking=max sweeps in thinkingMax: ${JSON.stringify(max)}`);
+			assert.ok(nearest(max, [53, 167, 124]) > 40, `the previous level's color must be gone: ${JSON.stringify(max)}`);
+
+			// "off" is a surface tone in most palettes: too close to the panel to see, so the sweep
+			// steps away from it rather than vanishing.
+			await chooseLevel("off");
+			const off = frameColors();
+			assert.ok(off.length >= 3, `the muted level still sweeps: ${JSON.stringify(off)}`);
+			const offBand = off.reduce((a, b) => (dist(b, [92, 106, 114]) > dist(a, [92, 106, 114]) ? b : a));
+			const lin = (v: number) => {
+				const s = v / 255;
+				return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+			};
+			const lum = (c: number[]) => 0.2126 * lin(c[0]) + 0.7152 * lin(c[1]) + 0.0722 * lin(c[2]);
+			const [hi, lo] = [lum(offBand), lum([237, 240, 223])].sort((a, b) => b - a);
+			assert.ok((hi + 0.05) / (lo + 0.05) >= 1.6, `a muted level still has to read against the panel: ${JSON.stringify(off)}`);
 		} finally {
 			(globalThis as any)[globalThemeKey] = previousGlobalTheme;
 		}

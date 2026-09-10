@@ -867,29 +867,40 @@ const DEFAULT_ACTIVITY_LABEL = "working";
  * ChatGPT "working" shimmer). Time-based rather than frame-based so the motion is
  * uniform no matter how often the TUI re-renders.
  *
- * The band peaks at the active theme's own accent, pushed past the label in the panel's
- * emphasis direction, while the resting label fades slightly toward the panel color.
- * The fade is what makes the sweep visible: a same-lightness hue swap alone reads as
- * barely anything, and a brightness step of the label alone has no color to travel
- * through.
+ * The band's color is the active theme's color for the *current thinking level*, so a live
+ * label is tinted by how hard the model is being asked to think and follows /thinking,
+ * Shift+Tab, and model switches. The level color is used as-is: pushing it toward the
+ * panel's emphasis color costs the chroma that makes it read as a palette color.
  */
 const SHIMMER_PERIOD_MS = 1200;
 /** Re-render cadence while a shimmering group is on screen (the ● blink stays 500ms). */
 const SHIMMER_INTERVAL_MS = 80;
 /** Highlight band half-width, as a fraction of the label length. */
 const SHIMMER_BAND_RATIO = 0.5;
-/** Mix toward the band color at the band's center: the accent color itself. */
+/** Mix toward the band color at the band's center: the level color itself. */
 const SHIMMER_PEAK_MIX = 1;
 /** Exponent on the cosine falloff; >1 keeps the tint in a hot core instead of a wash. */
 const SHIMMER_FALLOFF_POW = 1.5;
-/** How far the resting label fades toward the panel color, buying the band its contrast. */
-const SHIMMER_BASE_DIM = 0.18;
-/** How far the theme accent is pushed past the label (deeper on light panels, brighter on dark). */
-const SHIMMER_ACCENT_PUSH = 0.65;
-/** Theme color keys tried in order for the band: the active palette's own accent. */
-const SHIMMER_ACCENT_KEYS = ["accent", "borderAccent", "mdLink"];
-/** Ignore an accent closer than this to the label; a near-monochrome theme gets the fallback. */
-const SHIMMER_MIN_ACCENT_DELTA = 40;
+/** Pi thinking level -> theme color key (the same mapping pi uses for thinking borders). */
+const THINKING_LEVEL_KEYS: Record<string, string> = {
+	off: "thinkingOff",
+	minimal: "thinkingMinimal",
+	low: "thinkingLow",
+	medium: "thinkingMedium",
+	high: "thinkingHigh",
+	xhigh: "thinkingXhigh",
+	max: "thinkingMax",
+};
+/** `max` arrived after the other levels; older themes only define `thinkingXhigh`. */
+const THINKING_LEVEL_COLOR_FALLBACKS: Record<string, string[]> = { max: ["thinkingXhigh"] };
+/** Band color when no thinking level is known, or the theme has no color for it. */
+const SHIMMER_FALLBACK_KEYS = ["accent", "borderAccent", "mdLink"];
+/** How far the band color must sit from the label to read as a sweep at all. */
+const SHIMMER_MIN_SWEEP_DELTA = 40;
+/** pi's muted levels can match the panel color ("off"); the band needs at least this much. */
+const SHIMMER_MIN_CONTRAST = 1.6;
+/** Current pi thinking level, as reported by the session runtime. */
+let _thinkingLevel: string | undefined;
 /** Label base color when the active theme exposes no `text`/`muted` key. */
 const DEFAULT_LABEL_FG = "\x1b[38;2;212;212;212m";
 
@@ -4256,55 +4267,85 @@ function rgbToBgAnsi(c: { r: number; g: number; b: number }): string {
 }
 
 /**
- * Base color for a shimmering activity label: the theme's primary text color, faded
- * slightly toward the panel so the accent band has room to stand out. The sweep runs
- * from here to the theme accent, so a live label reads as the theme's own text lit up by
- * the theme's own highlight color.
+ * Base color for a shimmering activity label: the theme's primary text color. The sweep
+ * runs from here to the band color, so a live label reads as the theme's own text lit up by
+ * the palette's current thinking-level color.
  */
 function shimmerBaseRgb(): Rgb {
-	let base: Rgb | null = null;
 	if (themeAdaptiveEnabled()) {
 		const ansi =
 			safeFgAnsi(_toolBranchThemeHint, "text") ?? safeFgAnsi(_toolBranchThemeHint, "muted");
-		base = ansi ? parseAnsiRgb(ansi) : null;
+		const rgb = ansi ? parseAnsiRgb(ansi) : null;
+		if (rgb) return rgb;
 	}
-	if (!base) base = parseAnsiRgb(DEFAULT_LABEL_FG) ?? { r: 212, g: 212, b: 212 };
-	// Fade toward the panel color rather than toward gray, so the label keeps the panel's
-	// cast and the band keeps a uniform amount of headroom on any theme.
-	const panel = themeAdaptiveEnabled() ? themePanelBgRgb(_toolBranchThemeHint) : null;
-	return panel ? mixRgb(base, panel, SHIMMER_BASE_DIM) : base;
+	return parseAnsiRgb(DEFAULT_LABEL_FG) ?? { r: 212, g: 212, b: 212 };
 }
 
 function rgbDistance(a: Rgb, b: Rgb): number {
 	return Math.sqrt((a.r - b.r) ** 2 + (a.g - b.g) ** 2 + (a.b - b.b) ** 2);
 }
 
+/** W3C relative luminance, for contrast checks against the panel. */
+function relativeLuminance(c: Rgb): number {
+	const channel = (value: number) => {
+		const v = value / 255;
+		return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+	};
+	return 0.2126 * channel(c.r) + 0.7152 * channel(c.g) + 0.0722 * channel(c.b);
+}
+
+/** W3C contrast ratio between two colors. */
+function contrastRatio(a: Rgb, b: Rgb): number {
+	const [hi, lo] = [relativeLuminance(a), relativeLuminance(b)].sort((x, y) => y - x);
+	return (hi + 0.05) / (lo + 0.05);
+}
+
 /**
- * The active theme's accent: the color the band peaks at. Themes that expose none — and
- * the classic non-adaptive palette — return null so the sweep can fall back to a
- * brightness step instead of losing its highlight entirely.
+ * The color the band peaks at: the active theme's color for the current thinking level, so
+ * the sweep tracks /thinking, Shift+Tab, and model switches. A theme with no color for that
+ * level falls back to its accent, and so does a context that never reported a level.
  */
-function shimmerAccentRgb(): Rgb | null {
+function shimmerSweepRgb(): Rgb | null {
 	if (!themeAdaptiveEnabled()) return null;
-	for (const key of SHIMMER_ACCENT_KEYS) {
-		const rgb = themeFgRgb(_toolBranchThemeHint, key);
+	const level = _thinkingLevel;
+	const key = level ? THINKING_LEVEL_KEYS[level] : undefined;
+	const keys = [
+		...(key ? [key, ...(THINKING_LEVEL_COLOR_FALLBACKS[level as string] ?? [])] : []),
+		...SHIMMER_FALLBACK_KEYS,
+	];
+	for (const candidate of keys) {
+		const rgb = themeFgRgb(_toolBranchThemeHint, candidate);
 		if (rgb) return rgb;
 	}
 	return null;
 }
 
 /**
- * The band's hot color: the theme accent, pushed past the label in the panel's emphasis
- * direction (deeper on light panels, brighter on dark ones) so the band is a visible
- * accent rather than a same-lightness hue swap. A theme whose accent sits too close to
- * the label keeps the old step: brighten on dark panels, deepen on light ones.
+ * Keep a level's color visible on the panel. Pi's muted levels sit close to the panel color
+ * ("off" is usually a surface tone) and would sweep invisibly, so those step toward the
+ * panel's emphasis color. A loud level is returned untouched: its chroma is the point.
+ */
+function readableOnPanel(rgb: Rgb, panel: Rgb | null, light: boolean): Rgb {
+	if (!panel) return rgb;
+	if (contrastRatio(rgb, panel) >= SHIMMER_MIN_CONTRAST) return rgb;
+	const target = light ? { r: 12, g: 16, b: 18 } : { r: 255, g: 255, b: 255 };
+	for (const push of [0.25, 0.45, 0.65]) {
+		const candidate = mixRgb(rgb, target, push);
+		if (contrastRatio(candidate, panel) >= SHIMMER_MIN_CONTRAST) return candidate;
+	}
+	return mixRgb(rgb, target, 0.65);
+}
+
+/**
+ * The band's hot color: the current thinking level's theme color, kept visible against the
+ * panel. With no level color — or one indistinguishable from the label — the sweep steps
+ * away from the label instead: brighten on dark panels, deepen on light ones.
  */
 function shimmerHighlightRgb(base: Rgb): Rgb {
 	const light = isLightThemeBackground(_toolBranchThemeHint);
-	const accent = shimmerAccentRgb();
-	if (accent && rgbDistance(base, accent) >= SHIMMER_MIN_ACCENT_DELTA) {
-		const target = light ? { r: 12, g: 16, b: 18 } : { r: 255, g: 255, b: 255 };
-		return mixRgb(accent, target, SHIMMER_ACCENT_PUSH);
+	const sweep = shimmerSweepRgb();
+	if (sweep && rgbDistance(base, sweep) >= SHIMMER_MIN_SWEEP_DELTA) {
+		return readableOnPanel(sweep, themePanelBgRgb(_toolBranchThemeHint), light);
 	}
 	if (light) return mixRgb(base, { r: 12, g: 16, b: 18 }, 0.75);
 	return mixRgb(base, { r: 255, g: 255, b: 255 }, 0.92);
@@ -5598,6 +5639,29 @@ function trackThinkingBlockEvents(event: any, ctx?: any): void {
 	}
 }
 
+/**
+ * Track pi's thinking level: the shimmer band is painted in that level's theme color, so it
+ * has to follow /thinking, Shift+Tab, model switches, and session resume.
+ */
+function registerThinkingLevelTracking(pi: ExtensionAPI): void {
+	pi.on("thinking_level_select", async (event) => {
+		if (typeof event?.level === "string") _thinkingLevel = event.level;
+	});
+	const refresh = (_event: unknown, ctx: any) => {
+		let level: unknown = ctx?.thinkingLevel;
+		if (typeof level !== "string") {
+			try {
+				level = (pi as any)?.getThinkingLevel?.();
+			} catch {
+				level = undefined;
+			}
+		}
+		if (typeof level === "string") _thinkingLevel = level;
+	};
+	pi.on("session_start", async (event, ctx) => refresh(event, ctx));
+	pi.on("turn_start", async (event, ctx) => refresh(event, ctx));
+}
+
 function registerThinkingLabels(pi: ExtensionAPI): void {
 	const patchMessage = (event: any, theme?: Theme) => {
 		// Keep theme-derived border / dim text colors in sync with the
@@ -6727,6 +6791,7 @@ export default function (pi: ExtensionAPI) {
 	patchAssistantMessages();
 	patchToolExecutionRenderers();
 	applyDiffPalette();
+	registerThinkingLevelTracking(pi);
 	registerThinkingLabels(pi);
 	syncExtraToolDetailMode();
 

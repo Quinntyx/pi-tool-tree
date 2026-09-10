@@ -155,14 +155,18 @@ live while the group runs** (freezing at its final value once the last call
 settles), so a phase that reasoned 19s before a fast tool reads `· 19s`, not `· <1s`.
 
 While a group is still running, its label shimmers: a highlight band sweeps across
-the word (the Claude Code / ChatGPT "working" effect). The band peaks at the active
-theme's own accent color, pushed past the label in the panel's emphasis direction, and
-the resting label fades slightly toward the panel — the sweep reads as the theme's
-palette, and it stays visible on light and dark themes alike. It settles to a constant
-color once the last call finishes. The transcript arms its own repaint while a group is
-in flight — 80ms with the shimmer on, 500ms for a bare live timer — because grouped rows
-bypass pi's native tool renderer, which is what the ● blink normally rides on. Turn it
-off with `/cc-tools shimmer off` or `"activityShimmer": false`.
+the word (the Claude Code / ChatGPT "working" effect), painted in the active theme's
+color for the **current thinking level** — `thinkingMinimal` through `thinkingMax`, the
+same palette pi uses for the editor border. So `/thinking`, `Shift+Tab`, and model
+switches retint a running sweep as they happen, and a live label doubles as a readout of
+how hard the model is being asked to think. Pi's muted levels ("off" is usually a
+surface tone) are stepped toward the panel's emphasis color when they would otherwise be
+invisible, and a theme with no color for the level falls back to its accent. The label
+settles to a constant color once the last call finishes. The transcript arms its own
+repaint while a group is in flight — 80ms with the shimmer on, 500ms for a bare live
+timer — because grouped rows bypass pi's native tool renderer, which is what the ● blink
+normally rides on. Turn it off with `/cc-tools shimmer off` or
+`"activityShimmer": false`.
 
 Pending lights spin on the same wall-clock frame index (from `SPINNER_FRAMES`), so
 the group header and its rows always show the same frame. Agent-family calls keep
@@ -211,7 +215,7 @@ immediately and to plugin tools the next time they register.
 | `groupToolCalls` | `true` | Group adjacent thinking/tool activity with one child per call |
 | `activityGroups` | `true` | Label each group with the model-supplied `activity` word |
 | `pendingIndicator` | `breathe` | Pending light: `breathe` (sized `● → • → · → · → •`, 500ms steps), `spinner` (braille `⠃⠉⠘⠰⢠⣀⡄⠆` at 80ms), or `dot` (classic blinking `●`) |
-| `activityShimmer` | `true` | Sweep an accent-colored highlight across a running group's label: the theme's `accent`, pushed past the label (deepened on light panels, brightened on dark ones) over a label faded toward the panel. Constant color once the group settles. Also drives the ~80ms repaint of the live group timer |
+| `activityShimmer` | `true` | Sweep a highlight across a running group's label in the theme color of the current thinking level (`thinkingMinimal`…`thinkingMax`, falling back to the theme's accent), following `/thinking` and `Shift+Tab` live; constant color once the group settles. Also drives the ~80ms repaint of the live group timer |
 | `toolActivityParam` | `true` | Add the `activity` param to the tools this package owns (optional; a missing label defaults to `working`) |
 | `thinkingMode` | `live` | `live` = only streaming thinking expands (finished collapse to `Thought for Xs`); `full` = always expanded. Pi's `hideThinkingBlock` (Ctrl+T) wins over both: hidden thinking never streams a body. |
 | `bashCollapsedLines` | `10` | Lines for collapsed bash output |
