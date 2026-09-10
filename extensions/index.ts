@@ -14,6 +14,7 @@ import {
 	AssistantMessageComponent,
 	CustomMessageComponent,
 	ToolExecutionComponent,
+	UserMessageComponent,
 	keyHint,
 	keyText,
 	rawKeyHint,
@@ -1113,7 +1114,7 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 
 	type ToolEntry = { kind: "tool"; tool: any; label: string };
 	type ThinkingEntry = { kind: "thinking"; lines: string[]; label: string; durationMs?: number };
-	type ContentEntry = { kind: "content"; lines: string[]; trimEdges?: boolean };
+	type ContentEntry = { kind: "content"; lines: string[]; trimEdges?: boolean; ambient?: boolean };
 	type Entry = ToolEntry | ThinkingEntry | ContentEntry;
 
 	// Pass 1: classify children (content renders once, here).
@@ -1124,6 +1125,12 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 			continue;
 		}
 		if (isSpacerComponent(child)) continue;
+		// Only the conversation closes a chunk; everything else pi prints into the transcript
+		// (status notices, warnings, help) is chrome that can land mid-run.
+		const fromConversation =
+			child instanceof AssistantMessageComponent ||
+			child instanceof UserMessageComponent ||
+			child instanceof CustomMessageComponent;
 		const rows = child instanceof AssistantMessageComponent
 			? assistantActivityRows(child, width)
 			: [{ kind: "content" as const, lines: applyTerminalCopyZones(child.render(width)) }];
@@ -1135,7 +1142,7 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 				// Only assistant rows get their edge padding trimmed — pi wraps every message in a
 				// Spacer, but a user message pads itself with background-filled rows inside its Box,
 				// and dropping those collapses the bubble to a single line.
-				entries.push({ kind: "content", lines: row.lines, trimEdges: child instanceof AssistantMessageComponent });
+				entries.push({ kind: "content", lines: row.lines, trimEdges: child instanceof AssistantMessageComponent, ambient: !fromConversation });
 			}
 		}
 	}
@@ -1149,7 +1156,16 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 		if (!entry.label) entry.label = lastLabel;
 		lastLabel = entry.label;
 	}
-	lastLabel = "";
+	// Where the conversation ends. pi splices non-conversation rows into the transcript
+	// while a run is in flight — the `Thinking level: …` and `Switched to …` status notices
+	// that Shift+Tab and Ctrl+P post, plus warnings and errors. Those are not the
+	// conversation moving on, so they must not close the live chunk: doing that froze the
+	// sweep, the duration ticks and the repaint loop mid-run.
+	let lastConversationalIndex = -1;
+	for (let index = 0; index < entries.length; index++) {
+		const entry = entries[index];
+		if (entry.kind !== "content" || entry.ambient !== true) lastConversationalIndex = index;
+	}	lastLabel = "";
 	for (const entry of entries) {
 		if (entry.kind === "thinking") {
 			let nextLabel: string | undefined;
@@ -1296,9 +1312,12 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 		if (output.length > 0 && !isBlankTranscriptLine(output[output.length - 1])) output.push("");
 	};
 
-	for (const entry of entries) {
+	for (let index = 0; index < entries.length; index++) {
+		const entry = entries[index];
 		if (entry.kind === "content") {
-			flush();
+			// A status notice pi splices in mid-run is the last row in the transcript but not the
+			// conversation moving on, so the chunk before it is still the live one.
+			flush(entry.ambient === true && index > lastConversationalIndex);
 			// Assistant rows drop pi's own edge padding so block spacing stays uniform. Pi's
 			// Markdown child can also overshoot at very small widths, so clamp every prose/native
 			// line the same way grouped rows are clamped.

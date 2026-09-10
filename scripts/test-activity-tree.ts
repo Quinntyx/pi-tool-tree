@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { AssistantMessageComponent, ToolExecutionComponent, UserMessageComponent } from "@earendil-works/pi-coding-agent";
-import { Container, Text, visibleWidth } from "@earendil-works/pi-tui";
+import { Container, Spacer, Text, visibleWidth } from "@earendil-works/pi-tui";
 import { initTheme, theme } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 import extension from "../extensions/index.ts";
 
@@ -412,6 +412,18 @@ assert.ok(listOutput.includes("first item"));
 		assert.ok(new Set(settledColors).size >= 3, `settling a call must not stop the chunk's sweep: ${JSON.stringify(settledColors)}`);
 		fakeNow += 250;
 		assert.notEqual(settledColors.join(), labelColors(shimmerParent.render(100)).join(), "the sweep keeps moving after the call settles");
+		// pi prints status notices into the transcript while a run is in flight — the
+		// `Thinking level: …` and `Switched to …` lines that Shift+Tab and Ctrl+P post. They are
+		// chrome, not the conversation moving on, so they must not close the live chunk: closing
+		// it froze the sweep and the duration mid-run.
+		shimmerParent.addChild(new Spacer(1));
+		shimmerParent.addChild(new Text("Thinking level: max", 1, 0));
+		fakeNow += 250;
+		const noticed = shimmerParent.render(100);
+		assert.ok(plain(noticed).includes("Thinking level: max"), "the notice still renders");
+		assert.ok(new Set(labelColors(noticed)).size >= 3, `a status notice must not stop the sweep: ${JSON.stringify(labelColors(noticed))}`);
+		fakeNow += 250;
+		assert.notEqual(labelColors(noticed).join(), labelColors(shimmerParent.render(100)).join(), "the sweep keeps moving past a notice");
 		// A different activity label supersedes the chunk: the closed label is done, the
 		// new trailing chunk takes over the sweep.
 		const next = new ToolExecutionComponent("code_execution", "shimmer-next", { code: "print(2)", activity: "testing" }, {}, definition as any, ui as any, process.cwd());
