@@ -401,6 +401,41 @@ function isBlankLine(text: string): boolean {
 	return stripAnsi(text).trim().length === 0;
 }
 
+/** Copy-zone markers (OSC 133) carry no visible text, so they never count as content. */
+const OSC133_MARKER_RE = /\x1b\]133;[ABC](?:\x07|\x1b\\)?/g;
+
+function isBlankTranscriptLine(line: string): boolean {
+	return stripAnsi(line.replace(OSC133_MARKER_RE, "")).trim().length === 0;
+}
+
+function osc133MarkersIn(line: string): string {
+	return line.match(OSC133_MARKER_RE)?.join("") ?? "";
+}
+
+/**
+ * Pi pads every message with its own blank lines; the transcript owns block spacing
+ * instead, so drop content edges but keep any copy-zone markers they were carrying.
+ */
+function trimBlankEdges(lines: string[]): string[] {
+	let start = 0;
+	let lead = "";
+	while (start < lines.length && isBlankTranscriptLine(lines[start])) {
+		lead += osc133MarkersIn(lines[start]);
+		start++;
+	}
+	let end = lines.length - 1;
+	let tail = "";
+	while (end >= start && isBlankTranscriptLine(lines[end])) {
+		tail = osc133MarkersIn(lines[end]) + tail;
+		end--;
+	}
+	const kept = lines.slice(start, end + 1);
+	if (kept.length === 0) return kept;
+	if (lead) kept[0] = lead + kept[0];
+	if (tail) kept[kept.length - 1] = kept[kept.length - 1] + tail;
+	return kept;
+}
+
 function terminalColumnCeiling(): number {
 	const cols = typeof process !== "undefined" ? process.stdout?.columns : undefined;
 	return Number.isFinite(cols) && (cols as number) > 0 ? (cols as number) : 0;
@@ -739,7 +774,13 @@ function assistantActivityRows(component: any, width: number): ActivityTreeRow[]
 		const label = live ? `Thinking… ${formatThoughtDuration(duration)}` : `Thought for ${formatThoughtDuration(duration)}`;
 		const lines = [`${WORKED_LINE_FG}${label}${TRANSPARENT_RESET}`];
 		const visibilityOverride = component.thinkingVisibilityOverrides?.get(index);
-		const expanded = visibilityOverride ?? (component[THINKING_EXPANDED_KEY] ?? (getThinkingMode() === "full" || live));
+		// Pi's `hideThinkingBlock` is the user's "thinking is hidden" setting (Ctrl+T
+		// / settings.json). When it is on, nothing streams either: every run renders
+		// as its one-line `Thinking… Xs` / `Thought for Xs` summary. Per-run overrides
+		// (explicitly expanding one thought) still win.
+		const thinkingHidden = !!(component as any).hideThinkingBlock;
+		const expanded = visibilityOverride
+			?? (thinkingHidden ? false : (component[THINKING_EXPANDED_KEY] ?? (getThinkingMode() === "full" || live)));
 		if (expanded) {
 			let cached = thinkingBodyCache.get(child);
 			if (!cached || cached.text !== run.text) {
@@ -772,6 +813,8 @@ function toolActivityLines(tool: any, width: number): string[] {
 /** Activity labels group neighboring tool calls into model-named phases. */
 const ACTIVITY_PARAM = "activity";
 const ACTIVITY_WRAPPED = Symbol.for("pi-tool-tree:activity-wrapped");
+/** Opt-in integration key other tool plugins use to apply the activity param. */
+const ACTIVITY_API_KEY = Symbol.for("pi-tool-tree:activity-api");
 const DEFAULT_ACTIVITY_LABEL = "working";
 
 function activityGroupsEnabled(): boolean {
@@ -842,6 +885,7 @@ function stripActivityParam(args: any): any {
 /** Wrap a tool definition so the model tags each call with an activity label.
  *  The label lives in the recorded args (survives resume); execution never sees it. */
 function wrapWithActivity(record: any): any {
+	if (!record || typeof record !== "object" || record[ACTIVITY_WRAPPED]) return record;
 	const parameters = withActivityParam(record.parameters);
 	if (!parameters) return record;
 	const originalExecute = record.execute;
@@ -850,14 +894,12 @@ function wrapWithActivity(record: any): any {
 		...record,
 		parameters,
 		prepareArguments(args: any) {
-			let prepared = originalPrepare ? originalPrepare(args) : args;
-			// Models occasionally skip optional-feeling fields; default before validation
-			// so a missing label can never fail the call.
-			if (!prepared || typeof prepared !== "object" || Array.isArray(prepared)) prepared = {};
-			if (typeof prepared[ACTIVITY_PARAM] !== "string" || !prepared[ACTIVITY_PARAM].trim()) {
-				prepared[ACTIVITY_PARAM] = DEFAULT_ACTIVITY_LABEL;
-			}
-			return prepared;
+			const prepared = originalPrepare ? originalPrepare(args) : args;
+			const base = prepared && typeof prepared === "object" && !Array.isArray(prepared) ? prepared : {};
+			const label = typeof base[ACTIVITY_PARAM] === "string" && base[ACTIVITY_PARAM].trim() ? base[ACTIVITY_PARAM] : DEFAULT_ACTIVITY_LABEL;
+			// Return a copy: validation always sees a label, while the recorded
+			// tool-call arguments stay exactly what the model sent.
+			return { ...base, [ACTIVITY_PARAM]: label };
 		},
 		async execute(toolCallId: string, params: any, signal: any, onUpdate: any, ctx: any) {
 			return originalExecute(toolCallId, stripActivityParam(params), signal, onUpdate, ctx);
@@ -866,23 +908,51 @@ function wrapWithActivity(record: any): any {
 	};
 }
 
-/** Re-register every visible tool with the activity param. Idempotent via flag. */
-function sweepActivityParams(pi: ExtensionAPI): void {
-	if (!toolActivityParamEnabled()) return;
-	let allTools: any[] = [];
-	try {
-		allTools = typeof (pi as any).getAllTools === "function" ? (pi as any).getAllTools() : [];
-	} catch {
-		return;
-	}
-	for (const record of allTools) {
-		const name = typeof record?.name === "string" ? record.name : "";
-		if (!name || typeof record?.execute !== "function" || record[ACTIVITY_WRAPPED]) continue;
-		try {
-			pi.registerTool(wrapWithActivity(record));
-		} catch {
-			// Registration can race with plugins that own the tool mid-session.
-		}
+/**
+ * Opt-in hook for other tool plugins.
+ *
+ * `pi.getAllTools()` only exposes ToolInfo (name/description/parameters — no
+ * `execute`), so the activity param cannot be swept onto tools this extension
+ * does not own. A plugin opts in by wrapping its own definition before
+ * registering it:
+ *
+ *   const activity = (globalThis as any)[Symbol.for("pi-tool-tree:activity-api")];
+ *   pi.registerTool(activity?.wrapTool ? activity.wrapTool(tool) : tool);
+ *
+ * `wrapTool` is a no-op when the `toolActivityParam` setting is off, so plugins
+ * can call it unconditionally.
+ */
+interface ActivityIntegration {
+	version: 1;
+	param: string;
+	defaultLabel: string;
+	enabled(): boolean;
+	wrapTool<T extends object>(tool: T): T;
+}
+
+function publishActivityIntegration(): void {
+	const integration: ActivityIntegration = {
+		version: 1,
+		param: ACTIVITY_PARAM,
+		defaultLabel: DEFAULT_ACTIVITY_LABEL,
+		enabled: toolActivityParamEnabled,
+		wrapTool: <T extends object>(tool: T): T => (toolActivityParamEnabled() ? wrapWithActivity(tool) : tool),
+	};
+	(globalThis as any)[ACTIVITY_API_KEY] = integration;
+}
+
+/** Tools this extension owns, kept as factories so `/cc-tools activity` can
+ *  re-register them with or without the param without restarting pi. */
+const coreToolFactories = new Map<string, () => any>();
+
+function registerCoreTool(pi: ExtensionAPI, name: string, factory: () => any): void {
+	coreToolFactories.set(name, factory);
+	pi.registerTool(toolActivityParamEnabled() ? wrapWithActivity(factory()) : factory());
+}
+
+function reregisterCoreTools(pi: ExtensionAPI): void {
+	for (const factory of coreToolFactories.values()) {
+		pi.registerTool(toolActivityParamEnabled() ? wrapWithActivity(factory()) : factory());
 	}
 }
 
@@ -955,7 +1025,8 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 		const statuses = tools.map((item) => getToolStatusForGroup(item.tool));
 		const pendingCount = statuses.filter((status) => status === "pending").length;
 		const failedCount = statuses.filter((status) => status === "error").length;
-		const count = items.length;
+		// Only tool calls count as calls — a thought row is not a call.
+		const count = tools.length;
 		const color = failedCount > 0 ? TOOL_STATUS_ERROR : pendingCount > 0 ? TOOL_STATUS_PENDING : TOOL_STATUS_SUCCESS;
 		const dot = pendingCount > 0
 			? (_globalBlinkPhase ? paintStatusDot(color) : " ")
@@ -963,7 +1034,7 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 		const parts: string[] = [];
 		const label = items[0].label;
 		if (label) parts.push(label);
-		parts.push(`${count} ${count === 1 ? "call" : "calls"}`);
+		if (count > 0) parts.push(`${count} ${count === 1 ? "call" : "calls"}`);
 		let totalMs = 0;
 		let timed = 0;
 		for (const item of tools) {
@@ -979,7 +1050,9 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 		const header = `${margin}${dot}${TRANSPARENT_RESET} ${labelAndCounts}${
 			failedCount > 0 ? ` ${TOOL_STATUS_ERROR}· ${failedCount} failed${TRANSPARENT_RESET}` : ""
 		}`;
-		if (label || activityGroupsEnabled()) output.push(clampLineWidth(header, width));
+		// A run without tool calls has no group to head: emit its rows under the
+		// previous block instead of a bare `label 0 calls` header.
+		if (count > 0 && (label || activityGroupsEnabled())) output.push(clampLineWidth(header, width));
 		items.forEach((item, index) => {
 			const last = index === items.length - 1;
 			const glyph = last ? "╰" : "├";
@@ -999,14 +1072,28 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 			if (last && last[0].label === item.label) last.push(item);
 			else runs.push([item]);
 		}
-		for (const run of runs) emitGroup(run);
+		for (const run of runs) {
+			separate();
+			emitGroup(run);
+		}
 		pending = [];
+	};
+
+	// Blank lines separate transcript blocks (agent prose vs. activity groups).
+	const separate = () => {
+		if (output.length > 0 && !isBlankTranscriptLine(output[output.length - 1])) output.push("");
 	};
 
 	for (const entry of entries) {
 		if (entry.kind === "content") {
 			flush();
-			output.push(...entry.lines);
+			// Drop Pi's own edge padding so block spacing stays uniform; Pi's
+			// Markdown child can also overshoot at very small widths, so clamp every
+			// prose/native line the same way grouped rows are clamped.
+			const contentLines = trimBlankEdges(entry.lines);
+			if (contentLines.length === 0) continue;
+			separate();
+			output.push(...contentLines.map((line) => (isTerminalImageLine(line) ? line : clampLineWidth(line, width))));
 			continue;
 		}
 		pending.push({
@@ -1844,14 +1931,21 @@ function renderMathBlock(raw: string, width: number, theme: MarkdownThemeLike): 
 		.flatMap((line) => wrapTextWithAnsi(theme.bold(line), safeWidth));
 }
 
-class DottedParagraph {
+/**
+ * Renders assistant prose that needs more than Pi's Markdown renderer: display math
+ * blocks (`\[…\]`, `$$…$$`) and task-status transcripts that need glyph cleanup.
+ * Plain prose keeps Pi's own Markdown child so it renders flush left, exactly like stock pi.
+ */
+class FlushParagraph {
 	private segments: ParagraphSegment[];
 	private markdownTheme: MarkdownThemeLike;
+	private pad: number;
 	private cachedWidth?: number;
 	private cachedLines?: string[];
 
-	constructor(text: string, markdownTheme: MarkdownThemeLike) {
+	constructor(text: string, markdownTheme: MarkdownThemeLike, pad = 1) {
 		this.markdownTheme = copySafeMarkdownTheme(markdownTheme);
+		this.pad = Number.isFinite(pad) ? Math.max(0, Math.floor(pad)) : 1;
 		this.segments = buildParagraphSegments(stripTransientMagicContextTags(text), this.markdownTheme);
 	}
 
@@ -1871,14 +1965,16 @@ class DottedParagraph {
 			this.cachedLines = [""];
 			return this.cachedLines;
 		}
-		// " ● " = 1 margin + dot + space = 3 visible chars
-		const PREFIX_W = 3;
-		if (safeWidth <= PREFIX_W) {
+		// Match Pi's stock assistant padding (Markdown children get `outputPad`, 1 by
+		// default) so math/status prose lines up with every other prose block.
+		const pad = Math.min(this.pad, safeWidth);
+		const contentWidth = safeWidth - pad;
+		if (contentWidth <= 0) {
 			this.cachedWidth = width;
-			this.cachedLines = [clampLineWidth(" ● ", safeWidth)];
+			this.cachedLines = [" ".repeat(safeWidth)];
 			return this.cachedLines;
 		}
-		const contentWidth = safeWidth - PREFIX_W;
+		const gutter = " ".repeat(pad);
 		const lines = this.segments.flatMap((segment) => {
 			return segment.kind === "math"
 				? renderMathBlock(segment.raw, contentWidth, this.markdownTheme)
@@ -1886,23 +1982,20 @@ class DottedParagraph {
 		});
 		const looksLikeTaskStatus = lines.some((line) => /\b(?:transcript:|No output\.|Wrapped up)/.test(stripAnsi(line)));
 		const displayLines = looksLikeTaskStatus ? lines.map(normalizeLeadingCheckGlyph) : lines;
-		let dotPlaced = false;
-		const rendered = displayLines.map((line: string) => {
-			if (!stripAnsi(line).trim()) return `   ${line}`;
-			if (isCodeBoxChromeLine(line)) return `   ${line}`;
-			if (!dotPlaced) {
-				dotPlaced = true;
-				return ` ${activityTreeBranchAnsi()}●${TRANSPARENT_RESET} ${line}`;
-			}
-			return `   ${line}`;
-		}).map((line) => {
-			const gap = safeWidth - visibleWidth(line);
-			return gap > 0 ? line + " ".repeat(gap) : gap < 0 ? truncateToWidth(line, safeWidth, "", false) : line;
+		const rendered = displayLines.map((line) => {
+			const padded = line ? `${gutter}${line}` : line;
+			const gap = safeWidth - visibleWidth(padded);
+			return gap > 0 ? padded + " ".repeat(gap) : gap < 0 ? truncateToWidth(padded, safeWidth, "", false) : padded;
 		});
 		this.cachedWidth = width;
 		this.cachedLines = rendered;
 		return rendered;
 	}
+}
+
+/** True when prose needs {@link FlushParagraph} instead of Pi's stock Markdown child. */
+function needsFlushParagraph(text: string): boolean {
+	return hasDisplayMathMarkers(text) || /\b(?:transcript:|No output\.|Wrapped up)/.test(text);
 }
 
 function replaceHiddenThinkingPlaceholders(container: { children?: any[]; child?: any }, message: any): void {
@@ -2231,30 +2324,25 @@ function patchAssistantMessages(): void {
 			return originalUpdateContent.call(this, message, isStreaming);
 		}
 		// Thinking display:
-		// When thinking blocks are expanded via Ctrl+T (`hideThinkingBlock === false`),
-		// all thinking blocks (old and new) render in full markdown.
-		// When thinking blocks are collapsed (`hideThinkingBlock === true`):
-		// - "live" mode (default): the actively-streaming thinking block renders
-		//   expanded while streaming, and collapses to `Thought for Xs` once done.
-		// - "full" mode: behaves like stock pi (stays collapsed).
-		const liveMode = getThinkingMode() === "live";
+		// Pi's `hideThinkingBlock` is the single source of truth (Ctrl+T / settings.json).
+		// - `false` (thinking visible): `thinkingMode: "live"` streams the active thought
+		//   and collapses finished ones to `Thought for Xs`; `"full"` keeps them expanded.
+		// - `true` (thinking hidden): nothing streams — every run stays a one-line
+		//   `Thinking… Xs` / `Thought for Xs` summary until the user expands it.
 		const thinkingCollapsed = !!(this as any).hideThinkingBlock;
-		const showLiveThinking = liveMode && thinkingCollapsed && isLiveThinkingMessage(this, message);
 		if (thinkingCollapsed && messageHasThinkingContent(message)) {
 			// Pi wraps this in theme.italic/fg again — keep plain label for the placeholder pass.
 			(this as any).hiddenThinkingLabel = "Thinking…";
 		}
-		if (showLiveThinking) (this as any).hideThinkingBlock = false;
-		try {
-			// Call original to build all children (text, thinking, spacers, errors)
-			originalUpdateContent.call(this, message, isStreaming);
-		} finally {
-			if (showLiveThinking) (this as any).hideThinkingBlock = true;
-		}
-		// Replace text-block Markdown children with DottedParagraph wrappers
+		// Call original to build all children (text, thinking, spacers, errors).
+		// `hideThinkingBlock` is passed through untouched: hidden thinking never renders
+		// a live body, so there is no reason to temporarily reveal it here.
+		originalUpdateContent.call(this, message, isStreaming);
+		// Plain prose keeps Pi's Markdown child (flush left, stock spacing); only prose
+		// that needs display math or status-glyph cleanup gets the custom renderer.
 		const container = (this as any).contentContainer;
 		if (!container?.children) return;
-		if (thinkingCollapsed && !showLiveThinking && messageHasThinkingContent(message)) {
+		if (thinkingCollapsed && messageHasThinkingContent(message)) {
 			replaceHiddenThinkingPlaceholders(container, message);
 		}
 		const mdTheme = (this as any).markdownTheme;
@@ -2267,8 +2355,8 @@ function patchAssistantMessages(): void {
 				if (isThinking) {
 					const style = (child as any).defaultTextStyle;
 					container.children[i] = new ThinkingParagraph(text, mdTheme, style);
-				} else {
-					container.children[i] = new DottedParagraph(text, mdTheme);
+				} else if (needsFlushParagraph(text)) {
+					container.children[i] = new FlushParagraph(text, mdTheme);
 				}
 			}
 		}
@@ -6264,7 +6352,7 @@ export default function (pi: ExtensionAPI) {
 	// /cc-tools command — control tool chrome, grouping, and detail level.
 	const TOOL_MODES = ["outlines", "transparent", "default"] as const;
 	const TOOL_BOOL_MODES = ["on", "off", "toggle", "status"] as const;
-	const TOOL_SUBCOMMANDS = [...TOOL_MODES, "group", "detail", "thinking", "branch", "status"] as const;
+	const TOOL_SUBCOMMANDS = [...TOOL_MODES, "group", "detail", "activity", "thinking", "branch", "status"] as const;
 	const booleanMode = (raw: string | undefined, current: boolean): boolean | "status" | undefined => {
 		const mode = raw || "toggle";
 		if (mode === "on") return true;
@@ -6287,6 +6375,7 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify([
 			`Tool style: ${toolBackgroundMode}`,
 			`Tool grouping: ${toolGroupingEnabled() ? "on" : "off"}`,
+			`Activity labels: ${activityGroupsEnabled() ? "on" : "off"} · param ${toolActivityParamEnabled() ? "on" : "off"}`,
 			`Thinking: ${getThinkingMode()}`,
 			`Extra detail: ${extraToolOutputExpanded ? "on" : "off"} (${rawKeyHint("ctrl+shift+o", "toggle")})`,
 			branchLine,
@@ -6306,6 +6395,7 @@ export default function (pi: ExtensionAPI) {
 						label: m,
 						description:
 							m === "group" ? "Toggle grouped adjacent/concurrent tool rows"
+							: m === "activity" ? "Toggle the required activity label on tool calls"
 							: m === "thinking" ? "Thinking display: live (default) or full"
 							: m === "detail" ? "Toggle Ctrl+Shift+O extra-detail mode"
 							: m === "branch" ? "├ └ │ gray (0-255), theme, fixed, or reset"
@@ -6328,7 +6418,7 @@ export default function (pi: ExtensionAPI) {
 					.filter((m) => m.startsWith(second))
 					.map((m) => ({ value: `thinking ${m}`, label: m, description: `${m} thinking display` }));
 			}
-			if (first === "group" || first === "detail" || first === "extra") {
+			if (first === "group" || first === "detail" || first === "extra" || first === "activity") {
 				const second = parts[1] ?? "";
 				return TOOL_BOOL_MODES
 					.filter((m) => m.startsWith(second))
@@ -6358,6 +6448,29 @@ export default function (pi: ExtensionAPI) {
 				if (ctx.hasUI) {
 					ctx.ui.setToolsExpanded(ctx.ui.getToolsExpanded());
 					ctx.ui.notify(`Tool grouping: ${next ? "on" : "off"}${next ? " (future adjacent tool rows)" : ""}`, "info");
+				}
+				return;
+			}
+
+			if (sub === "activity") {
+				const next = booleanMode(parts[1], toolActivityParamEnabled());
+				if (next === undefined) {
+					if (ctx.hasUI) ctx.ui.notify(`Usage: /cc-tools activity ${TOOL_BOOL_MODES.join("|")}`, "error");
+					return;
+				}
+				if (next === "status") {
+					if (ctx.hasUI) ctx.ui.notify(`Activity param: ${toolActivityParamEnabled() ? "on" : "off"}`, "info");
+					return;
+				}
+				writeSettingsKey("toolActivityParam", next);
+				reregisterCoreTools(pi);
+				if (ctx.hasUI) {
+					ctx.ui.notify(
+						next
+							? "Activity param: on — the model labels every core tool call"
+							: "Activity param: off — labels fall back to the previous group",
+						"info",
+					);
 				}
 				return;
 			}
@@ -6436,7 +6549,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (!(TOOL_MODES as readonly string[]).includes(sub)) {
-				if (ctx.hasUI) ctx.ui.notify(`Unknown option "${sub}". Try /cc-tools status, /cc-tools thinking live, or /cc-tools group toggle.`, "error");
+				if (ctx.hasUI) ctx.ui.notify(`Unknown option "${sub}". Try /cc-tools status, /cc-tools thinking live, /cc-tools group toggle, or /cc-tools activity toggle.`, "error");
 				return;
 			}
 			toolBackgroundOverride = sub as typeof toolBackgroundMode;
@@ -6559,8 +6672,11 @@ export default function (pi: ExtensionAPI) {
 	const cwd = process.cwd();
 	const sp = (path: string) => shortPath(cwd, path);
 
+	// Advertise the opt-in activity integration before any tool registers.
+	publishActivityIntegration();
+
 	const readTool = createReadTool(cwd);
-	pi.registerTool({
+	registerCoreTool(pi, "read", () => ({
 		name: "read",
 		label: "read",
 		description: readTool.description,
@@ -6612,10 +6728,10 @@ export default function (pi: ExtensionAPI) {
 			text += `\n${buildPreviewText(lines, false, theme, previewLimit(), lines.length, (line) => theme.fg("dim", line || " "))}`;
 			return makeText(ctx.lastComponent, withBranch(text, theme));
 		},
-	});
+	}));
 
 	const bashTool = createBashTool(cwd);
-	pi.registerTool({
+	registerCoreTool(pi, "bash", () => ({
 		name: "bash",
 		label: "bash",
 		description: bashTool.description,
@@ -6685,10 +6801,10 @@ export default function (pi: ExtensionAPI) {
 			text += `\n${buildPreviewText(nonEmpty.lines, false, theme, collapsed, nonEmpty.total, (line) => theme.fg("dim", line))}`;
 			return makeText(ctx.lastComponent, withBranch(text, theme));
 		},
-	});
+	}));
 
 	const grepTool = createGrepTool(cwd);
-	pi.registerTool({
+	registerCoreTool(pi, "grep", () => ({
 		name: "grep",
 		label: "grep",
 		description: grepTool.description,
@@ -6725,10 +6841,10 @@ export default function (pi: ExtensionAPI) {
 			text += `\n${buildPreviewText(matches, false, theme, previewLimit(), matches.length, (line) => theme.fg("dim", line))}`;
 			return makeText(ctx.lastComponent, withBranch(text, theme));
 		},
-	});
+	}));
 
 	const findTool = createFindTool(cwd);
-	pi.registerTool({
+	registerCoreTool(pi, "find", () => ({
 		name: "find",
 		label: "find",
 		description: findTool.description,
@@ -6776,10 +6892,10 @@ export default function (pi: ExtensionAPI) {
 			text += `\n${findLines.join('\n')}`;
 			return makeText(ctx.lastComponent, withBranch(text, theme));
 		},
-	});
+	}));
 
 	const lsTool = createLsTool(cwd);
-	pi.registerTool({
+	registerCoreTool(pi, "ls", () => ({
 		name: "ls",
 		label: "ls",
 		description: lsTool.description,
@@ -6827,10 +6943,10 @@ export default function (pi: ExtensionAPI) {
 			text += `\n${treeLines.join('\n')}`;
 			return makeText(ctx.lastComponent, withBranch(text, theme));
 		},
-	});
+	}));
 
 	const writeTool = createWriteTool(cwd);
-	pi.registerTool({
+	registerCoreTool(pi, "write", () => ({
 		name: "write",
 		label: "write",
 		description: writeTool.description,
@@ -6942,10 +7058,10 @@ export default function (pi: ExtensionAPI) {
 			}
 			return makeText(ctx.lastComponent, withBranch(theme.fg("success", "Written"), theme));
 		},
-	});
+	}));
 
 	const editTool = createEditTool(cwd);
-	pi.registerTool({
+	registerCoreTool(pi, "edit", () => ({
 		name: "edit",
 		label: "edit",
 		description: editTool.description,
@@ -7043,7 +7159,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			return makeText(ctx.lastComponent, indentBranchBlock(withBranch(theme.fg("success", "Applied"), theme)));
 		},
-	});
+	}));
 
 	const wrappedOpenAiTools = new Set<string>();
 	const registerOpenAiToolOverrides = (): void => {
@@ -7131,12 +7247,10 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async () => {
 		registerOpenAiToolOverrides();
 		registerMcpToolOverrides();
-		sweepActivityParams(pi);
 	});
 	pi.on("before_agent_start", async () => {
 		registerOpenAiToolOverrides();
 		registerMcpToolOverrides();
-		sweepActivityParams(pi);
 	});
 
 	// Streaming activity keeps the blink timer alive. Do NOT clear blink contexts

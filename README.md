@@ -39,7 +39,7 @@ Claude Code inspired tool rendering for Pi — Shiki-powered diffs, status dots,
 - **Unified activity trees** with a distinct child for every tool call and thinking run, including repeated calls. Assistant prose and user messages remain outside the tree (set `groupToolCalls: false` to disable).
 - **Native custom-tool animations** (including Code Execution) remain visible while running, collapse on completion, and expand again with `Ctrl+O`.
 - **No horizontal tool rules**, including when older settings select `border` or `outlines`.
-- **Quieter layout**: short `├` / `╰` connectors, gray paragraph dots, and default Markdown bullets. Settled calls use green `✓` or red `!`; running indicators remain animated.
+- **Quieter layout**: short `├` / `╰` connectors, assistant prose left in pi's own flush-left Markdown rendering, blank lines between transcript blocks, and default Markdown bullets. Settled calls use green `✓` or red `!`; running indicators remain animated.
 - **Extra detail toggle** with `Ctrl+Shift+O`, increasing expanded preview caps without making the default view heavy
 - **Global border patch** for all tool rows, including unknown/custom tools
 
@@ -58,6 +58,8 @@ Set in `.pi/settings.json` or `~/.pi/settings.json`:
   "extraExpandedPreviewMaxLines": 12000,
   "extraToolOutputExpanded": false,
   "groupToolCalls": true,
+  "activityGroups": true,
+  "toolActivityParam": true,
   "thinkingMode": "live",
   "bashOutputMode": "opencode",
   "bashCollapsedLines": 10,
@@ -118,9 +120,51 @@ Use `/cc-tools` to control tool UI at runtime:
 /cc-tools group off       # disable grouping (also ungroups current grouped rows)
 /cc-tools thinking live   # default: only the streaming thinking expands; finished ones collapse
 /cc-tools thinking full   # always render thinking expanded, like stock pi
+                          # (Ctrl+T / `hideThinkingBlock` hides thinking entirely: nothing streams)
 /cc-tools detail toggle   # same mode as Ctrl+Shift+O
+/cc-tools activity toggle # add/remove the model's activity label on tool calls
 ```
 
+### Activity labels
+
+Adjacent tool calls are grouped into phases named by the model on each call:
+
+```text
+ ● implementing 3 calls · 4.2s
+ ├ ✓ edit  src/index.ts
+ ├ ✓ bash  bun test
+ ╰ ✓ edit  src/utils.ts
+```
+
+The seven tools this package owns (`read`, `bash`, `grep`, `find`, `ls`, `write`,
+`edit`) declare a required `activity` param, so the label arrives with every call.
+It is stripped again before the tool executes, and the recorded message keeps
+exactly the arguments the model sent. Calls from tools that do not opt in (MCP,
+other plugins) inherit the previous group's label instead of starting a new group.
+
+Only tool calls are counted, so a thinking row never inflates `N calls`. A run
+without any tool call (a trailing thought, for example) prints its rows without a
+header, and blank lines separate groups from the prose between them.
+
+#### Plugin integration (opt-in)
+
+Tools registered by other extensions are not wrapped automatically:
+`pi.getAllTools()` exposes no `execute`, so they cannot be re-registered from the
+outside. A plugin opts in by wrapping its own definition before registering it —
+the integration is published on `globalThis` under
+`Symbol.for("pi-tool-tree:activity-api")`:
+
+```ts
+const activity = (globalThis as any)[Symbol.for("pi-tool-tree:activity-api")];
+const tool = buildMyTool();
+pi.registerTool(activity?.wrapTool ? activity.wrapTool(tool) : tool);
+```
+
+`wrapTool(tool)` adds `activity` to the schema, defaults a missing label to
+`working` in `prepareArguments`, and strips the label from the arguments your
+`execute` receives. It is a no-op when `toolActivityParam` is `false`, so plugins
+can call it unconditionally. Toggling the setting applies to the core tools
+immediately and to plugin tools the next time they register.
 ### Output modes
 
 | Setting | Values | Default |
@@ -139,7 +183,9 @@ Use `/cc-tools` to control tool UI at runtime:
 | `extraExpandedPreviewMaxLines` | `12000` | Max lines after Ctrl+Shift+O extra-detail mode |
 | `extraToolOutputExpanded` | `false` | Start with Ctrl+Shift+O extra-detail mode enabled |
 | `groupToolCalls` | `true` | Group adjacent thinking/tool activity with one child per call |
-| `thinkingMode` | `live` | `live` = only streaming thinking expands (finished collapse to `Thought for Xs`); `full` = always expanded |
+| `activityGroups` | `true` | Label each group with the model-supplied `activity` word |
+| `toolActivityParam` | `true` | Add the required `activity` param to the tools this package owns |
+| `thinkingMode` | `live` | `live` = only streaming thinking expands (finished collapse to `Thought for Xs`); `full` = always expanded. Pi's `hideThinkingBlock` (Ctrl+T) wins over both: hidden thinking never streams a body. |
 | `bashCollapsedLines` | `10` | Lines for collapsed bash output |
 | `bashCommandPreviewLines` | `8` | Verbatim script lines shown while bash runs or after failure; `0` disables them |
 | `liveToolPreview` | `true` | Show a small live output preview while tools are still running |

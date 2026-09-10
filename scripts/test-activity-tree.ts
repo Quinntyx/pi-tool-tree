@@ -6,15 +6,20 @@ import extension from "../extensions/index.ts";
 
 initTheme("dark", false);
 const handlers = new Map<string, any[]>();
+const commands = new Map<string, any>();
 const tools = new Map<string, any>();
 const pi = {
 	registerTool(tool: any) { tools.set(tool.name, tool); },
-	registerCommand() {}, registerShortcut() {},
+	registerCommand(name: string, command: any) { commands.set(name, command); }, registerShortcut() {},
 	on(name: string, handler: any) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
 };
+// Isolate settings: the activity param reads `toolActivityParam` from ~/.pi/settings.json.
+const realHome = process.env.HOME;
+const tmpHome = `${realHome}/.pi-activity-test-home-${Date.now()}`;
+process.env.HOME = tmpHome;
 extension(pi as any);
 for (const handler of handlers.get("agent_start") ?? []) await handler({}, {});
-const plain = (lines: string[]) => lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, "")).join("\n");
+const plain = (lines: string[]) => lines.map((line) => line.replace(/\x1b\][^\x07]*\x07/g, "").replace(/\x1b\[[0-9;]*m/g, "")).join("\n");
 const ui = { requestRender() {} };
 let frame = 1;
 let nativeRenders = 0;
@@ -99,14 +104,34 @@ const mixed = new AssistantMessageComponent({
 parent.addChild(mixed);
 output = plain(parent.render(100));
 assert.ok(output.lastIndexOf("Visible answer") > output.lastIndexOf("Thought for"));
-// Prose keeps its original spacing (no injected blank lines) and its dot follows the tree gray.
-assert.ok(output.split("\n").some((line) => / ● /.test(line)), "prose paragraph dot present");
+// Prose renders flush left with Pi's own Markdown child: no dot, no indent, and a
+// blank line separates it from the activity groups around it. (Group headers keep
+// their own status dot, so only the prose lines themselves are checked here.)
+const proseLines = output.split("\n").filter((line) => line.includes("Visible answer"));
+assert.equal(proseLines.length, 1);
+assert.ok(/^ ?Visible answer/.test(proseLines[0]), `prose must be flush left without a dot: ${JSON.stringify(proseLines[0])}`);
+assert.ok(!/\b0 calls?\b/.test(output), "a group with no tool calls must not print a count header");
 assert.equal(plain(parent.render(100)), output, "repeated rendering must not accumulate spacing");
+// Thinking hidden up front (pi's hideThinkingBlock / Ctrl+T) must never stream a
+// live body — only the one-line summary stays until the user expands it.
+const hiddenMessage = {
+	role: "assistant", content: [{ type: "thinking", thinking: "secret live reasoning" }], stopReason: "pending",
+	_piClaudeStyleThinkingActive: true,
+};
+const hiddenStream = new AssistantMessageComponent(hiddenMessage as any, true);
+hiddenStream.updateContent(structuredClone(hiddenMessage) as any, true);
+const hiddenParent = new Container();
+hiddenParent.addChild(hiddenStream);
+const hiddenOutput = plain(hiddenParent.render(100));
+assert.ok(!hiddenOutput.includes("secret live reasoning"), "hidden thinking must not stream");
+assert.ok(/Thinking…|Thought for/.test(hiddenOutput), "hidden thinking still reports a summary line");
 const terminal = new Text("User boundary", 0, 0);
 parent.addChild(terminal);
 parent.addChild(tool("four", "print('next')", true));
 output = plain(parent.render(100));
 assert.ok(output.indexOf("User boundary") < output.indexOf("print('next')"));
+// Prose is followed by exactly one blank line before the next transcript block.
+assert.ok(/Visible answer stays after the tree\. *\n\n ?User boundary/.test(output), "prose must be followed by exactly one blank line");
 // Malformed numeric path arguments must not crash rendering (glm-5.3-flash produced path: 5).
 const numeric = new ToolExecutionComponent("read", "bad-args", { path: 5, offset: 1 } as any, {}, undefined as any, ui as any, process.cwd());
 numeric.markExecutionStarted();
@@ -132,4 +157,70 @@ const ctx = { hasUI: true, ui: { theme, notify() {}, getToolsExpanded: () => fal
 for (const handler of handlers.get("session_start") ?? []) await handler({ reason: "resume" }, ctx);
 const lightTree = parent.render(100);
 assert.ok(lightTree.some((line) => line.includes("\x1b[38;2;176;176;176m├")), "light gray connectors on a light background");
-console.log("OK: spacing reverted, gray prose dots, stock bullets, short connectors, ✓/! statuses, live previews, and width safety");
+console.log("OK: flush-left prose, blank-line block spacing, tool-only call counts, hidden-thinking respect, stock bullets, short connectors, ✓/! statuses, live previews, and width safety");
+// ---------------------------------------------------------------------------
+// Activity param: the core tools opt in, other plugins opt in through the
+// published integration, and /cc-tools activity switches it without a restart.
+// ---------------------------------------------------------------------------
+{
+	const api = (globalThis as any)[Symbol.for("pi-tool-tree:activity-api")];
+	assert.ok(api, "the activity integration must be published on globalThis");
+	assert.equal(api.version, 1);
+	assert.equal(api.param, "activity");
+	assert.equal(api.defaultLabel, "working");
+	assert.equal(api.enabled(), true);
+
+	// Core tools declare the param, so the model always sees it in the schema.
+	for (const name of ["read", "bash", "grep", "find", "ls", "write", "edit"]) {
+		const tool = tools.get(name);
+		assert.ok(tool?.parameters?.properties?.activity, `${name} schema must accept activity`);
+		assert.ok(tool.parameters.required.includes("activity"), `${name} must require activity`);
+	}
+
+	// Plugin opt-in: schema gains the param, a missing label defaults, and the
+	// plugin's own execute never sees it. Recorded (model) args are not mutated.
+	const seen: any[] = [];
+	const pluginTool = api.wrapTool({
+		name: "plugin_probe",
+		parameters: { type: "object", properties: { value: { type: "string" } }, required: ["value"] },
+		async execute(_id: string, args: any) { seen.push(args); return { content: [], details: {} }; },
+	});
+	assert.ok(pluginTool.parameters.properties.activity, "plugin schema must accept activity");
+	const rawArgs = { value: "v" };
+	assert.equal(pluginTool.prepareArguments(rawArgs).activity, "working", "a missing label must default");
+	assert.deepEqual(rawArgs, { value: "v" }, "prepareArguments must not mutate the model's args");
+	await pluginTool.execute("id", { value: "v", activity: "exploring" });
+	assert.deepEqual(seen, [{ value: "v" }], "execute must never see the label");
+	assert.equal(pluginTool[Symbol.for("pi-tool-tree:activity-wrapped")], true, "wrapping is idempotent");
+
+	// The real validator must accept the injected param without losing strictness
+	// (a missing required arg still fails).
+	const { validateToolArguments } = await import("../node_modules/@earendil-works/pi-ai/dist/utils/validation.js");
+	const readTool = tools.get("read");
+	const validated = validateToolArguments(readTool, { id: "c1", name: "read", arguments: { path: "x", activity: "exploring" } } as any);
+	assert.equal(validated.activity, "exploring");
+	assert.equal(validated.path, "x");
+	const defaulted = validateToolArguments(readTool, { id: "c2", name: "read", arguments: readTool.prepareArguments({ path: "x" }) } as any);
+	assert.equal(defaulted.activity, "working");
+	assert.throws(
+		() => validateToolArguments(readTool, { id: "c3", name: "read", arguments: { activity: "exploring" } } as any),
+		/Validation failed/,
+		"required arguments must still be enforced",
+	);
+
+	// Disabling drops the param from the core tools and makes wrapTool a no-op.
+	const ccTools = commands.get("cc-tools");
+	assert.ok(ccTools, "cc-tools command must be registered");
+	const toolCtx = { hasUI: true, ui: { theme, notify() {}, getToolsExpanded: () => false, setToolsExpanded() {} } };
+	await ccTools.handler("activity off", toolCtx);
+	assert.equal(api.enabled(), false);
+	assert.equal(api.wrapTool({ name: "x", parameters: { type: "object", properties: {} }, execute: async () => ({}) }).parameters.properties.activity, undefined);
+	assert.equal(tools.get("read").parameters.properties.activity, undefined, "activity off must drop the param");
+	await ccTools.handler("activity on", toolCtx);
+	assert.ok(tools.get("read").parameters.properties.activity, "activity on must restore the param");
+	console.log("OK  activity param: core tools, plugin opt-in, /cc-tools toggle, disabled no-op");
+}
+
+process.env.HOME = realHome;
+const { execFileSync } = await import("node:child_process");
+execFileSync("trash", [tmpHome]);

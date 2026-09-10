@@ -35,6 +35,22 @@
 
 ## Unreleased
 
+### Added
+
+- **Model-named activity groups** — the seven core tools (`read`, `bash`, `grep`, `find`, `ls`, `write`, `edit`) now declare a required `activity` param, so every call carries the phase it belongs to (`exploring`, `implementing`, `testing`, …) and each tree group is headed by that word. The label is stripped before the tool runs and the recorded message keeps exactly the arguments the model sent.
+- **Opt-in integration for tool plugins** — other extensions can wrap their own tool definitions through the API published at `Symbol.for("pi-tool-tree:activity-api")` (`wrapTool(tool)`), which adds the schema property, defaults a missing label, and strips it before `execute`. `pi.getAllTools()` exposes no `execute`, so plugin tools cannot be wrapped from the outside; the integration is a no-op when the setting is off.
+- **`/cc-tools activity on|off|toggle|status`** — switches the param without restarting pi (core tools re-register live), and the `activityGroups` / `toolActivityParam` settings are now documented.
+
+### Fixed
+
+- **The activity param is actually injected** — the previous sweep read `pi.getAllTools()`, which returns tool metadata without `execute`, so every tool was skipped and the model never saw the param. Core tools are now wrapped at their own registration sites and the dead sweep is gone. (`registerOpenAiToolOverrides` and `registerMcpToolOverrides` are gated on the same missing `execute` field, so they still never fire in the real harness — unchanged by this release).
+
+### Changed
+
+- **Flush-left assistant prose** — assistant text keeps pi's own Markdown rendering again: no ` ● ` dot and no extra three-space indent. Only prose containing display math (`\[…\]`, `$$…$$`) or task-status transcripts still uses the custom paragraph renderer (now flush left, matching pi's one-space assistant padding).
+- **Blank lines between transcript blocks** — a blank line follows agent prose and separates consecutive activity groups, so phases read as distinct blocks instead of one wall of rows.
+- **Only tool calls are counted** — a thinking row no longer inflates the group header (one thought plus four calls used to read `5 calls`), and a run with no tool call at all (a trailing thought, say) no longer prints a `N calls` header at all.
+- **Hidden thinking stays hidden** — `hideThinkingBlock` (Ctrl+T / settings.json) now wins over `thinkingMode`. When thinking is hidden, the newest thought no longer streams a live body into the tree; only its one-line `Thinking… Xs` / `Thought for Xs` summary stays until you explicitly expand it.
 ### Fixed
 
 - **`Turn took` is now `Agent took`, and the bracket counts real turns** — the end-of-run status line reads `✻ Agent took 2m 30s (Total time 8m 4s · 3 turns)`. "Turn" previously named two different things: the agent run since your last prompt, and pi's own turn (one model response plus its tool calls). The label now names the run, and the count is how many turns actually fired inside it. Transcripts whose runs were never stamped fall back to the number of assistant messages in that run. Legacy `Turn took` lines baked into older transcripts are still scrubbed on load.
