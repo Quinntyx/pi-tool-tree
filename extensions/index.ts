@@ -1068,22 +1068,30 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 		if (label) parts.push(label);
 		if (count > 0) parts.push(`${count} ${count === 1 ? "call" : "calls"}`);
 		let totalMs = 0;
+		let timed = 0;
 		for (const item of tools) {
 			const timing = TOOL_TIMINGS.get(item.tool.toolCallId);
-			if (timing?.end) {
-				totalMs += Math.max(0, timing.end - timing.start);
-			}
+			if (!timing) continue;
+			timed++;
+			// Pending calls tick against the wall clock, so the header total is live while
+			// the group runs and freezes at its final value when the last call settles.
+			const end = timing.end ?? Date.now();
+			totalMs += Math.max(0, end - timing.start);
 		}
 		// Thinking inside the group is time spent on that group, so it counts toward the
 		// duration even though it is not a call. Without this a group whose tools are fast
 		// advertises `<1s` after half a minute of reasoning.
 		let thinkingMs = 0;
+		let thought = 0;
 		for (const item of items) {
-			if (!item.tool && typeof item.durationMs === "number") thinkingMs += Math.max(0, item.durationMs);
+			if (item.tool || typeof item.durationMs !== "number") continue;
+			thought++;
+			thinkingMs += Math.max(0, item.durationMs);
 		}
 		const complete = pendingCount === 0;
-		const workMs = totalMs + thinkingMs;
-		if (complete && workMs > 0) parts.push(formatBashDuration(workMs));
+		// A reading of 0 still prints (`<1s`): a call that just started is a measurement,
+		// while a group with no timing data at all prints none.
+		if (timed > 0 || thought > 0) parts.push(formatBashDuration(totalMs + thinkingMs));
 		// While the group is running its label shimmers; once every call settles the label
 		// returns to the ambient color. Counts stay static metadata.
 		const shimmering = !complete && !!label && activityShimmerEnabled();

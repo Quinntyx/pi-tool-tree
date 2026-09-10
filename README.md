@@ -149,8 +149,9 @@ bare `N calls` header.
 Only tool calls are counted, so a thinking row never inflates `N calls`. A run
 without any tool call (a trailing thought, for example) prints its rows without a
 header, and blank lines separate groups from the prose between them. The group
-duration sums tool time **plus the thinking time inside the group**, so a phase that
-reasoned 19s before a fast tool reads `· 19s`, not `· <1s`.
+duration sums tool time **plus the thinking time inside the group**, and it **ticks
+live while the group runs** (freezing at its final value once the last call
+settles), so a phase that reasoned 19s before a fast tool reads `· 19s`, not `· <1s`.
 
 While a group is still running, its label shimmers: a highlight band sweeps across
 the word (the Claude Code / ChatGPT "working" effect) as a gradient of the label's
@@ -200,7 +201,7 @@ immediately and to plugin tools the next time they register.
 | `extraToolOutputExpanded` | `false` | Start with Ctrl+Shift+O extra-detail mode enabled |
 | `groupToolCalls` | `true` | Group adjacent thinking/tool activity with one child per call |
 | `activityGroups` | `true` | Label each group with the model-supplied `activity` word |
-| `activityShimmer` | `true` | Sweep a highlight across a running group's label; constant color once the group settles |
+| `activityShimmer` | `true` | Sweep a highlight across a running group's label; constant color once the group settles. Also drives the ~80ms repaint of the live group timer |
 | `toolActivityParam` | `true` | Add the `activity` param to the tools this package owns (optional; a missing label defaults to `working`) |
 | `thinkingMode` | `live` | `live` = only streaming thinking expands (finished collapse to `Thought for Xs`); `full` = always expanded. Pi's `hideThinkingBlock` (Ctrl+T) wins over both: hidden thinking never streams a body. |
 | `bashCollapsedLines` | `10` | Lines for collapsed bash output |

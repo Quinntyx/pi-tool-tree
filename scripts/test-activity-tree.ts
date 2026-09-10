@@ -155,6 +155,39 @@ const listOutput = plain(listParent.render(100));
 assert.ok(!listOutput.includes("◉"), "stock list bullets must not be replaced");
 assert.ok(listOutput.includes("first item"));
 
+// A running group's total ticks live off the wall clock, and freezes when it settles.
+{
+	const realNow = Date.now;
+	let fakeNow = 1_700_000_000_000;
+	Date.now = () => fakeNow;
+	try {
+		const liveParent = new Container();
+		const callId = "live-timer";
+		for (const handler of handlers.get("tool_execution_start") ?? []) {
+			await handler({ toolCallId: callId, toolName: "code_execution", args: { code: "print(1)", activity: "testing" } }, ui);
+		}
+		const running = new ToolExecutionComponent("code_execution", callId, { code: "print(1)", activity: "testing" }, {}, definition as any, ui as any, process.cwd());
+		running.markExecutionStarted();
+		running.updateResult({ content: [{ type: "text", text: "running" }], isError: false } as any, true);
+		liveParent.addChild(running);
+		assert.ok(/testing 1 call · <1s/.test(plain(liveParent.render(100))), "a just-started group starts near zero");
+		fakeNow += 5000;
+		assert.ok(/testing 1 call · 5s/.test(plain(liveParent.render(100))), `a running total must tick: ${JSON.stringify(plain(liveParent.render(100)).split("\n")[0])}`);
+		fakeNow += 4000;
+		assert.ok(/testing 1 call · 9s/.test(plain(liveParent.render(100))), "a running total keeps ticking");
+		// Settle it: the total now measures the recorded run and stops moving.
+		for (const handler of handlers.get("tool_execution_end") ?? []) {
+			await handler({ toolCallId: callId, toolName: "code_execution", args: {} }, ui);
+		}
+		running.updateResult({ content: [{ type: "text", text: "done" }], isError: false } as any, false);
+		const settled = plain(liveParent.render(100));
+		fakeNow += 30000;
+		assert.equal(settled, plain(liveParent.render(100)), "a settled total must stop ticking");
+	} finally {
+		Date.now = realNow;
+	}
+}
+
 // A group that reasoned for 19s and then ran a fast tool must not advertise `<1s`:
 // thinking is time spent on the group even though it is not a call.
 {
