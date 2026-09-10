@@ -47,7 +47,7 @@ assert.equal(output.split("\n").filter((line) => /[├╰] .*python/.test(line))
 assert.ok(output.includes("Executing Python frame 1"));
 // Neither tool declares `activity`, so the group has nothing to inherit: it falls
 // back to the default label instead of printing a bare `2 calls` header.
-assert.ok(output.split("\n").some((line) => /^ [\u2800-\u28FF●] working 2 calls/.test(line)), `unlabeled first group must show the default label: ${JSON.stringify(output.split("\n")[0])}`);
+assert.ok(output.split("\n").some((line) => /^ [●•· \u2800-\u28FF] working 2 calls/.test(line)), `unlabeled first group must show the default label: ${JSON.stringify(output.split("\n")[0])}`);
 assert.ok(!output.includes("×2"));
 assert.ok(!output.includes("Code Execution Code Execution"));
 assert.ok(!output.split("\n").some((line) => /^\s*─{5,}\s*$/.test(line)));
@@ -177,13 +177,14 @@ assert.ok(listOutput.includes("first item"));
 	assert.ok(isPaddingRow(lines[textIndex + 1]), `user bubble keeps its bottom padding row: ${JSON.stringify(lines[textIndex + 1])}`);
 }
 
-// Pending lights are a braille spinner by default, indexed off the wall clock, and
-// `/cc-tools pending dot` still offers the classic blinking ●.
+// Pending lights default to the circle-breathe cycle, with the braille spinner and
+// the classic blinking dot available through /cc-tools pending.
 {
 	const realNow = Date.now;
 	let fakeNow = 1_700_000_000_000;
 	Date.now = () => fakeNow;
-	const frames = "⠃⠉⠘⠰⢠⣀⡄⠆";
+	const breathe = "●•· ·•";        // AGENT_BREATHE_GLYPHS
+	const spinner = "⠃⠉⠘⠰⢠⣀⡄⠆";
 	const ctx = { hasUI: true, ui: { theme, notify() {}, getToolsExpanded: () => false, setToolsExpanded() {} } };
 	const glyphOf = (parent: Container) => {
 		const line = plain(parent.render(100)).split("\n").find((l) => l.includes("implementing")) ?? "";
@@ -198,22 +199,26 @@ assert.ok(listOutput.includes("first item"));
 		return { parent, component };
 	};
 	try {
-		const spinning = pendingTool("spinner-frame");
-		const first = glyphOf(spinning.parent);
-		assert.ok(frames.includes(first), `a pending group must spin: ${JSON.stringify(first)}`);
-		fakeNow += 80;
-		const second = glyphOf(spinning.parent);
-		assert.notEqual(second, first, "the spinner frame must advance with the clock");
-		assert.ok(frames.includes(second), `spinner frames stay in the cycle: ${JSON.stringify(second)}`);
-		// Settled groups show the static filled light (green ●), never a spinner frame.
-		spinning.component.updateResult({ content: [{ type: "text", text: "ok" }], isError: false } as any, false);
-		assert.equal(glyphOf(spinning.parent), "●", "a settled group shows the static status light");
+		const breathing = pendingTool("breathe-frame");
+		const first = glyphOf(breathing.parent);
+		assert.ok(breathe.includes(first), `a pending group must breathe by default: ${JSON.stringify(first)}`);
+		// One 500ms beat advances the cycle (big ● → •), clock-driven like the spinner.
+		fakeNow += 500;
+		const second = glyphOf(breathing.parent);
+		assert.notEqual(second, first, "the breathe glyph must advance with the clock");
+		assert.ok(breathe.includes(second), `breathe frames stay in the cycle: ${JSON.stringify(second)}`);
+		// Settled groups show the static filled light (green ●), never a cycle frame.
+		breathing.component.updateResult({ content: [{ type: "text", text: "ok" }], isError: false } as any, false);
+		assert.equal(glyphOf(breathing.parent), "●", "a settled group shows the static status light");
 
-		const dotCase = pendingTool("spinner-dot");
-		await commands.get("cc-tools").handler("pending dot", ctx);
-		assert.ok("● ".includes(glyphOf(dotCase.parent)), `dot mode must blink, not spin: ${JSON.stringify(glyphOf(dotCase.parent))}`);
+		const spinnerCase = pendingTool("spinner-frame");
 		await commands.get("cc-tools").handler("pending spinner", ctx);
-		assert.ok(frames.includes(glyphOf(dotCase.parent)), "spinner mode comes back with /cc-tools pending spinner");
+		assert.ok(spinner.includes(glyphOf(spinnerCase.parent)), `spinner mode still works: ${JSON.stringify(glyphOf(spinnerCase.parent))}`);
+		const dotCase = pendingTool("dot-frame");
+		await commands.get("cc-tools").handler("pending dot", ctx);
+		assert.ok("● ".includes(glyphOf(dotCase.parent)), `dot mode must blink, not cycle: ${JSON.stringify(glyphOf(dotCase.parent))}`);
+		await commands.get("cc-tools").handler("pending breathe", ctx);
+		assert.ok(breathe.includes(glyphOf(spinnerCase.parent)), "breathe mode comes back as the default");
 	} finally {
 		Date.now = realNow;
 	}
@@ -331,7 +336,7 @@ assert.ok(listOutput.includes("first item"));
 		const labelColors = (lines: string[]) => {
 			const line = lines.find((l) => l.replace(/\x1b\[[0-9;]*m/g, "").includes("implementing")) ?? "";
 			const stripped = line.replace(/\x1b\[[0-9;]*m/g, "");
-			const glyphAt = stripped.search(/[\u2800-\u28FF●]/);
+			const glyphAt = stripped.search(/[\u2800-\u28FF●•·]/);
 			const callAt = line.indexOf("1 call");
 			if (glyphAt < 0 || callAt < 0) return [];
 			const region = line.slice(glyphAt + 1, callAt);

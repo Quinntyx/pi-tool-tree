@@ -138,7 +138,7 @@ thinking("Done \u2014 summarising the change for the user.", 1200);
 	const paint = COLOR ? (l: string) => l : plain;
 	process.stdout.write(probe.render(WIDTH).map(paint).join("\n") + "\n");
 	for (let i = 1; i < frames; i++) {
-		advance(400);
+		advance(500);
 		process.stdout.write(probe.render(WIDTH).map(paint).join("\n") + "\n");
 	}
 	process.exit(0);

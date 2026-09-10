@@ -94,8 +94,8 @@ interface SettingsFile {
 	groupToolCalls?: boolean;
 	/** Group neighboring tool calls by the model's per-call `activity` label. Default true. */
 	activityGroups?: boolean;
-	/** Pending light: `spinner` (default, braille) or `dot` (classic blinking ●). */
-	pendingIndicator?: "spinner" | "dot";
+	/** Pending light: `breathe` (default, circle-breathe ● • ·), `spinner` (braille), or `dot`. */
+	pendingIndicator?: "breathe" | "spinner" | "dot";
 	/** Sweep a highlight across the activity label while its group is running. Default true. */
 	activityShimmer?: boolean;
 	/** Inject the required `activity` param into every tool schema. Default true. */
@@ -586,17 +586,26 @@ function paintStatusDot(colorAnsi: string): string {
 }
 
 /**
- * Pending indicator. Default is a single-cell braille spinner; `pendingIndicator:
- * "dot"` restores the classic on/off ●. Frames come from the wall clock (not from a
- * frame counter), so grouped rows, native rows and the group header all show the
- * same frame no matter which of them happened to repaint last.
+ * Pending indicator. Default is the circle-breathe cycle (big ● → • → · → invisible →
+ * · → •); `pendingIndicator: "spinner"` uses a single-cell braille spinner and
+ * `"dot"` restores the classic on/off ●. Frames come from the wall clock (not from a
+ * frame counter), so grouped rows, native rows and the group header all show the same
+ * frame no matter which of them happened to repaint last.
  */
 const SPINNER_FRAMES = ["⠃", "⠉", "⠘", "⠰", "⢠", "⣀", "⡄", "⠆"] as const;
-/** Spinner cadence; also the repaint beat while any tool is pending. */
+/** Spinner cadence; also the repaint beat while a spinner is pending. */
 const SPINNER_INTERVAL_MS = 80;
+/** One breathe step per beat — same cadence agent-family rows have always used. */
+const BREATHE_INTERVAL_MS = 500;
 
-function pendingIndicatorIsSpinner(): boolean {
-	return readSettings().pendingIndicator !== "dot";
+function pendingIndicatorMode(): "breathe" | "spinner" | "dot" {
+	const raw = readSettings().pendingIndicator;
+	return raw === "spinner" || raw === "dot" ? raw : "breathe";
+}
+
+/** On/off phase of the classic blinking dot, read from the clock so any repaint agrees. */
+function blinkPhaseOn(): boolean {
+	return Math.floor(Date.now() / BREATHE_INTERVAL_MS) % 2 === 0;
 }
 
 function spinnerFrameGlyph(): string {
@@ -605,10 +614,12 @@ function spinnerFrameGlyph(): string {
 	return SPINNER_FRAMES[(index + frames) % frames];
 }
 
-/** Colored pending light: a spinner frame, or the classic blinking ●. */
+/** Colored pending light: breathe (default), braille spinner, or the blinking ●. */
 function paintPendingLight(colorAnsi: string): string {
-	if (!pendingIndicatorIsSpinner()) return _globalBlinkPhase ? paintStatusDot(colorAnsi) : " ";
-	return `${colorAnsi}${spinnerFrameGlyph()}${TRANSPARENT_RESET}`;
+	const mode = pendingIndicatorMode();
+	if (mode === "spinner") return `${colorAnsi}${spinnerFrameGlyph()}${TRANSPARENT_RESET}`;
+	if (mode === "dot") return blinkPhaseOn() ? paintStatusDot(colorAnsi) : " ";
+	return paintAgentBreatheDot(colorAnsi);
 }
 
 function themeStatusDot(theme: Theme, colorKey: "success" | "error" | "dim" | "muted"): string {
@@ -618,7 +629,10 @@ function themeStatusDot(theme: Theme, colorKey: "success" | "error" | "dim" | "m
 
 function agentBreatheGlyphRaw(): string {
 	// Always exactly one display cell — matches ordinary tool dots, keeps titles aligned.
-	return AGENT_BREATHE_GLYPHS[_globalBlinkPhaseIndex % AGENT_BREATHE_LEN];
+	// Clock-driven so a repaint from any path lands on the same step.
+	const frames = AGENT_BREATHE_LEN;
+	const index = Math.floor(Date.now() / BREATHE_INTERVAL_MS) % frames;
+	return AGENT_BREATHE_GLYPHS[(index + frames) % frames];
 }
 
 function paintAgentBreatheDot(colorAnsi: string = TOOL_STATUS_SUCCESS): string {
@@ -639,8 +653,8 @@ function agentBreatheDot(theme: Theme): string {
 function groupStatusLight(status: ToolStatus, options?: { agentBreathe?: boolean }): string {
 	const color = status === "success" ? TOOL_STATUS_SUCCESS : status === "error" ? TOOL_STATUS_ERROR : TOOL_STATUS_PENDING;
 	if (status === "pending") {
-		// Agent work keeps its size-breathe light; everything else spins. Spinner frames
-		// are wall-clock based, so staying in sync with the global timer is automatic.
+		// Agent work always breathes; everyone else follows the configured pending light.
+		// (Breathe and spinner are both clock-driven, so header and rows agree.)
 		if (options?.agentBreathe) return paintAgentBreatheDot(TOOL_STATUS_SUCCESS);
 		return paintPendingLight(TOOL_STATUS_SUCCESS);
 	}
@@ -3119,9 +3133,9 @@ function shimmerRunning(): boolean {
 }
 
 function getBlinkIntervalMs(): number {
-	// Pending tools animate a wall-clock spinner, so their repaint beat is the spinner
-	// cadence; the ● breathe / blink phase still advances on its own 500ms gate.
-	return _blinkContexts.size > 0 ? SPINNER_INTERVAL_MS : BLINK_INTERVAL_MS;
+	// Only the braille spinner needs sub-blink frames; the breathe cycle steps on its own
+	// 500ms beat and the shimmer's live-frame loop drives its own cadence.
+	return _blinkContexts.size > 0 && pendingIndicatorMode() === "spinner" ? SPINNER_INTERVAL_MS : BLINK_INTERVAL_MS;
 }
 
 /**
@@ -3268,20 +3282,17 @@ function blinkDot(ctx: any, theme: Theme): string {
 	}
 	setupBlinkTimer(ctx);
 	const key = getBlinkKey(ctx);
-	// A spinner has no off phase, so every pending row shows one; the blinking ● only
-	// exists while this row is one of the actively tracked lights.
-	if (pendingIndicatorIsSpinner()) {
-		if (ctx?.state?._agentBreathe === true) return agentBreatheDot(theme);
-		return theme.fg("success", spinnerFrameGlyph());
-	}
-	if (key?._blinkActive !== true) return " ";
-	// Agent-family tools breathe through sizes; ordinary tools still on/off ●.
+	const mode = pendingIndicatorMode();
+	// Only the classic dot has an off phase, and only while this row is tracked.
+	if (mode === "dot" && key?._blinkActive !== true) return " ";
+	// Agent-family tools breathe through sizes; ordinary tools use the configured light.
 	if (ctx?.state?._agentBreathe === true) {
 		return agentBreatheDot(theme);
 	}
-	// Claude Code: solid filled circle that either shows or fully disappears —
-	// never a hollow outlined ○ in the off phase.
-	return _globalBlinkPhase ? themeStatusDot(theme, "success") : " ";
+	if (mode === "spinner") return theme.fg("success", spinnerFrameGlyph());
+	if (mode === "dot") return blinkPhaseOn() ? themeStatusDot(theme, "success") : " ";
+	const glyph = agentBreatheGlyphRaw();
+	return glyph === " " ? " " : theme.fg("success", glyph);
 }
 
 // ---------------------------------------------------------------------------
@@ -6579,7 +6590,7 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify([
 			`Tool style: ${toolBackgroundMode}`,
 			`Tool grouping: ${toolGroupingEnabled() ? "on" : "off"}`,
-			`Activity labels: ${activityGroupsEnabled() ? "on" : "off"} · param ${toolActivityParamEnabled() ? "on" : "off"} · shimmer ${activityShimmerEnabled() ? "on" : "off"} · pending ${pendingIndicatorIsSpinner() ? "spinner" : "dot"}`,
+			`Activity labels: ${activityGroupsEnabled() ? "on" : "off"} · param ${toolActivityParamEnabled() ? "on" : "off"} · shimmer ${activityShimmerEnabled() ? "on" : "off"} · pending ${pendingIndicatorMode()}`,
 			`Thinking: ${getThinkingMode()}`,
 			`Extra detail: ${extraToolOutputExpanded ? "on" : "off"} (${rawKeyHint("ctrl+shift+o", "toggle")})`,
 			branchLine,
@@ -6601,7 +6612,7 @@ export default function (pi: ExtensionAPI) {
 							m === "group" ? "Toggle grouped adjacent/concurrent tool rows"
 							: m === "activity" ? "Toggle the activity label on tool calls"
 							: m === "shimmer" ? "Toggle the highlight sweep on running group labels"
-							: m === "pending" ? "Pending light: braille spinner (default) or blinking dot"
+							: m === "pending" ? "Pending light: circle-breathe (default), braille spinner, or blinking dot"
 							: m === "thinking" ? "Thinking display: live (default) or full"
 							: m === "detail" ? "Toggle Ctrl+Shift+O extra-detail mode"
 							: m === "branch" ? "├ └ │ gray (0-255), theme, fixed, or reset"
@@ -6620,7 +6631,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (first === "pending") {
 				const second = parts[1] ?? "";
-				return ["spinner", "dot", "status"]
+				return ["breathe", "spinner", "dot", "status"]
 					.filter((m) => m.startsWith(second))
 					.map((m) => ({ value: `pending ${m}`, label: m, description: `${m} pending light` }));
 			}
@@ -6713,20 +6724,22 @@ export default function (pi: ExtensionAPI) {
 			if (sub === "pending") {
 				const arg = parts[1] ?? "status";
 				if (arg === "status") {
-					if (ctx.hasUI) ctx.ui.notify(`Pending light: ${pendingIndicatorIsSpinner() ? "spinner" : "dot"}`, "info");
+					if (ctx.hasUI) ctx.ui.notify(`Pending light: ${pendingIndicatorMode()}`, "info");
 					return;
 				}
-				if (arg !== "spinner" && arg !== "dot") {
-					if (ctx.hasUI) ctx.ui.notify(`Usage: /cc-tools pending spinner|dot|status`, "error");
+				if (arg !== "breathe" && arg !== "spinner" && arg !== "dot") {
+					if (ctx.hasUI) ctx.ui.notify(`Usage: /cc-tools pending breathe|spinner|dot|status`, "error");
 					return;
 				}
-				writeSettingsKey("pendingIndicator", arg === "dot" ? "dot" : undefined);
+				writeSettingsKey("pendingIndicator", arg === "breathe" ? undefined : arg);
 				if (ctx.hasUI) refreshAllToolBranchVisuals(ctx);
 				if (ctx.hasUI) {
 					ctx.ui.notify(
 						arg === "dot"
 							? "Pending light: dot — the classic blinking ●"
-							: `Pending light: spinner — ${SPINNER_FRAMES.join("")}`,
+							: arg === "spinner"
+								? `Pending light: spinner — ${SPINNER_FRAMES.join("")}`
+								: "Pending light: breathe — ● • · · • ",
 						"info",
 					);
 				}
@@ -6807,7 +6820,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (!(TOOL_MODES as readonly string[]).includes(sub)) {
-				if (ctx.hasUI) ctx.ui.notify(`Unknown option "${sub}". Try /cc-tools status, /cc-tools thinking live, /cc-tools group toggle, /cc-tools activity toggle, /cc-tools shimmer toggle, or /cc-tools pending dot.`, "error");
+				if (ctx.hasUI) ctx.ui.notify(`Unknown option "${sub}". Try /cc-tools status, /cc-tools thinking live, /cc-tools group toggle, /cc-tools activity toggle, /cc-tools shimmer toggle, or /cc-tools pending spinner.`, "error");
 				return;
 			}
 			toolBackgroundOverride = sub as typeof toolBackgroundMode;
