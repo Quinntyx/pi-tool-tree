@@ -220,25 +220,37 @@ assert.ok(listOutput.includes("first item"));
 }
 
 // The transcript arms its own repaint while a group runs: grouped rows bypass the
-// native tool renderer that would otherwise arm the ● blink / shimmer tick. Without
-// this the label rendered once and froze. Callbacks are never fired here.
+// native tool renderer that would otherwise arm the ● blink / shimmer tick. The frame
+// must also *request* a render — pi's component invalidate only clears caches, so a
+// loop that just invalidates paints nothing (the bug that made the shimmer invisible).
 {
-	// Let any live tick armed by an earlier block drain, so the count below is ours.
 	await new Promise((resolve) => setTimeout(resolve, 150));
 	const realSetTimeout = globalThis.setTimeout;
+	const frames: Array<() => void> = [];
 	const delays: Array<number | undefined> = [];
-	(globalThis as any).setTimeout = ((_fn: any, ms?: number) => {
+	(globalThis as any).setTimeout = ((fn: any, ms?: number) => {
 		delays.push(ms);
+		if (typeof fn === "function") frames.push(fn);
 		return { unref() {}, ref() {}, hasRef: () => false } as any;
 	});
 	try {
+		const renders = { count: 0 };
 		const cadenceParent = new Container();
-		const tool = new ToolExecutionComponent("code_execution", "cadence", { code: "print(1)", activity: "implementing" }, {}, definition as any, ui as any, process.cwd());
+		const tool = new ToolExecutionComponent(
+			"code_execution", "cadence", { code: "print(1)", activity: "implementing" }, {}, definition as any,
+			{ requestRender: () => { renders.count++; } } as any, process.cwd(),
+		);
 		tool.markExecutionStarted();
 		tool.updateResult({ content: [{ type: "text", text: "ok" }], isError: false } as any, true);
 		cadenceParent.addChild(tool);
 		cadenceParent.render(100);
 		assert.ok(delays.includes(80), `a running group must arm the ~80ms repaint: ${JSON.stringify(delays)}`);
+		const armed = frames.slice();
+		assert.ok(armed.length > 0, "a frame callback must be armed");
+		// Ignore the requests that setup made (markExecutionStarted requests one itself).
+		renders.count = 0;
+		for (const frame of armed) frame();
+		assert.ok(renders.count > 0, "each frame must request a repaint, not just clear caches");
 	} finally {
 		(globalThis as any).setTimeout = realSetTimeout;
 	}

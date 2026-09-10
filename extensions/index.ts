@@ -1127,7 +1127,24 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 		// The transcript owns this row's light and label, so it also owns the repaint:
 		// ~80ms while the sweep runs, 500ms for a bare live duration. Settled groups
 		// stop asking, which ends the timer chain.
-		if (!complete) requestLiveGroupFrame(() => safeInvalidate(parent), shimmering);
+		if (!complete) {
+			const running: any[] = [];
+			for (let i = 0; i < tools.length; i++) {
+				if (statuses[i] === "pending") running.push(tools[i].tool);
+			}
+			requestLiveGroupFrame(() => {
+				safeInvalidate(parent);
+				for (const tool of running) {
+					safeInvalidate(tool);
+					// pi's component `invalidate()` only clears caches — the repaint has to be
+					// requested. That is what the render context does, and why the ● blink wakes
+					// the TUI. Without it this loop painted nothing at all.
+					const ui = (tool as any)?.ui;
+					if (typeof ui?.requestRender === "function") ui.requestRender();
+					else (tool as any)?.getRenderContext?.()?.invalidate?.();
+				}
+			}, shimmering);
+		}
 		const labelAnsi = label ? (shimmering ? shimmerTextAnsi(label) : label) : "";
 		// Secondary text: `N calls · 5s` uses the same theme-derived gray as the
 		// `Thought for Xs` rows (branch chrome + OUTLINE_CHROME_BRIGHTEN) instead of the

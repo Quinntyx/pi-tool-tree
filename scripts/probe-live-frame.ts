@@ -20,19 +20,25 @@ process.env.HOME = realHome;
 for (const handler of handlers.get("agent_start") ?? []) { try { await handler({}, { hasUI: false }); } catch { /* noop */ } }
 
 const delays: Array<number | undefined> = [];
+const frames: Array<() => void> = [];
 const realSetTimeout = globalThis.setTimeout;
 (globalThis as any).setTimeout = (fn: any, ms?: number, ...rest: any[]) => {
 	delays.push(ms);
+	if (typeof fn === "function") frames.push(fn);
 	return { unref() {}, ref() {}, hasRef: () => false } as any;
 };
 
-const ui = { requestRender() {} };
+let repaints = 0;
+const ui = { requestRender() { repaints++; } };
 function render(component: ToolExecutionComponent, label: string) {
 	delays.length = 0;
+	frames.length = 0;
 	const root = new Container();
 	root.addChild(component);
 	root.render(100);
-	console.log(`${label}: scheduled timeouts [${delays.join(", ")}]`);
+	repaints = 0;
+	for (const frame of frames.splice(0)) frame();
+	console.log(`${label}: timeouts [${delays.join(", ")}] · repaint requests ${repaints}`);
 }
 
 // (a) plain pending tool: no partial result, no live preview
