@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { AssistantMessageComponent, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
+import { AssistantMessageComponent, ToolExecutionComponent, UserMessageComponent } from "@earendil-works/pi-coding-agent";
 import { Container, Text, visibleWidth } from "@earendil-works/pi-tui";
 import { initTheme, theme } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 import extension from "../extensions/index.ts";
@@ -154,6 +154,28 @@ listParent.addChild(listMessage);
 const listOutput = plain(listParent.render(100));
 assert.ok(!listOutput.includes("◉"), "stock list bullets must not be replaced");
 assert.ok(listOutput.includes("first item"));
+
+// User messages keep their own bubble: pi pads them with background-filled rows
+// inside a Box, and the transcript must not trim those away (it only trims the
+// Spacer padding that pi puts around assistant messages).
+{
+	const chat = new Container();
+	const anchorTool = new ToolExecutionComponent("code_execution", "bubble-anchor", { code: "print(1)", activity: "testing" }, {}, definition as any, ui as any, process.cwd());
+	anchorTool.markExecutionStarted();
+	anchorTool.updateResult({ content: [{ type: "text", text: "ok" }], isError: false } as any, false);
+	chat.addChild(anchorTool);
+	const userMessage: any = new UserMessageComponent("hello bubble");
+	chat.addChild(userMessage);
+	const lines = chat.render(100);
+	const textIndex = lines.findIndex((line) => line.replace(/\x1b\[[0-9;]*m/g, "").includes("hello bubble"));
+	assert.ok(textIndex > 0, "the user message must render inside the transcript");
+	// A padding row is visually empty but background-filled; trimming it collapses the bubble.
+	const isPaddingRow = (line: string | undefined) => Boolean(line)
+		&& /\x1b\[48;2;\d+;\d+;\d+m/.test(line as string)
+		&& (line as string).replace(/\x1b\][^\x07]*\x07/g, "").replace(/\x1b\[[0-9;]*m/g, "").trim() === "";
+	assert.ok(isPaddingRow(lines[textIndex - 1]), `user bubble keeps its top padding row: ${JSON.stringify(lines[textIndex - 1])}`);
+	assert.ok(isPaddingRow(lines[textIndex + 1]), `user bubble keeps its bottom padding row: ${JSON.stringify(lines[textIndex + 1])}`);
+}
 
 // Pending lights are a braille spinner by default, indexed off the wall clock, and
 // `/cc-tools pending dot` still offers the classic blinking ●.

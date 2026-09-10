@@ -1020,7 +1020,7 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 
 	type ToolEntry = { kind: "tool"; tool: any; label: string };
 	type ThinkingEntry = { kind: "thinking"; lines: string[]; label: string; durationMs?: number };
-	type ContentEntry = { kind: "content"; lines: string[] };
+	type ContentEntry = { kind: "content"; lines: string[]; trimEdges?: boolean };
 	type Entry = ToolEntry | ThinkingEntry | ContentEntry;
 
 	// Pass 1: classify children (content renders once, here).
@@ -1039,7 +1039,10 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 			else {
 				// Empty assistant shells don't split a thinking/tool sequence.
 				if (child instanceof AssistantMessageComponent && row.lines.every((line: string) => isBlankLine(line))) continue;
-				entries.push({ kind: "content", lines: row.lines });
+				// Only assistant rows get their edge padding trimmed — pi wraps every message in a
+				// Spacer, but a user message pads itself with background-filled rows inside its Box,
+				// and dropping those collapses the bubble to a single line.
+				entries.push({ kind: "content", lines: row.lines, trimEdges: child instanceof AssistantMessageComponent });
 			}
 		}
 	}
@@ -1170,10 +1173,10 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 	for (const entry of entries) {
 		if (entry.kind === "content") {
 			flush();
-			// Drop Pi's own edge padding so block spacing stays uniform; Pi's
-			// Markdown child can also overshoot at very small widths, so clamp every
-			// prose/native line the same way grouped rows are clamped.
-			const contentLines = trimBlankEdges(entry.lines);
+			// Assistant rows drop pi's own edge padding so block spacing stays uniform. Pi's
+			// Markdown child can also overshoot at very small widths, so clamp every prose/native
+			// line the same way grouped rows are clamped.
+			const contentLines = entry.trimEdges ? trimBlankEdges(entry.lines) : entry.lines;
 			if (contentLines.length === 0) continue;
 			separate();
 			output.push(...contentLines.map((line) => (isTerminalImageLine(line) ? line : clampLineWidth(line, width))));
