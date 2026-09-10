@@ -94,6 +94,8 @@ interface SettingsFile {
 	groupToolCalls?: boolean;
 	/** Group neighboring tool calls by the model's per-call `activity` label. Default true. */
 	activityGroups?: boolean;
+	/** Sweep a highlight across the activity label while its group is running. Default true. */
+	activityShimmer?: boolean;
 	/** Inject the required `activity` param into every tool schema. Default true. */
 	toolActivityParam?: boolean;
 	bashOutputMode?: "opencode" | "summary" | "preview";
@@ -721,6 +723,8 @@ function getCompactToolLine(tool: any, width: number, groupedLabel?: string, sho
 interface ActivityTreeRow {
 	kind: "activity" | "content";
 	lines: string[];
+	/** Thinking wall-clock for this run, so group headers can include it. */
+	durationMs?: number;
 }
 
 const thinkingBodyCache = new WeakMap<object, { text: string; body: ThinkingParagraph }>();
@@ -771,8 +775,7 @@ function assistantActivityRows(component: any, width: number): ActivityTreeRow[]
 		const duration = live && thinkingBlockStartMs > 0
 			? Math.max(0, Date.now() - thinkingBlockStartMs)
 			: getMessageThinkingDurationMs(message);
-		const label = live ? `Thinking… ${formatThoughtDuration(duration)}` : `Thought for ${formatThoughtDuration(duration)}`;
-		const lines = [`${WORKED_LINE_FG}${label}${TRANSPARENT_RESET}`];
+		const label = live ? `Thinking… ${formatThoughtDuration(duration)}` : `Thought for ${formatThoughtDuration(duration)}`;		const lines = [`${WORKED_LINE_FG}${label}${TRANSPARENT_RESET}`];
 		const visibilityOverride = component.thinkingVisibilityOverrides?.get(index);
 		// Pi's `hideThinkingBlock` is the user's "thinking is hidden" setting (Ctrl+T
 		// / settings.json). When it is on, nothing streams either: every run renders
@@ -793,7 +796,7 @@ function assistantActivityRows(component: any, width: number): ActivityTreeRow[]
 			const bodyWidth = Math.max(1, width - 5);
 			lines.push(...cached.body.render(bodyWidth, { noGutter: true }));
 		}
-		rows.push({ kind: "activity", lines });
+		rows.push({ kind: "activity", lines, durationMs: duration });
 	}
 	return rows;
 }
@@ -817,8 +820,27 @@ const ACTIVITY_WRAPPED = Symbol.for("pi-tool-tree:activity-wrapped");
 const ACTIVITY_API_KEY = Symbol.for("pi-tool-tree:activity-api");
 const DEFAULT_ACTIVITY_LABEL = "working";
 
+/**
+ * Running group labels sweep a highlight band across the text (the Claude Code /
+ * ChatGPT "working" shimmer). Time-based rather than frame-based so the motion is
+ * uniform no matter how often the TUI re-renders.
+ */
+const SHIMMER_PERIOD_MS = 1500;
+/** Re-render cadence while a shimmering group is on screen (the ● blink stays 500ms). */
+const SHIMMER_INTERVAL_MS = 80;
+/** Highlight band half-width, as a fraction of the label length. */
+const SHIMMER_BAND_RATIO = 0.45;
+/** Peak lift toward the highlight color at the band's center. */
+const SHIMMER_PEAK_MIX = 0.9;
+/** Label base color when the active theme exposes no `text`/`muted` key. */
+const DEFAULT_LABEL_FG = "\x1b[38;2;212;212;212m";
+
 function activityGroupsEnabled(): boolean {
 	return readSettings().activityGroups !== false;
+}
+
+function activityShimmerEnabled(): boolean {
+	return readSettings().activityShimmer !== false;
 }
 
 function toolActivityParamEnabled(): boolean {
@@ -969,7 +991,7 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 	if (width <= 0) return [];
 
 	type ToolEntry = { kind: "tool"; tool: any; label: string };
-	type ThinkingEntry = { kind: "thinking"; lines: string[]; label: string };
+	type ThinkingEntry = { kind: "thinking"; lines: string[]; label: string; durationMs?: number };
 	type ContentEntry = { kind: "content"; lines: string[] };
 	type Entry = ToolEntry | ThinkingEntry | ContentEntry;
 
@@ -985,7 +1007,7 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 			? assistantActivityRows(child, width)
 			: [{ kind: "content" as const, lines: applyTerminalCopyZones(child.render(width)) }];
 		for (const row of rows) {
-			if (row.kind === "activity") entries.push({ kind: "thinking", lines: row.lines, label: "" });
+			if (row.kind === "activity") entries.push({ kind: "thinking", lines: row.lines, label: "", durationMs: row.durationMs });
 			else {
 				// Empty assistant shells don't split a thinking/tool sequence.
 				if (child instanceof AssistantMessageComponent && row.lines.every((line: string) => isBlankLine(line))) continue;
@@ -1024,7 +1046,7 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 	const output: string[] = [];
 	const margin = " ";
 	const connector = activityTreeBranchAnsi();
-	let pending: { label: string; lines: string[]; tool?: any }[] = [];
+	let pending: { label: string; lines: string[]; tool?: any; durationMs?: number }[] = [];
 
 	const emitGroup = (items: typeof pending): void => {
 		const tools = items.filter((item) => item.tool);
@@ -1046,20 +1068,30 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 		if (label) parts.push(label);
 		if (count > 0) parts.push(`${count} ${count === 1 ? "call" : "calls"}`);
 		let totalMs = 0;
-		let timed = 0;
 		for (const item of tools) {
 			const timing = TOOL_TIMINGS.get(item.tool.toolCallId);
 			if (timing?.end) {
 				totalMs += Math.max(0, timing.end - timing.start);
-				timed++;
 			}
 		}
+		// Thinking inside the group is time spent on that group, so it counts toward the
+		// duration even though it is not a call. Without this a group whose tools are fast
+		// advertises `<1s` after half a minute of reasoning.
+		let thinkingMs = 0;
+		for (const item of items) {
+			if (!item.tool && typeof item.durationMs === "number") thinkingMs += Math.max(0, item.durationMs);
+		}
 		const complete = pendingCount === 0;
-		if (complete && timed > 0 && totalMs > 0) parts.push(formatBashDuration(totalMs));
+		const workMs = totalMs + thinkingMs;
+		if (complete && workMs > 0) parts.push(formatBashDuration(workMs));
+		// While the group is running its label shimmers; once every call settles the label
+		// returns to the ambient color. Counts stay static metadata.
+		const shimmering = !complete && !!label && activityShimmerEnabled();
+		const labelAnsi = label ? (shimmering ? shimmerTextAnsi(label) : label) : "";
 		// Secondary text: `N calls · 5s` uses the same theme-derived gray as the
 		// `Thought for Xs` rows (branch chrome + OUTLINE_CHROME_BRIGHTEN) instead of the
 		// dimmer body-gray, so it reads as metadata next to the label rather than vanishing.
-		const labelAndCounts = `${label ? `${label} ` : ""}${WORKED_LINE_FG}${parts.slice(label ? 1 : 0).join(" · ")}${TRANSPARENT_RESET}`;
+		const labelAndCounts = `${labelAnsi}${labelAnsi ? " " : ""}${WORKED_LINE_FG}${parts.slice(label ? 1 : 0).join(" · ")}${TRANSPARENT_RESET}`;
 		const header = `${margin}${dot}${TRANSPARENT_RESET} ${labelAndCounts}${
 			failedCount > 0 ? ` ${TOOL_STATUS_ERROR}· ${failedCount} failed${TRANSPARENT_RESET}` : ""
 		}`;
@@ -1113,6 +1145,7 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 			label: entry.label,
 			lines: entry.kind === "tool" ? toolActivityLines(entry.tool, width) : entry.lines,
 			tool: entry.kind === "tool" ? entry.tool : undefined,
+			durationMs: entry.kind === "thinking" ? entry.durationMs : undefined,
 		});
 	}
 	flush();
@@ -3011,9 +3044,21 @@ let _blinkOrder = 0;
 // Agent-family tools map the index onto a 6-step size breath cycle.
 let _globalBlinkPhaseIndex = 0;
 let _globalBlinkPhase = true;
+// Wall-clock of the last blink/breathe advance: the timer can tick faster than the
+// dot cycle while a label shimmer is running.
+let _lastBlinkPhaseAt = 0;
+
+/** True while a tracked tool is still running — the shimmer's reason to re-render fast. */
+function shimmerRunning(): boolean {
+	if (!activityShimmerEnabled()) return false;
+	for (const entry of _blinkContexts.values()) {
+		if (entry.key?._toolStatus === "pending") return true;
+	}
+	return false;
+}
 
 function getBlinkIntervalMs(): number {
-	return BLINK_INTERVAL_MS;
+	return shimmerRunning() ? SHIMMER_INTERVAL_MS : BLINK_INTERVAL_MS;
 }
 
 function getBlinkKey(ctx: any): any {
@@ -3068,8 +3113,14 @@ function _scheduleGlobalBlinkTimer(): void {
 			_clearAllBlinkContexts();
 			return;
 		}
-		_globalBlinkPhaseIndex = (_globalBlinkPhaseIndex + 1) % AGENT_BREATHE_LEN;
-		_globalBlinkPhase = _globalBlinkPhaseIndex % 2 === 0;
+		// The ● blink / Agent breathe cycle stays on its 500ms beat even when the
+		// shimmer asks for a faster tick, so the dot never strobes.
+		const now = Date.now();
+		if (now - _lastBlinkPhaseAt >= BLINK_INTERVAL_MS) {
+			_lastBlinkPhaseAt = now;
+			_globalBlinkPhaseIndex = (_globalBlinkPhaseIndex + 1) % AGENT_BREATHE_LEN;
+			_globalBlinkPhase = _globalBlinkPhaseIndex % 2 === 0;
+		}
 		for (const entry of getBlinkingEntries()) {
 			try { entry.invalidate(); } catch { /* noop */ }
 		}
@@ -3964,6 +4015,54 @@ function mixRgb(
 
 function rgbToBgAnsi(c: { r: number; g: number; b: number }): string {
 	return `\x1b[48;2;${Math.round(c.r)};${Math.round(c.g)};${Math.round(c.b)}m`;
+}
+
+/**
+ * Base color for a shimmering activity label: the theme's primary text color, so the
+ * sweep reads as a brightness gradient of the same text rather than a foreign tint.
+ */
+function shimmerBaseRgb(): Rgb {
+	if (themeAdaptiveEnabled()) {
+		const ansi = safeFgAnsi(_toolBranchThemeHint, "text") ?? safeFgAnsi(_toolBranchThemeHint, "muted");
+		const rgb = ansi ? parseAnsiRgb(ansi) : null;
+		if (rgb) return rgb;
+	}
+	return parseAnsiRgb(DEFAULT_LABEL_FG) ?? { r: 212, g: 212, b: 212 };
+}
+
+/** Emphasis direction depends on the panel: brighten on dark, deepen on light. */
+function shimmerHighlightRgb(base: Rgb): Rgb {
+	if (isLightThemeBackground(_toolBranchThemeHint)) return mixRgb(base, { r: 12, g: 16, b: 18 }, 0.75);
+	return mixRgb(base, { r: 255, g: 255, b: 255 }, 0.92);
+}
+
+/**
+ * Paint `text` with a highlight band part-way across it. The band travels left to
+ * right and wraps, so every re-render of a running group advances the wave.
+ */
+function shimmerTextAnsi(text: string): string {
+	const length = text.length;
+	if (length === 0) return "";
+	const base = shimmerBaseRgb();
+	const highlight = shimmerHighlightRgb(base);
+	const band = Math.max(2, length * SHIMMER_BAND_RATIO);
+	const phase = (Date.now() % SHIMMER_PERIOD_MS) / SHIMMER_PERIOD_MS;
+	const center = -band + phase * (length + band * 2);
+	let out = "";
+	let lastAnsi = "";
+	for (let i = 0; i < length; i++) {
+		const distance = Math.abs(i + 0.5 - center) / band;
+		// Cosine falloff: 1 at the band center, 0 once past the band edge.
+		const intensity = distance >= 1 ? 0 : 0.5 * (1 + Math.cos(Math.PI * distance)) * SHIMMER_PEAK_MIX;
+		const rgb = mixRgb(base, highlight, intensity);
+		const ansi = `\x1b[38;2;${Math.round(rgb.r)};${Math.round(rgb.g)};${Math.round(rgb.b)}m`;
+		if (ansi !== lastAnsi) {
+			out += ansi;
+			lastAnsi = ansi;
+		}
+		out += text[i];
+	}
+	return `${out}${TRANSPARENT_RESET}`;
 }
 
 function autoDeriveBgFromTheme(theme: any): void {
@@ -6365,7 +6464,7 @@ export default function (pi: ExtensionAPI) {
 	// /cc-tools command — control tool chrome, grouping, and detail level.
 	const TOOL_MODES = ["outlines", "transparent", "default"] as const;
 	const TOOL_BOOL_MODES = ["on", "off", "toggle", "status"] as const;
-	const TOOL_SUBCOMMANDS = [...TOOL_MODES, "group", "detail", "activity", "thinking", "branch", "status"] as const;
+	const TOOL_SUBCOMMANDS = [...TOOL_MODES, "group", "detail", "activity", "shimmer", "thinking", "branch", "status"] as const;
 	const booleanMode = (raw: string | undefined, current: boolean): boolean | "status" | undefined => {
 		const mode = raw || "toggle";
 		if (mode === "on") return true;
@@ -6388,7 +6487,7 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify([
 			`Tool style: ${toolBackgroundMode}`,
 			`Tool grouping: ${toolGroupingEnabled() ? "on" : "off"}`,
-			`Activity labels: ${activityGroupsEnabled() ? "on" : "off"} · param ${toolActivityParamEnabled() ? "on" : "off"}`,
+			`Activity labels: ${activityGroupsEnabled() ? "on" : "off"} · param ${toolActivityParamEnabled() ? "on" : "off"} · shimmer ${activityShimmerEnabled() ? "on" : "off"}`,
 			`Thinking: ${getThinkingMode()}`,
 			`Extra detail: ${extraToolOutputExpanded ? "on" : "off"} (${rawKeyHint("ctrl+shift+o", "toggle")})`,
 			branchLine,
@@ -6408,7 +6507,8 @@ export default function (pi: ExtensionAPI) {
 						label: m,
 						description:
 							m === "group" ? "Toggle grouped adjacent/concurrent tool rows"
-							: m === "activity" ? "Toggle the required activity label on tool calls"
+							: m === "activity" ? "Toggle the activity label on tool calls"
+							: m === "shimmer" ? "Toggle the highlight sweep on running group labels"
 							: m === "thinking" ? "Thinking display: live (default) or full"
 							: m === "detail" ? "Toggle Ctrl+Shift+O extra-detail mode"
 							: m === "branch" ? "├ └ │ gray (0-255), theme, fixed, or reset"
@@ -6431,7 +6531,7 @@ export default function (pi: ExtensionAPI) {
 					.filter((m) => m.startsWith(second))
 					.map((m) => ({ value: `thinking ${m}`, label: m, description: `${m} thinking display` }));
 			}
-			if (first === "group" || first === "detail" || first === "extra" || first === "activity") {
+			if (first === "group" || first === "detail" || first === "extra" || first === "activity" || first === "shimmer") {
 				const second = parts[1] ?? "";
 				return TOOL_BOOL_MODES
 					.filter((m) => m.startsWith(second))
@@ -6482,6 +6582,29 @@ export default function (pi: ExtensionAPI) {
 						next
 							? "Activity param: on — the model labels every core tool call"
 							: "Activity param: off — labels fall back to the previous group",
+						"info",
+					);
+				}
+				return;
+			}
+
+			if (sub === "shimmer") {
+				const next = booleanMode(parts[1], activityShimmerEnabled());
+				if (next === undefined) {
+					if (ctx.hasUI) ctx.ui.notify(`Usage: /cc-tools shimmer ${TOOL_BOOL_MODES.join("|")}`, "error");
+					return;
+				}
+				if (next === "status") {
+					if (ctx.hasUI) ctx.ui.notify(`Label shimmer: ${activityShimmerEnabled() ? "on" : "off"}`, "info");
+					return;
+				}
+				writeSettingsKey("activityShimmer", next);
+				if (ctx.hasUI) refreshAllToolBranchVisuals(ctx);
+				if (ctx.hasUI) {
+					ctx.ui.notify(
+						next
+							? "Label shimmer: on — running groups sweep a highlight across the activity label"
+							: "Label shimmer: off — activity labels keep a constant color",
 						"info",
 					);
 				}
@@ -6562,7 +6685,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (!(TOOL_MODES as readonly string[]).includes(sub)) {
-				if (ctx.hasUI) ctx.ui.notify(`Unknown option "${sub}". Try /cc-tools status, /cc-tools thinking live, /cc-tools group toggle, or /cc-tools activity toggle.`, "error");
+				if (ctx.hasUI) ctx.ui.notify(`Unknown option "${sub}". Try /cc-tools status, /cc-tools thinking live, /cc-tools group toggle, /cc-tools activity toggle, or /cc-tools shimmer toggle.`, "error");
 				return;
 			}
 			toolBackgroundOverride = sub as typeof toolBackgroundMode;

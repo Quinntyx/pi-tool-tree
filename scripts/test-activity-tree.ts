@@ -154,6 +154,70 @@ listParent.addChild(listMessage);
 const listOutput = plain(listParent.render(100));
 assert.ok(!listOutput.includes("◉"), "stock list bullets must not be replaced");
 assert.ok(listOutput.includes("first item"));
+
+// A group that reasoned for 19s and then ran a fast tool must not advertise `<1s`:
+// thinking is time spent on the group even though it is not a call.
+{
+	const reasoned = new Container();
+	const thinkingMessage = {
+		role: "assistant", stopReason: "toolUse", _piClaudeStyleThinkingActive: false, _piClaudeStyleThinkingDurationMs: 19000,
+		content: [{ type: "thinking", thinking: "long private reasoning" }],
+	} as any;
+	const asm = new AssistantMessageComponent(thinkingMessage, false);
+	asm.updateContent(thinkingMessage, false);
+	reasoned.addChild(asm);
+	const fast = new ToolExecutionComponent("code_execution", "duration-case", { code: "print(1)", activity: "exploring" }, {}, definition as any, ui as any, process.cwd());
+	fast.markExecutionStarted();
+	fast.updateResult({ content: [{ type: "text", text: "ok" }], isError: false } as any, false);
+	reasoned.addChild(fast);
+	const reasonedOutput = plain(reasoned.render(100));
+	assert.ok(reasonedOutput.includes("├ Thought for 19s"), `thought row keeps its own duration: ${JSON.stringify(reasonedOutput)}`);
+	assert.ok(/exploring 1 call · 19s/.test(reasonedOutput), `group duration must include thinking time: ${JSON.stringify(reasonedOutput.split("\n")[0])}`);
+	assert.ok(!/exploring 1 call · <1s/.test(reasonedOutput), "group duration must not ignore thinking");
+}
+
+// Running groups shimmer: the label carries a moving multi-color gradient that stops
+// once every call settles (and the label text itself never changes).
+{
+	const realNow = Date.now;
+	let fakeNow = 1_700_000_000_000;
+	Date.now = () => fakeNow;
+	try {
+		const shimmerParent = new Container();
+		const pendingTool = new ToolExecutionComponent("code_execution", "shimmer-pending", { code: "print(1)", activity: "implementing" }, {}, definition as any, ui as any, process.cwd());
+		pendingTool.markExecutionStarted();
+		pendingTool.updateResult({ content: [{ type: "text", text: "ok" }], isError: false } as any, true);
+		shimmerParent.addChild(pendingTool);
+		const codeSet = (lines: string[]) => new Set([...lines.join("\n").matchAll(/\x1b\[38;2;(\d+);(\d+);(\d+)m/g)].map((m) => m[0]));
+		// Colors that belong to the label itself: the one opening it plus any interleaved
+		// between its characters (the dot/branch colors before it are not ours).
+		// The gradient interleaves color codes between the label's characters, so the
+		// label is not a contiguous substring of the raw line: strip first, then take
+		// every color between the ● glyph and the counts text.
+		const labelColors = (lines: string[]) => {
+			const line = lines.find((l) => l.replace(/\x1b\[[0-9;]*m/g, "").includes("implementing")) ?? "";
+			const glyphAt = line.indexOf("●");
+			const callAt = line.indexOf("1 call");
+			if (glyphAt < 0 || callAt < 0) return [];
+			const region = line.slice(glyphAt + 1, callAt);
+			return [...region.matchAll(/\x1b\[38;2;\d+;\d+;\d+m/g)].map((m) => m[0]);
+		};
+		const firstFrame = shimmerParent.render(100);
+		assert.ok(/implementing/.test(plain(firstFrame)), "the label text survives the gradient");
+		assert.ok(new Set(labelColors(firstFrame)).size >= 3, `a running label must be a gradient, got ${new Set(labelColors(firstFrame)).size} colors`);
+		fakeNow += 250;
+		const secondFrame = shimmerParent.render(100);
+		assert.notEqual(labelColors(firstFrame).join(), labelColors(secondFrame).join(), "the running label must animate between frames");
+		// Settled groups keep a constant label: no gradient, and no motion over time.
+		pendingTool.updateResult({ content: [{ type: "text", text: "ok" }], isError: false } as any, false);
+		const settled = shimmerParent.render(100);
+		assert.ok(new Set(labelColors(settled)).size <= 1, `a settled label must not keep gradient colors: ${JSON.stringify(labelColors(settled))}`);
+		fakeNow += 250;
+		assert.equal(settled.join("\n"), shimmerParent.render(100).join("\n"), "a settled label must not animate");
+	} finally {
+		Date.now = realNow;
+	}
+}
 // Light-mode tree connectors are quieter without fading the reasoning text.
 initTheme("light", false);
 const ctx = { hasUI: true, ui: { theme, notify() {}, getToolsExpanded: () => false, setToolsExpanded() {} } };

@@ -123,6 +123,7 @@ Use `/cc-tools` to control tool UI at runtime:
                           # (Ctrl+T / `hideThinkingBlock` hides thinking entirely: nothing streams)
 /cc-tools detail toggle   # same mode as Ctrl+Shift+O
 /cc-tools activity toggle # add/remove the model's activity label on tool calls
+/cc-tools shimmer toggle  # sweep a highlight across a running group's label
 ```
 
 ### Activity labels
@@ -144,6 +145,18 @@ other plugins) inherit the previous group's label instead of starting a new grou
 a group with nothing to inherit (the first group of a run, or a tool that never
 declared `activity`) falls back to the default label `working` instead of showing a
 bare `N calls` header.
+
+Only tool calls are counted, so a thinking row never inflates `N calls`. A run
+without any tool call (a trailing thought, for example) prints its rows without a
+header, and blank lines separate groups from the prose between them. The group
+duration sums tool time **plus the thinking time inside the group**, so a phase that
+reasoned 19s before a fast tool reads `· 19s`, not `· <1s`.
+
+While a group is still running, its label shimmers: a highlight band sweeps across
+the word (the Claude Code / ChatGPT "working" effect) as a gradient of the label's
+own theme color, then settles to a constant color once the last call finishes. The
+sweep repaints on its own ~80ms beat; the status dot keeps its 500ms blink. Turn it
+off with `/cc-tools shimmer off` or `"activityShimmer": false`.
 
 Only tool calls are counted, so a thinking row never inflates `N calls`. A run
 without any tool call (a trailing thought, for example) prints its rows without a
@@ -187,6 +200,7 @@ immediately and to plugin tools the next time they register.
 | `extraToolOutputExpanded` | `false` | Start with Ctrl+Shift+O extra-detail mode enabled |
 | `groupToolCalls` | `true` | Group adjacent thinking/tool activity with one child per call |
 | `activityGroups` | `true` | Label each group with the model-supplied `activity` word |
+| `activityShimmer` | `true` | Sweep a highlight across a running group's label; constant color once the group settles |
 | `toolActivityParam` | `true` | Add the `activity` param to the tools this package owns (optional; a missing label defaults to `working`) |
 | `thinkingMode` | `live` | `live` = only streaming thinking expands (finished collapse to `Thought for Xs`); `full` = always expanded. Pi's `hideThinkingBlock` (Ctrl+T) wins over both: hidden thinking never streams a body. |
 | `bashCollapsedLines` | `10` | Lines for collapsed bash output |

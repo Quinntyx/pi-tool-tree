@@ -9,7 +9,7 @@ import { Container, Text } from "@earendil-works/pi-tui";
 import { initTheme, theme } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 import extension from "../extensions/index.ts";
 
-const WIDTH = Number(process.argv[2] ?? 100);
+const WIDTH = Number(process.argv.slice(2).find((a) => /^\d+$/.test(a)) ?? 100);
 // `--plain` drops every activity label, i.e. what you see after `/cc-tools activity off`.
 const PLAIN = process.argv.includes("--plain");
 // `--color` keeps the ANSI SGR colors (default strips them for copy/paste).
@@ -124,4 +124,24 @@ thinking("Done \u2014 summarising the change for the user.", 1200);
 
 // Strip CSI colors and OSC 133 copy-zone markers so the sample reads as plain text.
     const plain = (line: string) => line.replace(/\x1b\[[0-9;]*m/g, "").replace(/\x1b\]133;[ABC](?:\x07|\x1b\\)?/g, "").trimEnd();
+
+    // `--shimmer-strip[=N]` renders one running group at N successive clock values so the
+    // label sweep can be eyeballed (run it with --color in a real terminal).
+    const stripArg = process.argv.find((a) => a.startsWith("--shimmer-strip"));
+    if (stripArg) {
+	const frames = Number(stripArg.split("=")[1] ?? 6) || 6;
+	for (const handler of handlers.get("agent_start") ?? []) await handler({}, ui);
+	const probe = new Container();
+	const running = startTool("read", { path: "src/args.ts" }, "implementing");
+	running.component.updateResult({ content: [{ type: "text", text: "…" }], isError: false } as any, true);
+	probe.addChild(running.component);
+	const paint = COLOR ? (l: string) => l : plain;
+	process.stdout.write(probe.render(WIDTH).map(paint).join("\n") + "\n");
+	for (let i = 1; i < frames; i++) {
+		advance(170);
+		process.stdout.write(probe.render(WIDTH).map(paint).join("\n") + "\n");
+	}
+	process.exit(0);
+    }
+
     process.stdout.write(root.render(WIDTH).map(COLOR ? (l: string) => l : plain).join("\n") + "\n");

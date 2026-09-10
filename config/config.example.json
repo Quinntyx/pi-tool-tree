@@ -9,6 +9,7 @@
   "extraToolOutputExpanded": false,
   "groupToolCalls": true,
   "activityGroups": true,
+  "activityShimmer": true,
   "toolActivityParam": true,
   "thinkingMode": "live",
   "bashOutputMode": "opencode",
