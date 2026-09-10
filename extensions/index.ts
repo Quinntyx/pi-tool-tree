@@ -866,14 +866,30 @@ const DEFAULT_ACTIVITY_LABEL = "working";
  * Running group labels sweep a highlight band across the text (the Claude Code /
  * ChatGPT "working" shimmer). Time-based rather than frame-based so the motion is
  * uniform no matter how often the TUI re-renders.
+ *
+ * The band peaks at the active theme's own accent, pushed past the label in the panel's
+ * emphasis direction, while the resting label fades slightly toward the panel color.
+ * The fade is what makes the sweep visible: a same-lightness hue swap alone reads as
+ * barely anything, and a brightness step of the label alone has no color to travel
+ * through.
  */
-const SHIMMER_PERIOD_MS = 1500;
+const SHIMMER_PERIOD_MS = 1200;
 /** Re-render cadence while a shimmering group is on screen (the ● blink stays 500ms). */
 const SHIMMER_INTERVAL_MS = 80;
 /** Highlight band half-width, as a fraction of the label length. */
-const SHIMMER_BAND_RATIO = 0.45;
-/** Peak lift toward the highlight color at the band's center. */
-const SHIMMER_PEAK_MIX = 0.9;
+const SHIMMER_BAND_RATIO = 0.5;
+/** Mix toward the band color at the band's center: the accent color itself. */
+const SHIMMER_PEAK_MIX = 1;
+/** Exponent on the cosine falloff; >1 keeps the tint in a hot core instead of a wash. */
+const SHIMMER_FALLOFF_POW = 1.5;
+/** How far the resting label fades toward the panel color, buying the band its contrast. */
+const SHIMMER_BASE_DIM = 0.18;
+/** How far the theme accent is pushed past the label (deeper on light panels, brighter on dark). */
+const SHIMMER_ACCENT_PUSH = 0.65;
+/** Theme color keys tried in order for the band: the active palette's own accent. */
+const SHIMMER_ACCENT_KEYS = ["accent", "borderAccent", "mdLink"];
+/** Ignore an accent closer than this to the label; a near-monochrome theme gets the fallback. */
+const SHIMMER_MIN_ACCENT_DELTA = 40;
 /** Label base color when the active theme exposes no `text`/`muted` key. */
 const DEFAULT_LABEL_FG = "\x1b[38;2;212;212;212m";
 
@@ -4189,11 +4205,17 @@ const DELETION_TINT_TARGET = { r: 232, g: 95, b: 122 };
 const FALLBACK_BASE_BG_DARK = { r: 32, g: 35, b: 42 };
 const FALLBACK_BASE_BG_LIGHT = { r: 232, g: 233, b: 236 };
 
-function isLightThemeBackground(theme: any): boolean {
-	const panel =
+/** Panel background tool rows sit on, when the theme exposes one. */
+function themePanelBgRgb(theme: any): Rgb | null {
+	return (
 		themeBgRgb(theme, "toolSuccessBg") ||
 		themeBgRgb(theme, "userMessageBg") ||
-		themeBgRgb(theme, "selectedBg");
+		themeBgRgb(theme, "selectedBg")
+	);
+}
+
+function isLightThemeBackground(theme: any): boolean {
+	const panel = themePanelBgRgb(theme);
 	if (panel) {
 		const lum = 0.2126 * panel.r + 0.7152 * panel.g + 0.0722 * panel.b;
 		return lum > 165;
@@ -4234,21 +4256,57 @@ function rgbToBgAnsi(c: { r: number; g: number; b: number }): string {
 }
 
 /**
- * Base color for a shimmering activity label: the theme's primary text color, so the
- * sweep reads as a brightness gradient of the same text rather than a foreign tint.
+ * Base color for a shimmering activity label: the theme's primary text color, faded
+ * slightly toward the panel so the accent band has room to stand out. The sweep runs
+ * from here to the theme accent, so a live label reads as the theme's own text lit up by
+ * the theme's own highlight color.
  */
 function shimmerBaseRgb(): Rgb {
+	let base: Rgb | null = null;
 	if (themeAdaptiveEnabled()) {
-		const ansi = safeFgAnsi(_toolBranchThemeHint, "text") ?? safeFgAnsi(_toolBranchThemeHint, "muted");
-		const rgb = ansi ? parseAnsiRgb(ansi) : null;
-		if (rgb) return rgb;
+		const ansi =
+			safeFgAnsi(_toolBranchThemeHint, "text") ?? safeFgAnsi(_toolBranchThemeHint, "muted");
+		base = ansi ? parseAnsiRgb(ansi) : null;
 	}
-	return parseAnsiRgb(DEFAULT_LABEL_FG) ?? { r: 212, g: 212, b: 212 };
+	if (!base) base = parseAnsiRgb(DEFAULT_LABEL_FG) ?? { r: 212, g: 212, b: 212 };
+	// Fade toward the panel color rather than toward gray, so the label keeps the panel's
+	// cast and the band keeps a uniform amount of headroom on any theme.
+	const panel = themeAdaptiveEnabled() ? themePanelBgRgb(_toolBranchThemeHint) : null;
+	return panel ? mixRgb(base, panel, SHIMMER_BASE_DIM) : base;
 }
 
-/** Emphasis direction depends on the panel: brighten on dark, deepen on light. */
+function rgbDistance(a: Rgb, b: Rgb): number {
+	return Math.sqrt((a.r - b.r) ** 2 + (a.g - b.g) ** 2 + (a.b - b.b) ** 2);
+}
+
+/**
+ * The active theme's accent: the color the band peaks at. Themes that expose none — and
+ * the classic non-adaptive palette — return null so the sweep can fall back to a
+ * brightness step instead of losing its highlight entirely.
+ */
+function shimmerAccentRgb(): Rgb | null {
+	if (!themeAdaptiveEnabled()) return null;
+	for (const key of SHIMMER_ACCENT_KEYS) {
+		const rgb = themeFgRgb(_toolBranchThemeHint, key);
+		if (rgb) return rgb;
+	}
+	return null;
+}
+
+/**
+ * The band's hot color: the theme accent, pushed past the label in the panel's emphasis
+ * direction (deeper on light panels, brighter on dark ones) so the band is a visible
+ * accent rather than a same-lightness hue swap. A theme whose accent sits too close to
+ * the label keeps the old step: brighten on dark panels, deepen on light ones.
+ */
 function shimmerHighlightRgb(base: Rgb): Rgb {
-	if (isLightThemeBackground(_toolBranchThemeHint)) return mixRgb(base, { r: 12, g: 16, b: 18 }, 0.75);
+	const light = isLightThemeBackground(_toolBranchThemeHint);
+	const accent = shimmerAccentRgb();
+	if (accent && rgbDistance(base, accent) >= SHIMMER_MIN_ACCENT_DELTA) {
+		const target = light ? { r: 12, g: 16, b: 18 } : { r: 255, g: 255, b: 255 };
+		return mixRgb(accent, target, SHIMMER_ACCENT_PUSH);
+	}
+	if (light) return mixRgb(base, { r: 12, g: 16, b: 18 }, 0.75);
 	return mixRgb(base, { r: 255, g: 255, b: 255 }, 0.92);
 }
 
@@ -4268,9 +4326,12 @@ function shimmerTextAnsi(text: string): string {
 	let lastAnsi = "";
 	for (let i = 0; i < length; i++) {
 		const distance = Math.abs(i + 0.5 - center) / band;
-		// Cosine falloff: 1 at the band center, 0 once past the band edge.
-		const intensity = distance >= 1 ? 0 : 0.5 * (1 + Math.cos(Math.PI * distance)) * SHIMMER_PEAK_MIX;
-		const rgb = mixRgb(base, highlight, intensity);
+		// Cosine falloff: 1 at the band center, 0 once past the band edge. The exponent
+		// tightens the skirt, so the band reads as a comet with a hot core rather than a
+		// wash over the whole label.
+		const falloff =
+			distance >= 1 ? 0 : Math.pow(0.5 * (1 + Math.cos(Math.PI * distance)), SHIMMER_FALLOFF_POW);
+		const rgb = mixRgb(base, highlight, falloff * SHIMMER_PEAK_MIX);
 		const ansi = `\x1b[38;2;${Math.round(rgb.r)};${Math.round(rgb.g)};${Math.round(rgb.b)}m`;
 		if (ansi !== lastAnsi) {
 			out += ansi;

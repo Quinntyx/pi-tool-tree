@@ -434,6 +434,71 @@ assert.ok(listOutput.includes("first item"));
 		Date.now = realNow;
 	}
 }
+// The sweep's colors come from the active theme: the band peaks at the theme's own
+// accent, pushed past the label in the panel's emphasis direction, over a label faded
+// toward the panel. A hardcoded brightness step cannot be seen, and a same-lightness hue
+// swap barely can, so both halves of the palette math are pinned here.
+{
+	const realNow = Date.now;
+	Date.now = () => 1_700_000_000_000;
+	try {
+		// everforest-tui-light: text #5c6a72, accent #35a77c, toolSuccessBg #edf0df.
+		const fg: Record<string, string> = {
+			text: "\x1b[38;2;92;106;114m",
+			accent: "\x1b[38;2;53;167;124m",
+		};
+		const bg: Record<string, string> = { toolSuccessBg: "\x1b[48;2;237;240;223m" };
+		// Pi publishes the live theme on globalThis and several chrome paths re-derive from
+		// that slot, so the fake has to own it for the length of this block. It borrows the
+		// real theme's text/bold helpers so the tool component renders normally.
+		const globalThemeKey = Symbol.for("@earendil-works/pi-coding-agent:theme");
+		const previousGlobalTheme = (globalThis as any)[globalThemeKey];
+		const fakeTheme = Object.assign(Object.create(previousGlobalTheme), {
+			name: "everforest-tui-light",
+			getFgAnsi: (key: string) => fg[key] ?? "\x1b[38;2;128;128;128m",
+			getBgAnsi: (key: string) => bg[key] ?? "\x1b[48;2;0;0;0m",
+		});
+		(globalThis as any)[globalThemeKey] = fakeTheme;
+		const themeCtx = {
+			hasUI: true,
+			ui: { theme: fakeTheme, notify() {}, getToolsExpanded: () => false, setToolsExpanded() {} },
+		};
+		try {
+			for (const handler of handlers.get("session_start") ?? []) await handler({ reason: "resume" }, themeCtx);
+			// session_start clears the work window, and the grouping only counts a call as live
+			// while one is open, so the render below needs both.
+			for (const handler of handlers.get("agent_start") ?? []) await handler({}, themeCtx);
+
+			const accentParent = new Container();
+			const live = new ToolExecutionComponent("code_execution", "shimmer-accent", { code: "print(1)", activity: "implementing" }, {}, definition as any, ui as any, process.cwd());
+			live.markExecutionStarted();
+			live.updateResult({ content: [{ type: "text", text: "ok" }], isError: false } as any, true);
+			accentParent.addChild(live);
+			const raw =
+				accentParent
+					.render(100)
+					.find((line) => line.replace(/\x1b\[[0-9;]*m/g, "").includes("implementing")) ?? "";
+			// Everything up to the counts is the header: the label's own gradient plus the
+			// light in front of it (whose gray is nowhere near either expected color).
+			const colors = [...raw
+				.slice(0, raw.indexOf("1 call"))
+				.matchAll(/\x1b\[38;2;(\d+);(\d+);(\d+)m/g)
+			].map((m) => [+m[1], +m[2], +m[3]]);
+			const nearest = (target: number[]) =>
+				Math.min(...colors.map((c) => Math.hypot(c[0] - target[0], c[1] - target[1], c[2] - target[2])));
+			// mix(text, panel, 0.18) and mix(accent, near-black, 0.65): the two palette ends the
+			// sweep should reach. The band center misses a character by at most half a cell, so
+			// the reachable peak sits a few units short of the second value.
+			assert.ok(colors.length >= 3, `the gradient must be present: ${JSON.stringify(colors)}`);
+			assert.ok(nearest([118, 130, 134]) <= 6, `the resting label fades toward the panel: ${JSON.stringify(colors)}`);
+			assert.ok(nearest([26, 69, 55]) <= 10, `the band peaks at the theme accent: ${JSON.stringify(colors)}`);
+		} finally {
+			(globalThis as any)[globalThemeKey] = previousGlobalTheme;
+		}
+	} finally {
+		Date.now = realNow;
+	}
+}
 // Light-mode tree connectors are quieter without fading the reasoning text.
 initTheme("light", false);
 const ctx = { hasUI: true, ui: { theme, notify() {}, getToolsExpanded: () => false, setToolsExpanded() {} } };
