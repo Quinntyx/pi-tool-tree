@@ -1264,8 +1264,15 @@ const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
 const WORKED_DURATION_KEY = "_piClaudeStyleWorkedDurationMs";
 const WORKED_START_KEY = "_piClaudeStyleWorkedStartMs";
 const WORKED_SESSION_TOTAL_KEY = "_piClaudeStyleWorkedSessionTotalMs";
+// Storage key string is frozen for resume compatibility: sessions written by
+// older builds record the session prompt count under this name.
 const WORKED_TURNS_KEY = "_piClaudeStyleWorkedTurns";
-const WORKED_DURATION_MARKER = "Turn took";
+/** Status-line label. "Agent" keeps it distinct from pi's own turn terminology. */
+const WORKED_DURATION_MARKER = "Agent took";
+/** Pre-rename label; transcripts written by older builds may still carry it. */
+const LEGACY_WORKED_DURATION_MARKER = "Turn took";
+const WORKED_DURATION_MARKERS = [WORKED_DURATION_MARKER, LEGACY_WORKED_DURATION_MARKER];
+const WORKED_DURATION_LINE_PATTERN = /^✻ (?:Agent|Turn) took [^\r\n]+$/;
 const THINKING_DURATION_KEY = "_piClaudeStyleThinkingDurationMs";
 const THINKING_ACTIVE_KEY = "_piClaudeStyleThinkingActive";
 const MIN_THINKING_SUMMARY_MS = 100;
@@ -1278,12 +1285,60 @@ let thinkingBlockInFlight = false;
 let WORKED_LINE_FG = "\x1b[38;2;140;140;140m";
 let currentAgentWorkStartMs: number | undefined;
 let currentAssistantMessageStartMs: number | undefined;
-// Session-wide accumulators for the "Turn took … (Total time … · N turns)" line.
-// Seeded from the `context` event (which carries the full message history,
-// including resumed sessions) so totals reflect the whole session, not just the
-// current process. `userTurnCount` counts role==="user" messages (= prompts sent).
-let sessionStartMs: number | undefined;
-let userTurnCount = 0;
+// Session-wide accumulators for the "Agent took … (Total time … · N turns)" line.
+// Total time is active agent work only: the sum of completed runs. It must never
+// include time spent idle while the user reads or writes a prompt. Both values
+// are re-seeded from persisted message metadata on resume/reload.
+let sessionWorkedTotalMs = 0;
+// Turns fired by the current agent run — pi's turn unit: one model response plus
+// the tool calls it makes. Reset whenever a new run starts.
+let currentRunTurnCount = 0;
+/** Last known run turn count, used for history rows that carry no stamp. */
+let lastRunTurnCount = 0;
+
+function seedSessionTiming(messages: any[]): void {
+	let workedTotalMs = 0;
+	let runTurnCount = 0;
+	let runHasAssistant = false;
+	for (const message of messages) {
+		if (!message || typeof message !== "object") continue;
+		if (message.role === "user") {
+			runTurnCount = 0;
+			runHasAssistant = false;
+			continue;
+		}
+		if (message.role !== "assistant") continue;
+		runTurnCount++;
+		runHasAssistant = true;
+		const stampedTurns = (message as any)[WORKED_TURNS_KEY];
+		if (typeof stampedTurns === "number" && stampedTurns > 0) runTurnCount = stampedTurns;
+		if (message.stopReason !== "stop") continue;
+		const durationMs = (message as any)[WORKED_DURATION_KEY];
+		if (typeof durationMs !== "number" || !Number.isFinite(durationMs) || durationMs < 0) continue;
+		workedTotalMs += durationMs;
+		// Older builds stored wall-clock elapsed totals. Normalize loaded message
+		// objects in memory so rerenders show cumulative work instead.
+		(message as any)[WORKED_SESSION_TOTAL_KEY] = workedTotalMs;
+		if (typeof stampedTurns === "number" && stampedTurns > 0) continue;
+		// Transcripts written before turns were stamped: derive the run's turn
+		// count from the assistant messages it produced.
+		(message as any)[WORKED_TURNS_KEY] = runTurnCount;
+	}
+	sessionWorkedTotalMs = workedTotalMs;
+	lastRunTurnCount = runHasAssistant ? runTurnCount : 0;
+}
+
+function sessionBranchMessages(ctx: any): any[] | undefined {
+	try {
+		const entries = ctx?.sessionManager?.getBranch?.();
+		if (!Array.isArray(entries)) return undefined;
+		return entries
+			.filter((entry: any) => entry?.type === "message" && entry.message)
+			.map((entry: any) => entry.message);
+	} catch {
+		return undefined;
+	}
+}
 
 function formatWorkedDuration(ms: number): string {
 	const safeMs = Math.max(0, Number.isFinite(ms) ? ms : 0);
@@ -1436,19 +1491,24 @@ function messageHasThinkingContent(message: any): boolean {
 }
 
 function workedDurationText(ms: number, sessionTotalMs?: number, turns?: number): string {
-	let text = `${WORKED_LINE_FG}✻ Turn took ${formatWorkedDuration(ms)}`;
+	let text = `${WORKED_LINE_FG}✻ ${WORKED_DURATION_MARKER} ${formatWorkedDuration(ms)}`;
 	if (typeof sessionTotalMs === "number" && typeof turns === "number" && turns > 0) {
 		text += ` (Total time ${formatSessionTotal(sessionTotalMs)} · ${pluralizeTurns(turns)})`;
 	}
 	return `${text}${RESET}`;
 }
 
+function mentionsWorkedDuration(text: string): boolean {
+	return WORKED_DURATION_MARKERS.some((marker) => text.includes(marker));
+}
+
 function isWorkedDurationLine(line: string): boolean {
-	return line.includes(WORKED_DURATION_MARKER) && /^✻ Turn took [^\r\n]+$/.test(stripAnsi(line).trim());
+	const plain = stripAnsi(line).trim();
+	return mentionsWorkedDuration(plain) && WORKED_DURATION_LINE_PATTERN.test(plain);
 }
 
 function stripWorkedDurationLine(text: string): string {
-	if (!text.includes(WORKED_DURATION_MARKER)) return text;
+	if (!mentionsWorkedDuration(text)) return text;
 	return text
 		.split(/\r?\n/)
 		.filter((line) => !isWorkedDurationLine(line))
@@ -1459,7 +1519,7 @@ function stripWorkedDurationLine(text: string): string {
 function hasWorkedDurationLine(message: any): boolean {
 	if (!Array.isArray(message?.content)) return false;
 	return message.content.some((block: any) => {
-		if (block?.type !== "text" || typeof block.text !== "string" || !block.text.includes(WORKED_DURATION_MARKER)) return false;
+		if (block?.type !== "text" || typeof block.text !== "string" || !mentionsWorkedDuration(block.text)) return false;
 		return block.text.split(/\r?\n/).some(isWorkedDurationLine);
 	});
 }
@@ -2215,7 +2275,7 @@ function patchAssistantMessages(): void {
 		const explicitDuration = (message as any)[WORKED_DURATION_KEY];
 		const explicitSessionTotal = (message as any)[WORKED_SESSION_TOTAL_KEY];
 		const explicitTurns = (message as any)[WORKED_TURNS_KEY];
-		// The "Turn took" line must only appear once the stream has truly closed.
+		// The "Agent took" line must only appear once the stream has truly closed.
 		// `message.stopReason === "stop"` is not a safe "finished" signal here because
 		// providers may initialize a live message with that value. The `message_end`
 		// handler stamps `explicitDuration` after the final stream event. Render the
@@ -2225,10 +2285,10 @@ function patchAssistantMessages(): void {
 		const workedDuration = typeof explicitDuration === "number" ? explicitDuration : undefined;
 		const workedSessionTotal = typeof explicitSessionTotal === "number"
 			? explicitSessionTotal
-			: typeof sessionStartMs === "number"
-				? Date.now() - sessionStartMs
+			: sessionWorkedTotalMs > 0
+				? sessionWorkedTotalMs
 				: undefined;
-		const workedTurns = typeof explicitTurns === "number" ? explicitTurns : userTurnCount;
+		const workedTurns = typeof explicitTurns === "number" ? explicitTurns : lastRunTurnCount;
 		const hasAssistantText = message.content.some((block: any) => block?.type === "text" && typeof block.text === "string" && block.text.trim());
 		if (typeof workedDuration === "number" && isFinalAssistantMessage && hasAssistantText && !hasWorkedDurationLine(message)) {
 			container.children.push(new Spacer(1), new Text(workedDurationText(workedDuration, workedSessionTotal, workedTurns), 1, 0));
@@ -5077,24 +5137,37 @@ function registerThinkingLabels(pi: ExtensionAPI): void {
 	pi.on("before_agent_start", async () => {
 		// Start once per top-level request. Steering/follow-up messages can be
 		// injected while the agent is already active; those must not reset the
-		// request timer.
+		// request timer or the turn counter.
 		if (currentAgentWorkStartMs === undefined) {
 			currentAgentWorkStartMs = Date.now();
+			currentRunTurnCount = 0;
 		}
-		if (sessionStartMs === undefined) sessionStartMs = Date.now();
 		currentAssistantMessageStartMs = undefined;
 	});
 	pi.on("agent_start", async () => {
 		if (currentAgentWorkStartMs === undefined) {
 			currentAgentWorkStartMs = Date.now();
+			currentRunTurnCount = 0;
 		}
-		if (sessionStartMs === undefined) sessionStartMs = Date.now();
 		currentAssistantMessageStartMs = undefined;
+	});
+	pi.on("turn_start", async () => {
+		// Count pi's turns for this run so the status line reports how many actually
+		// fired, rather than how many prompts the user sent.
+		if (currentAgentWorkStartMs === undefined) {
+			// Hosts that never emit before_agent_start/agent_start: treat the first
+			// turn as the run boundary so the counter cannot leak across runs.
+			currentAgentWorkStartMs = Date.now();
+			currentRunTurnCount = 1;
+			return;
+		}
+		currentRunTurnCount++;
 	});
 	pi.on("message_start", async (event: any) => {
 		const message = event?.message;
 		if (message?.role === "user" && currentAgentWorkStartMs === undefined) {
 			currentAgentWorkStartMs = Date.now();
+			currentRunTurnCount = 0;
 		}
 		if (message?.role === "assistant") {
 			currentAssistantMessageStartMs = Date.now();
@@ -5137,12 +5210,13 @@ function registerThinkingLabels(pi: ExtensionAPI): void {
 					: currentAssistantMessageStartMs;
 			const isFinalAssistantMessage = message.stopReason === "stop";
 			if (started !== undefined && isFinalAssistantMessage) {
-				const durationMs = Date.now() - started;
-				const sessionTotalMs = typeof sessionStartMs === "number" ? Date.now() - sessionStartMs : undefined;
-				const turns = userTurnCount > 0 ? userTurnCount : undefined;
+				const durationMs = Math.max(0, Date.now() - started);
+				const turns = Math.max(1, currentRunTurnCount);
+				sessionWorkedTotalMs += durationMs;
+				lastRunTurnCount = turns;
 				(message as any)[WORKED_DURATION_KEY] = durationMs;
-				if (typeof sessionTotalMs === "number") (message as any)[WORKED_SESSION_TOTAL_KEY] = sessionTotalMs;
-				if (typeof turns === "number") (message as any)[WORKED_TURNS_KEY] = turns;
+				(message as any)[WORKED_SESSION_TOTAL_KEY] = sessionWorkedTotalMs;
+				(message as any)[WORKED_TURNS_KEY] = turns;
 				// Duration metadata drives the assistant component's TUI-only status line.
 				// Message content stays presentation-neutral for persistence and consumers.
 			}
@@ -5158,38 +5232,20 @@ function registerThinkingLabels(pi: ExtensionAPI): void {
 		currentAgentWorkStartMs = undefined;
 		currentAssistantMessageStartMs = undefined;
 	});
-	pi.on("session_start", async () => {
-		// Reset session-wide accumulators on every session transition (new / resume /
-		// fork / reload). The `context` event re-seeds them from the new session's
-		// message history, so /new starts fresh while /resume picks up past prompts
-		// and the original session start time. Resetting here is what lets /new
-		// clear the totals (Math.min / Math.max seeding alone could never lower them).
-		// Also drop the live-agent marker so history partials rebuilt during resume
-		// never look "in flight" and re-arm blink timers.
+	pi.on("session_start", async (_event, ctx) => {
+		// Reset live state on every session transition. Seed from the complete active
+		// branch so resume, fork, tree navigation, and compaction retain prior work
+		// totals without counting the idle gaps between prompts.
 		currentAgentWorkStartMs = undefined;
 		currentAssistantMessageStartMs = undefined;
-		sessionStartMs = undefined;
-		userTurnCount = 0;
+		seedSessionTiming(sessionBranchMessages(ctx) ?? []);
 	});
-	pi.on("context", async (event) => {
+	pi.on("context", async (event, ctx) => {
 		const messages = (event as any)?.messages;
 		if (!Array.isArray(messages)) return;
-		// Seed session-wide accumulators from the full message history (covers
-		// /resume — past prompts and the original session start time are included).
-		// Values are monotonic, so recomputing on every fire stays stable.
-		let earliest: number | undefined;
-		let userCount = 0;
-		for (const msg of messages) {
-			if (!msg) continue;
-			if (msg.role === "user") userCount++;
-			if (typeof msg.timestamp === "number" && Number.isFinite(msg.timestamp)) {
-				if (earliest === undefined || msg.timestamp < earliest) earliest = msg.timestamp;
-			}
-		}
-		if (earliest !== undefined) {
-			sessionStartMs = sessionStartMs === undefined ? earliest : Math.min(sessionStartMs, earliest);
-		}
-		if (userCount > userTurnCount) userTurnCount = userCount;
+		// getBranch() remains complete across compaction; event.messages is a safe
+		// fallback for hosts that don't expose a session manager.
+		seedSessionTiming(sessionBranchMessages(ctx) ?? messages);
 		for (const msg of messages) {
 			if (!msg || msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
 			for (const block of msg.content) {

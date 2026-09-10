@@ -78,7 +78,7 @@ When `themeAdaptive` is `true` (default), the following colors are derived from 
 |---------|--------------|
 | Tool rules, code fences | `dim` → `muted` → `borderMuted` → `thinkingText` |
 | Branch connectors (`├`, `╰`, `│`) | Activity trees and paragraph dots use light gray on light themes, dim gray on dark themes; explicit `/cc-tools branch` settings still override this |
-| "✻ Turn took Ns" line (final message only, with session total + turn count) | `muted` |
+| "✻ Agent took Ns" line (final message only, with cumulative active-work total + the run's turn count) | `muted` |
 | Expanded thinking-block text and `∴` marker | `muted` |
 | Diff add/remove accents | `toolDiffAdded` / `toolDiffRemoved` |
 | Diff background tints | mixed against `toolSuccessBg` base |

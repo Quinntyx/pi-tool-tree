@@ -224,9 +224,11 @@ const neq = (a: string[], b: string[], label: string) => {
 		getToolsExpanded() { return false; },
 		setToolsExpanded() {},
 	};
-	const turnStart = (fakePi as any).handlers.get("turn_start")?.[0];
-	if (!turnStart) throw new Error("turn_start handler not registered");
-	await turnStart({}, { hasUI: true, ui });
+	// Every turn_start handler runs on the same event; the notice patch is applied
+	// by one of them, so drive them all instead of depending on registration order.
+	const turnStartHandlers = (fakePi as any).handlers.get("turn_start") ?? [];
+	if (turnStartHandlers.length === 0) throw new Error("turn_start handler not registered");
+	for (const handler of turnStartHandlers) await handler({}, { hasUI: true, ui });
 	ui.notify("💾 Memory auto-reviewed and updated");
 	const notice = notices.at(-1) ?? "";
 	if (!notice.includes("✻ Memory auto-reviewed and updated") || !notice.includes("\x1b[38;") || notice.includes("\x1b[2m")) {
@@ -354,6 +356,111 @@ const neq = (a: string[], b: string[], label: string) => {
 		throw new Error(`finished message did not resolve to Thought for Xs: ${JSON.stringify(lines)}`);
 	}
 	console.log("OK  finished thoughts: fast/untimed messages resolve to Thought for Xs");
+}
+
+// ---------------------------------------------------------------------------
+// 12. Session total sums active work; the bracket counts turns of the last run.
+// ---------------------------------------------------------------------------
+{
+	const handlersFor = (name: string) => (fakePi as any).handlers.get(name) ?? [];
+	for (const name of ["session_start", "before_agent_start", "turn_start", "message_start", "message_end"]) {
+		if (handlersFor(name).length === 0) throw new Error(`${name} handler not registered`);
+	}
+
+	const history = [
+		{ role: "user", content: "one", timestamp: 1_000 },
+		{
+			role: "assistant", content: [{ type: "text", text: "first" }], stopReason: "stop",
+			_piClaudeStyleWorkedDurationMs: 3_000,
+			_piClaudeStyleWorkedSessionTotalMs: 63_000,
+		},
+		{ role: "user", content: "two", timestamp: 64_000 },
+		{
+			role: "assistant", content: [{ type: "text", text: "second" }], stopReason: "stop",
+			_piClaudeStyleWorkedDurationMs: 4_000,
+			_piClaudeStyleWorkedSessionTotalMs: 286_000,
+		},
+		{ role: "user", content: "three", timestamp: 287_000 },
+	];
+	const ctx = {
+		hasUI: false,
+		sessionManager: {
+			getBranch: () => history.map((message) => ({ type: "message", message })),
+		},
+		ui: {},
+	} as any;
+
+	const realNow = Date.now;
+	let now = 300_000;
+	Date.now = () => now;
+	try {
+		for (const handler of handlersFor("session_start")) await handler({}, ctx);
+		if ((history[1] as any)._piClaudeStyleWorkedSessionTotalMs !== 3_000
+			|| (history[3] as any)._piClaudeStyleWorkedSessionTotalMs !== 7_000) {
+			throw new Error("loaded wall-clock totals were not normalized to cumulative work");
+		}
+		// One assistant message per run in this history, so each run is one turn.
+		if ((history[1] as any)._piClaudeStyleWorkedTurns !== 1 || (history[3] as any)._piClaudeStyleWorkedTurns !== 1) {
+			throw new Error("unstamped runs were not seeded with a derived turn count");
+		}
+
+		for (const handler of handlersFor("before_agent_start")) await handler({}, ctx);
+		const finalMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "third" }],
+			stopReason: "stop",
+		};
+		await (async () => {
+			// Two pi turns fire in this run: a tool round plus the final answer.
+			for (const turnIndex of [1, 2]) {
+				for (const handler of handlersFor("turn_start")) await handler({ turnIndex }, ctx);
+			}
+		})();
+		now = 300_500;
+		for (const handler of handlersFor("message_start")) await handler({ message: finalMessage }, ctx);
+		now = 303_000;
+		for (const handler of handlersFor("message_end")) await handler({ message: finalMessage }, ctx);
+
+		const clean = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "").replace(/\x1b\][^\x07]*\x07/g, "").trim();
+		const lines = new AssistantMessageComponent(finalMessage as any, false).render(W).map(clean).filter(Boolean);
+		const timing = lines.find((line) => line.includes("Agent took")) ?? "";
+		if (!timing.includes("Agent took 3s") || !timing.includes("Total time 10s · 2 turns")) {
+			throw new Error(`status line did not report run turns and cumulative work: ${JSON.stringify(timing)}`);
+		}
+	} finally {
+		Date.now = realNow;
+	}
+	console.log("OK  timing total: cumulative work + turns fired in the last run");
+}
+
+// ---------------------------------------------------------------------------
+// 13. Status line says "Agent took", and legacy "Turn took" text is still scrubbed.
+// ---------------------------------------------------------------------------
+{
+	const contextHandler = (fakePi as any).handlers.get("context")?.[0];
+	if (!contextHandler) throw new Error("context handler not registered");
+	const ctx = { hasUI: false, ui: { invalidate() {}, requestRender() {} } } as any;
+	const messages = [
+		{
+			role: "assistant",
+			content: [{ type: "text", text: "Old answer.\n\n✻ Turn took 12s (Total time 4m · 2 turns)" }],
+			stopReason: "stop",
+		},
+		{
+			role: "assistant",
+			content: [{ type: "text", text: "New answer.\n\n✻ Agent took 12s (Total time 4m · 2 turns)" }],
+			stopReason: "stop",
+		},
+	];
+	await contextHandler({ messages }, ctx);
+	// The scrub drops the status line and leaves the surrounding blank line behind.
+	if (messages[0].content[0].text !== "Old answer.\n") {
+		throw new Error(`legacy Turn took line not scrubbed: ${JSON.stringify(messages[0].content[0].text)}`);
+	}
+	if (messages[1].content[0].text !== "New answer.\n") {
+		throw new Error(`Agent took line not scrubbed: ${JSON.stringify(messages[1].content[0].text)}`);
+	}
+	console.log("OK  status line label: Agent took, legacy Turn took still scrubbed");
 }
 
 console.log("\nAll correctness checks passed.");

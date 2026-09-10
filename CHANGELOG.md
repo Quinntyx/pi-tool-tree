@@ -37,8 +37,10 @@
 
 ### Fixed
 
+- **`Turn took` is now `Agent took`, and the bracket counts real turns** — the end-of-run status line reads `✻ Agent took 2m 30s (Total time 8m 4s · 3 turns)`. "Turn" previously named two different things: the agent run since your last prompt, and pi's own turn (one model response plus its tool calls). The label now names the run, and the count is how many turns actually fired inside it. Transcripts whose runs were never stamped fall back to the number of assistant messages in that run. Legacy `Turn took` lines baked into older transcripts are still scrubbed on load.
+- **Total turn time excludes user idle time** — `Total time` now sums completed `Agent took` durations instead of measuring wall-clock time since the session's first prompt. Resumed and reloaded sessions rebuild the cumulative total from persisted run-duration metadata.
 - **Grouped Bash commands show live progress** (Raine Virta) - collapsed running Bash rows display their latest non-empty output line beneath the command.
-- **Final timing status stays presentation-only** (Raine Virta) - the `Turn took` line renders as a styled TUI component without adding ANSI escapes or display text to persisted assistant messages.
+- **Final timing status stays presentation-only** (Raine Virta) - the `Agent took` line renders as a styled TUI component without adding ANSI escapes or display text to persisted assistant messages.
 
 ## 1.0.75 — 2026-07-29
 
