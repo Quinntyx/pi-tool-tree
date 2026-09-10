@@ -885,6 +885,12 @@ function activityShimmerEnabled(): boolean {
 	return readSettings().activityShimmer !== false;
 }
 
+/** True between the start of a run and `agent_end`: the agent is still on this request,
+ *  even in the quiet stretches where nothing is streaming and no call is in flight. */
+function agentWorking(): boolean {
+	return typeof currentAgentWorkStartMs === "number";
+}
+
 function toolActivityParamEnabled(): boolean {
 	return readSettings().toolActivityParam !== false;
 }
@@ -900,6 +906,24 @@ function activityLabelOf(tool: any): string {
 
 /** Live tool durations for group headers. Lost on restart (Pi doesn't persist them). */
 const TOOL_TIMINGS = new Map<string, { start: number; end?: number }>();
+/**
+ * Highest elapsed time a group's header reached while the chunk was live, keyed by the
+ * group's first call. Transcripts re-render from scratch on every frame, so without this
+ * a closed chunk would fall back to the sum of its recorded spans and visibly shrink the
+ * moment prose arrived. Also lost on restart, like the timings it is measured from.
+ */
+const GROUP_ELAPSED_HIGH_WATER = new Map<string, number>();
+
+function recordGroupElapsed(toolCallId: string, ms: number): void {
+	if (GROUP_ELAPSED_HIGH_WATER.size > 4096) {
+		let dropped = 0;
+		for (const key of GROUP_ELAPSED_HIGH_WATER.keys()) {
+			GROUP_ELAPSED_HIGH_WATER.delete(key);
+			if (++dropped >= 1024) break;
+		}
+	}
+	GROUP_ELAPSED_HIGH_WATER.set(toolCallId, Math.max(GROUP_ELAPSED_HIGH_WATER.get(toolCallId) ?? 0, ms));
+}
 
 function recordToolStart(toolCallId: string): void {
 	if (TOOL_TIMINGS.size > 4096) {
@@ -1026,6 +1050,34 @@ function reregisterCoreTools(pi: ExtensionAPI): void {
 	}
 }
 
+/**
+ * Wall-clock start of an activity group, reconstructed by laying its recorded spans
+ * end to end backwards from now. A live chunk's header duration is measured from here,
+ * so it keeps ticking through the silent gaps between calls without ever double counting
+ * a call that is still running.
+ */
+function groupChunkStartMs(items: { tool?: any; durationMs?: number }[]): number {
+	let cursor = Date.now();
+	let start = cursor;
+	for (let i = items.length - 1; i >= 0; i--) {
+		const item = items[i];
+		const timing = item.tool ? TOOL_TIMINGS.get(item.tool.toolCallId) : undefined;
+		if (timing) {
+			// A pending call is still running, so it ends at the cursor.
+			cursor = timing.end ?? cursor;
+			start = Math.min(start, timing.start);
+			continue;
+		}
+		if (typeof item.durationMs === "number" && item.durationMs >= 0) {
+			cursor -= item.durationMs;
+			start = Math.min(start, cursor);
+			continue;
+		}
+		start = Math.min(start, cursor);
+	}
+	return Math.min(start, Date.now());
+}
+
 /** Render-only grouping: keep Pi's child identities, message data and order intact. */
 function renderActivityTranscript(parent: any, width: number): string[] | undefined {
 	if (!toolGroupingEnabled() || !Array.isArray(parent.children)) return undefined;
@@ -1092,8 +1144,11 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 	const margin = " ";
 	const connector = activityTreeBranchAnsi();
 	let pending: { label: string; lines: string[]; tool?: any; durationMs?: number }[] = [];
+	// Whether this render found the transcript's trailing chunk still live. When it did
+	// not, the loop armed by an earlier render is released at the end of this one.
+	let armedLive = false;
 
-	const emitGroup = (items: typeof pending): void => {
+	const emitGroup = (items: typeof pending, trailing: boolean): void => {
 		const tools = items.filter((item) => item.tool);
 		const statuses = tools.map((item) => getToolStatusForGroup(item.tool));
 		const pendingCount = statuses.filter((status) => status === "pending").length;
@@ -1116,8 +1171,8 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 			const timing = TOOL_TIMINGS.get(item.tool.toolCallId);
 			if (!timing) continue;
 			timed++;
-			// Pending calls tick against the wall clock, so the header total is live while
-			// the group runs and freezes at its final value when the last call settles.
+			// Pending calls tick against the wall clock, so a running call is always measured
+			// to this frame; settled ones contribute the span they recorded.
 			const end = timing.end ?? Date.now();
 			totalMs += Math.max(0, end - timing.start);
 		}
@@ -1131,32 +1186,43 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 			thought++;
 			thinkingMs += Math.max(0, item.durationMs);
 		}
-		const complete = pendingCount === 0;
+		// The chunk is live while it is the last thing in the transcript and the agent is
+		// still on this request: from the group's first call until prose follows it, a
+		// different activity label supersedes it, or the run ends. Individual calls settling
+		// does not close it — the agent is still thinking, or about to call again.
+		const live = trailing && (agentWorking() || pendingCount > 0);
+		// While live the header clock runs on the wall (`max(sum, now - chunkStart)`), so it
+		// keeps ticking between calls instead of freezing on the last measured activity. A
+		// closed chunk keeps the highest value it reached: the measured sum would otherwise
+		// restart from its recorded spans and make the total drop back on the next frame.
+		const measuredMs = live ? Math.max(totalMs + thinkingMs, Date.now() - groupChunkStartMs(items)) : 0;
+		const anchorId = tools.length > 0 ? tools[0].tool?.toolCallId : undefined;
+		if (live && typeof anchorId === "string") recordGroupElapsed(anchorId, measuredMs);
+		const reachedMs = typeof anchorId === "string" ? (GROUP_ELAPSED_HIGH_WATER.get(anchorId) ?? 0) : 0;
+		const elapsedMs = Math.max(totalMs + thinkingMs, measuredMs, reachedMs);
 		// A reading of 0 still prints (`<1s`): a call that just started is a measurement,
 		// while a group with no timing data at all prints none.
-		if (timed > 0 || thought > 0) parts.push(formatBashDuration(totalMs + thinkingMs));
-		// While the group is running its label shimmers; once every call settles the label
-		// returns to the ambient color. Counts stay static metadata.
-		const shimmering = !complete && !!label && activityShimmerEnabled();
+		if (timed > 0 || thought > 0) parts.push(formatBashDuration(elapsedMs));
+		// While the chunk is live its label shimmers; once it closes the label returns to the
+		// ambient color. The status light stays what it always was — a per-call indicator
+		// that stops blinking the moment every individual call has settled. Counts are
+		// static metadata either way.
+		const shimmering = live && !!label && activityShimmerEnabled();
 		// The transcript owns this row's light and label, so it also owns the repaint:
-		// ~80ms while the sweep runs, 500ms for a bare live duration. Settled groups
-		// stop asking, which ends the timer chain.
-		if (!complete) {
+		// ~80ms while the sweep runs, 500ms for a bare live duration.
+		if (live && count > 0) {
+			armedLive = true;
 			const running: any[] = [];
 			for (let i = 0; i < tools.length; i++) {
 				if (statuses[i] === "pending") running.push(tools[i].tool);
 			}
-			requestLiveGroupFrame(() => {
+			// Any row in the group can carry the repaint: a chunk in its thinking phase has
+			// nothing in flight, and that is exactly when the clock needs the frames most.
+			const carrier = running[0] ?? tools[0]?.tool;
+			requestLiveGroupFrame(parent, () => {
 				safeInvalidate(parent);
-				for (const tool of running) {
-					safeInvalidate(tool);
-					// pi's component `invalidate()` only clears caches — the repaint has to be
-					// requested. That is what the render context does, and why the ● blink wakes
-					// the TUI. Without it this loop painted nothing at all.
-					const ui = (tool as any)?.ui;
-					if (typeof ui?.requestRender === "function") ui.requestRender();
-					else (tool as any)?.getRenderContext?.()?.invalidate?.();
-				}
+				for (const tool of running) safeInvalidate(tool);
+				requestLiveRepaint(carrier);
 			}, shimmering);
 		}
 		const labelAnsi = label ? (shimmering ? shimmerTextAnsi(label) : label) : "";
@@ -1182,16 +1248,18 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 		});
 	};
 
-	const flush = () => {
+	const flush = (finalFlush = false) => {
 		const runs: typeof pending[] = [];
 		for (const item of pending) {
 			const last = runs[runs.length - 1];
 			if (last && last[0].label === item.label) last.push(item);
 			else runs.push([item]);
 		}
-		for (const run of runs) {
+		for (let i = 0; i < runs.length; i++) {
 			separate();
-			emitGroup(run);
+			// Only the last group of the render still ends the transcript; anything flushed
+			// earlier was closed by the prose or the different label that followed it.
+			emitGroup(runs[i], finalFlush && i === runs.length - 1);
 		}
 		pending = [];
 	};
@@ -1220,7 +1288,10 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 			durationMs: entry.kind === "thinking" ? entry.durationMs : undefined,
 		});
 	}
-	flush();
+	flush(true);
+	// Nothing in this transcript is live any more (prose, a closed chunk, or the run
+	// ended): release the frame loop so it cannot outlive the animation.
+	if (!armedLive) stopLiveGroupFrame(parent);
 	return output;
 }
 
@@ -3119,18 +3190,18 @@ let _globalBlinkPhase = true;
 // Wall-clock of the last blink/breathe advance: the timer can tick faster than the
 // dot cycle while a label shimmer is running.
 let _lastBlinkPhaseAt = 0;
-// Live-group repaint: set on every render of a running group, consumed by the tick.
+// Live-group repaint: refreshed by every render of a live chunk, consumed by the tick.
 let _liveTickTimer: ReturnType<typeof setTimeout> | null = null;
 let _liveTickTarget: (() => void) | null = null;
-
-/** True while a tracked tool is still running — used by the label shimmer check. */
-function shimmerRunning(): boolean {
-	if (!activityShimmerEnabled()) return false;
-	for (const entry of _blinkContexts.values()) {
-		if (entry.key?._toolStatus === "pending") return true;
-	}
-	return false;
-}
+// The transcript that owns the running loop. Nested containers render through the same
+// code path, so only the owner is allowed to stop it.
+let _liveTickOwner: any = null;
+let _liveTickFast = false;
+// When the owning transcript last rendered. A chunk whose loop keeps ticking without
+// ever being rendered again (hidden viewport, a re-render that never lands) is done:
+// the loop would only burn frames painting a row nobody reads.
+let _liveTickRenderedAt = 0;
+const LIVE_TICK_STALE_MS = 4000;
 
 function getBlinkIntervalMs(): number {
 	// Only the braille spinner needs sub-blink frames; the breathe cycle steps on its own
@@ -3139,26 +3210,68 @@ function getBlinkIntervalMs(): number {
 }
 
 /**
- * Keep repainting while a group still has calls in flight.
+ * Keep repainting while the trailing chunk is still the agent's live work.
  *
- * The grouped transcript draws its own status light and (optionally) its own label
- * shimmer, so it never goes through the native tool row renderer that arms the ●
- * blink. Without this loop a running group rendered once and froze. Each frame re-arms
- * itself from the next render, so the loop stops by itself once every group settles.
+ * The grouped transcript draws its own status light and label shimmer, so it never goes
+ * through the native tool row renderer that arms the ● blink. Without this loop a running
+ * group rendered once and froze.
+ *
+ * The loop re-arms itself instead of waiting for the next render to restart it: a chunk
+ * that keeps working after its last call settled (the model thinking, or composing the
+ * next call) has nothing else asking for frames. Which transcript owns the loop, and
+ * whether it is still live, is decided by that transcript's render — prose, a new
+ * activity label, or the end of the run closes the chunk and clears the target.
  */
-function requestLiveGroupFrame(invalidate: () => void, fast: boolean): void {
+function requestLiveGroupFrame(owner: any, invalidate: () => void, fast: boolean): void {
+	_liveTickOwner = owner;
 	_liveTickTarget = invalidate;
-	if (_liveTickTimer) return;
+	_liveTickFast = fast;
+	_liveTickRenderedAt = Date.now();
+	_scheduleLiveTick();
+}
+
+function _scheduleLiveTick(): void {
+	if (!_liveTickTarget) return;
+	// Every render re-arms the tick, so the cadence syncs to the transcript's own frames
+	// (nothing double-repaints while the agent streams) and no dead handle can ever wedge
+	// the loop for the rest of the session.
+	if (_liveTickTimer) clearTimeout(_liveTickTimer);
 	_liveTickTimer = setTimeout(() => {
 		_liveTickTimer = null;
 		const target = _liveTickTarget;
-		_liveTickTarget = null;
 		if (!target) return;
+		// Nothing rendered the owning transcript since the last frame: stop instead of
+		// spinning forever. A later render re-arms the loop if the chunk is still live.
+		if (Date.now() - _liveTickRenderedAt > LIVE_TICK_STALE_MS) {
+			stopLiveGroupFrame();
+			return;
+		}
 		try {
 			target();
 		} catch { /* the row may be gone after a reload/session switch */ }
-	}, fast ? SHIMMER_INTERVAL_MS : BLINK_INTERVAL_MS);
+		_scheduleLiveTick();
+	}, _liveTickFast ? SHIMMER_INTERVAL_MS : BLINK_INTERVAL_MS);
 	unrefTimer(_liveTickTimer);
+}
+
+/** Stop the loop. Callers that render pass their own component so a nested container
+ *  render cannot kill the transcript's animation. */
+function stopLiveGroupFrame(owner?: any): void {
+	if (owner !== undefined && _liveTickOwner !== owner) return;
+	_liveTickTarget = null;
+	_liveTickOwner = null;
+	if (_liveTickTimer) {
+		clearTimeout(_liveTickTimer);
+		_liveTickTimer = null;
+	}
+}
+
+/** Request a frame. pi's component `invalidate()` only clears caches — the repaint has
+ *  to be asked for, which is why a loop that only invalidated painted nothing at all. */
+function requestLiveRepaint(component: any): void {
+	const ui = component?.ui;
+	if (ui && typeof ui.requestRender === "function") ui.requestRender();
+	else component?.getRenderContext?.()?.invalidate?.();
 }
 
 function getBlinkKey(ctx: any): any {
@@ -5534,6 +5647,8 @@ function registerThinkingLabels(pi: ExtensionAPI): void {
 	pi.on("agent_end", async () => {
 		currentAgentWorkStartMs = undefined;
 		currentAssistantMessageStartMs = undefined;
+		// The chunk that was live is closed: stop animating it and stamp its final total.
+		stopLiveGroupFrame();
 	});
 	pi.on("session_start", async (_event, ctx) => {
 		// Reset live state on every session transition. Seed from the complete active
@@ -5541,6 +5656,7 @@ function registerThinkingLabels(pi: ExtensionAPI): void {
 		// totals without counting the idle gaps between prompts.
 		currentAgentWorkStartMs = undefined;
 		currentAssistantMessageStartMs = undefined;
+		stopLiveGroupFrame();
 		seedSessionTiming(sessionBranchMessages(ctx) ?? []);
 	});
 	pi.on("context", async (event, ctx) => {
@@ -7554,9 +7670,11 @@ export default function (pi: ExtensionAPI) {
 	// Session rebuild (resume/reload/fork) must not leave history partials blinking.
 	pi.on("session_start", async () => {
 		_clearAllBlinkContexts();
+		stopLiveGroupFrame();
 	});
 	pi.on("session_shutdown", async () => {
 		_clearAllBlinkContexts();
+		stopLiveGroupFrame();
 		clearAllBashDurationContexts();
 		clearRtkRewriteState();
 		WRITE_EXISTED_BEFORE.clear();

@@ -261,7 +261,48 @@ assert.ok(listOutput.includes("first item"));
 	}
 }
 
-// A running group's total ticks live off the wall clock, and freezes when it settles.
+// The repaint loop follows the chunk, not the calls in flight. A chunk whose calls have
+// all settled but which the agent is still working on (thinking, composing the next call)
+// has nothing else asking for frames — and that is exactly when the ticking total and the
+// sweep need them. Closing the chunk releases the loop instead of leaving it running.
+{
+	const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+	const agentEnd = async () => { for (const handler of handlers.get("agent_end") ?? []) await handler({}, {}); };
+	const agentStart = async () => { for (const handler of handlers.get("agent_start") ?? []) await handler({}, {}); };
+	const renders = { count: 0 };
+	const loopParent = new Container();
+	const settledTool = new ToolExecutionComponent(
+		"code_execution", "loop-settled", { code: "print(1)", activity: "implementing" }, {}, definition as any,
+		{ requestRender: () => { renders.count++; } } as any, process.cwd(),
+	);
+	settledTool.markExecutionStarted();
+	settledTool.updateResult({ content: [{ type: "text", text: "ok" }], isError: false } as any, false);
+	loopParent.addChild(settledTool);
+	// A finished run must not leave a loop behind (this also releases the timer any earlier
+	// block left armed).
+	await agentEnd();
+	loopParent.render(100);
+	await agentStart();
+	loopParent.render(100);
+	const afterArming = renders.count;
+	// No further render happens here: if the loop were still waiting for one, its total
+	// would freeze on screen forever.
+	await sleep(250);
+	assert.ok(renders.count >= afterArming + 2, `a live chunk with every call settled must keep repainting itself: ${renders.count - afterArming} frames`);
+	// Prose closes the chunk: the loop is released and nothing re-arms it.
+	const prose = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "the answer" }] } as any;
+	const answer = new AssistantMessageComponent(prose, false);
+	answer.updateContent(prose, false);
+	loopParent.addChild(answer);
+	loopParent.render(100);
+	await sleep(250); // Let anything already armed fire before taking the reading.
+	const settledFrames = renders.count;
+	await sleep(250);
+	assert.equal(renders.count, settledFrames, "a closed chunk must release the repaint loop");
+}
+
+// A live chunk's total ticks off the wall clock, including the quiet stretches between
+// calls, and freezes at whatever it reached once the chunk closes.
 {
 	const realNow = Date.now;
 	let fakeNow = 1_700_000_000_000;
@@ -281,14 +322,25 @@ assert.ok(listOutput.includes("first item"));
 		assert.ok(/testing 1 call · 5s/.test(plain(liveParent.render(100))), `a running total must tick: ${JSON.stringify(plain(liveParent.render(100)).split("\n")[0])}`);
 		fakeNow += 4000;
 		assert.ok(/testing 1 call · 9s/.test(plain(liveParent.render(100))), "a running total keeps ticking");
-		// Settle it: the total now measures the recorded run and stops moving.
+		// The call settles, but the agent has not moved on: the chunk is still live, so the
+		// header keeps counting instead of freezing at the recorded sum.
 		for (const handler of handlers.get("tool_execution_end") ?? []) {
 			await handler({ toolCallId: callId, toolName: "code_execution", args: {} }, ui);
 		}
 		running.updateResult({ content: [{ type: "text", text: "done" }], isError: false } as any, false);
-		const settled = plain(liveParent.render(100));
+		assert.ok(/testing 1 call · 9s/.test(plain(liveParent.render(100))), "a settled call reports its recorded run");
 		fakeNow += 30000;
-		assert.equal(settled, plain(liveParent.render(100)), "a settled total must stop ticking");
+		assert.ok(/testing 1 call · 39s/.test(plain(liveParent.render(100))), `a live chunk keeps ticking after its last call settles: ${JSON.stringify(plain(liveParent.render(100)).split("\n")[0])}`);
+		// Prose after the group closes the chunk: the total freezes where it got to (it must
+		// not fall back to the sum of the recorded spans and visibly shrink).
+		const prose = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "writing the answer" }] } as any;
+		const answer = new AssistantMessageComponent(prose, false);
+		answer.updateContent(prose, false);
+		liveParent.addChild(answer);
+		const closed = plain(liveParent.render(100));
+		assert.ok(/testing 1 call · 39s/.test(closed), `a closed chunk keeps the total it reached: ${JSON.stringify(closed.split("\n")[0])}`);
+		fakeNow += 30000;
+		assert.equal(closed, plain(liveParent.render(100)), "a closed chunk must stop ticking");
 	} finally {
 		Date.now = realNow;
 	}
@@ -315,8 +367,10 @@ assert.ok(listOutput.includes("first item"));
 	assert.ok(!/exploring 1 call · <1s/.test(reasonedOutput), "group duration must not ignore thinking");
 }
 
-// Running groups shimmer: the label carries a moving multi-color gradient that stops
-// once every call settles (and the label text itself never changes).
+// The label shimmer belongs to the chunk, not to a single call: it sweeps while the
+// chunk is the agent's live work — from the group's first call until prose follows it, a
+// different activity label supersedes it, or the run ends — and individual calls settling
+// does not stop it. The light stays the per-call indicator (settled calls never blink).
 {
 	const realNow = Date.now;
 	let fakeNow = 1_700_000_000_000;
@@ -327,14 +381,13 @@ assert.ok(listOutput.includes("first item"));
 		pendingTool.markExecutionStarted();
 		pendingTool.updateResult({ content: [{ type: "text", text: "ok" }], isError: false } as any, true);
 		shimmerParent.addChild(pendingTool);
-		const codeSet = (lines: string[]) => new Set([...lines.join("\n").matchAll(/\x1b\[38;2;(\d+);(\d+);(\d+)m/g)].map((m) => m[0]));
 		// Colors that belong to the label itself: the one opening it plus any interleaved
 		// between its characters (the dot/branch colors before it are not ours).
 		// The gradient interleaves color codes between the label's characters, so the
 		// label is not a contiguous substring of the raw line: strip first, then take
 		// every color between the status glyph (spinner while running) and the counts.
-		const labelColors = (lines: string[]) => {
-			const line = lines.find((l) => l.replace(/\x1b\[[0-9;]*m/g, "").includes("implementing")) ?? "";
+		const labelColors = (lines: string[], text = "implementing") => {
+			const line = lines.find((l) => l.replace(/\x1b\[[0-9;]*m/g, "").includes(text)) ?? "";
 			const stripped = line.replace(/\x1b\[[0-9;]*m/g, "");
 			const glyphAt = stripped.search(/[\u2800-\u28FF●•·]/);
 			const callAt = line.indexOf("1 call");
@@ -342,18 +395,41 @@ assert.ok(listOutput.includes("first item"));
 			const region = line.slice(glyphAt + 1, callAt);
 			return [...region.matchAll(/\x1b\[38;2;\d+;\d+;\d+m/g)].map((m) => m[0]);
 		};
+		const header = (lines: string[]) => plain(lines).split("\n")[0];
 		const firstFrame = shimmerParent.render(100);
 		assert.ok(/implementing/.test(plain(firstFrame)), "the label text survives the gradient");
 		assert.ok(new Set(labelColors(firstFrame)).size >= 3, `a running label must be a gradient, got ${new Set(labelColors(firstFrame)).size} colors`);
 		fakeNow += 250;
 		const secondFrame = shimmerParent.render(100);
 		assert.notEqual(labelColors(firstFrame).join(), labelColors(secondFrame).join(), "the running label must animate between frames");
-		// Settled groups keep a constant label: no gradient, and no motion over time.
+		// The call settles. The light becomes the steady success dot — the chunk never
+		// blinks a dot of its own — but the sweep keeps going: the agent still owns this
+		// chunk (it is thinking, or composing the next call).
 		pendingTool.updateResult({ content: [{ type: "text", text: "ok" }], isError: false } as any, false);
-		const settled = shimmerParent.render(100);
-		assert.ok(new Set(labelColors(settled)).size <= 1, `a settled label must not keep gradient colors: ${JSON.stringify(labelColors(settled))}`);
+		const settledFrame = shimmerParent.render(100);
+		assert.ok(/^ ● implementing 1 call/.test(header(settledFrame)), `a settled call keeps a steady light: ${JSON.stringify(header(settledFrame))}`);
+		const settledColors = labelColors(settledFrame);
+		assert.ok(new Set(settledColors).size >= 3, `settling a call must not stop the chunk's sweep: ${JSON.stringify(settledColors)}`);
 		fakeNow += 250;
-		assert.equal(settled.join("\n"), shimmerParent.render(100).join("\n"), "a settled label must not animate");
+		assert.notEqual(settledColors.join(), labelColors(shimmerParent.render(100)).join(), "the sweep keeps moving after the call settles");
+		// A different activity label supersedes the chunk: the closed label is done, the
+		// new trailing chunk takes over the sweep.
+		const next = new ToolExecutionComponent("code_execution", "shimmer-next", { code: "print(2)", activity: "testing" }, {}, definition as any, ui as any, process.cwd());
+		next.markExecutionStarted();
+		next.updateResult({ content: [{ type: "text", text: "ok" }], isError: false } as any, true);
+		shimmerParent.addChild(next);
+		const superseded = shimmerParent.render(100);
+		assert.ok(new Set(labelColors(superseded)).size <= 1, `a superseded chunk must stop sweeping: ${JSON.stringify(labelColors(superseded))}`);
+		assert.ok(new Set(labelColors(superseded, "testing")).size >= 3, "the label that superseded it is the live one");
+		// Prose after the group closes the trailing chunk as well.
+		const prose = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "writing the answer" }] } as any;
+		const answer = new AssistantMessageComponent(prose, false);
+		answer.updateContent(prose, false);
+		shimmerParent.addChild(answer);
+		const closed = shimmerParent.render(100);
+		assert.ok(new Set(labelColors(closed, "testing")).size <= 1, `prose must close the chunk and stop the sweep: ${JSON.stringify(labelColors(closed, "testing"))}`);
+		fakeNow += 250;
+		assert.equal(closed.join("\n"), shimmerParent.render(100).join("\n"), "a closed chunk must not animate");
 	} finally {
 		Date.now = realNow;
 	}

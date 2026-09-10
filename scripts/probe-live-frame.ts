@@ -1,6 +1,8 @@
 /**
- * Does a grouped, still-running tool arm the fast (80ms) repaint that drives the
- * label shimmer? Renders the real transcript path with setTimeout captured.
+ * Does a grouped, still-live chunk arm the fast (80ms) repaint that drives the label
+ * shimmer and the ticking total? Covers both a call that is in flight and a chunk whose
+ * calls have all settled but which the agent is still working on (the case that used to
+ * stop the animation dead). Renders the real transcript path with setTimeout captured.
  *
  *   bun scripts/probe-live-frame.ts
  */
@@ -57,5 +59,12 @@ const streaming = new ToolExecutionComponent("bash", "stream", { command: "bun t
 streaming.markExecutionStarted();
 streaming.updateResult({ content: [{ type: "text", text: "1 fail\n11 pass" }], isError: false } as any, true);
 render(streaming, "pending bash (partial output)");
+
+// (c) every call settled, chunk still live: the agent is thinking or composing the next
+// call, so the header must keep repainting itself with no tool in flight.
+const settled = new ToolExecutionComponent("read", "settled", { path: "src/y.ts", activity: "implementing" }, {}, readDef as any, ui as any, process.cwd());
+settled.markExecutionStarted();
+settled.updateResult({ content: [{ type: "text", text: "out" }], isError: false } as any, false);
+render(settled, "settled call (live chunk)");
 
 (globalThis as any).setTimeout = realSetTimeout;
