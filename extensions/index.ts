@@ -855,9 +855,22 @@ function toolKeepsDisplayInActivityTree(tool: any): boolean {
 	return name === "edit" || name === "write";
 }
 
+const ACTIVITY_TREE_CHILD_CHROME_WIDTH = 5;
+const TOOL_SHELL_HORIZONTAL_CHROME_WIDTH = 2;
+
 function toolActivityLines(tool: any, width: number): string[] {
-	const childWidth = Math.max(1, width - 5);
+	const childWidth = Math.max(1, width - ACTIVITY_TREE_CHILD_CHROME_WIDTH);
 	const status = getToolStatusForGroup(tool);
+	if (toolKeepsDisplayInActivityTree(tool) && tool?.rendererState && typeof tool.rendererState === "object") {
+		// Tool renderers normally learn their width only after returning a component.
+		// In an activity group that first pass used the whole terminal, so a split diff
+		// was built before the outer tree prefix and the tool shell padding were known.
+		// Seed the exact component budget before renderCall/renderResult chooses a mode.
+		tool.rendererState._diffComponentWidth = Math.max(
+			1,
+			childWidth - TOOL_SHELL_HORIZONTAL_CHROME_WIDTH,
+		);
+	}
 	// Edits and writes are the model's proposed file changes, not incidental output:
 	// keep their preview below the call after settlement. The group's continuation
 	// rail is then drawn beside every preview row until the next item in the cluster.

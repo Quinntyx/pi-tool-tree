@@ -126,6 +126,10 @@ assert.ok(nativeRenders > 0);
 	}
 	const narrowPending = await waitForPendingMode(100, "unified");
 	assert.ok(narrowPending.includes("• unified"), `narrow pending writes use a unified diff: ${JSON.stringify(narrowPending)}`);
+	const indentedBoundaryNarrow = await waitForPendingMode(129, "unified");
+	assert.ok(indentedBoundaryNarrow.includes("• unified"), "auto mode subtracts the activity rail and tool-shell indentation before its width check");
+	const indentedBoundaryWide = await waitForPendingMode(130, "split");
+	assert.ok(indentedBoundaryWide.includes("• split"), "auto mode switches only when the indented diff itself has 120 columns");
 	const widePending = await waitForPendingMode(140, "split");
 	assert.ok(widePending.includes("• split"), `wide pending writes use a split diff: ${JSON.stringify(widePending)}`);
 	for (const width of [20, 48, 80, 100, 140]) {
