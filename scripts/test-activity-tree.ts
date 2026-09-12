@@ -133,6 +133,52 @@ assert.ok(nativeRenders > 0);
 			assert.ok(visibleWidth(line) <= width, `pending write overflow at ${width}: ${visibleWidth(line)}`);
 		}
 	}
+
+	const editArgs = {
+		path: "extensions/diff-mode.ts",
+		activity: "implementing",
+		edits: [
+			{ oldText: 'export type DiffViewMode = "auto" | "split" | "unified";', newText: 'export type DiffViewMode = "auto-wide" | "split" | "unified";' },
+			{ oldText: "const DEFAULT_SPLIT_MIN_WIDTH = 120;", newText: "const DEFAULT_SPLIT_MIN_WIDTH = 132;" },
+			{ oldText: "export function getDiffSplitMinWidth(config: DiffModeConfig): number {", newText: "export function resolveDiffSplitMinWidth(config: DiffModeConfig): number {" },
+			{ oldText: " * Match pi-tool-display's responsive diff mode: auto uses side-by-side columns", newText: " * Mirror pi-tool-display's responsive diff mode: auto uses side-by-side columns" },
+		],
+	};
+	const editCluster = new Container();
+	const pendingEdit = new ToolExecutionComponent("edit", "four-hunk-edit", editArgs, {}, tools.get("edit") as any, ui as any, process.cwd());
+	pendingEdit.updateArgs(editArgs);
+	pendingEdit.setArgsComplete();
+	pendingEdit.markExecutionStarted();
+	pendingEdit.updateResult({ content: [{ type: "text", text: "" }], isError: false } as any, true);
+	editCluster.addChild(pendingEdit);
+	editCluster.addChild(tool("after-four-hunk-edit", "print('verify hunks')", true));
+	let fourHunkPreview = "";
+	for (let attempt = 0; attempt < 80; attempt++) {
+		fourHunkPreview = plain(editCluster.render(100));
+		if (fourHunkPreview.includes("4 hunks")) break;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	assert.ok(fourHunkPreview.includes("4 hunks"), `all edit hunks must render instead of a summary: ${JSON.stringify(fourHunkPreview)}`);
+	for (const changedText of ["auto-wide", "132", "resolveDiffSplitMinWidth", "Mirror pi-tool-display"]) {
+		assert.ok(fourHunkPreview.includes(changedText), `the full four-hunk preview must include ${changedText}: ${JSON.stringify(fourHunkPreview)}`);
+	}
+	assert.ok(fourHunkPreview.includes("MIN_SPLIT_COLUMN_WIDTH"), "the projected edit diff includes unchanged context around its hunks");
+	for (const line of fourHunkPreview.split("\n").filter((line) => /auto-wide|resolveDiffSplitMinWidth|Mirror pi-tool-display/.test(line))) {
+		assert.match(line, /^ │\s+/, `the edit preview rail must reach the next clustered call: ${JSON.stringify(line)}`);
+	}
+
+	pendingEdit.updateResult({
+		content: [{ type: "text", text: "Applied 4 edits" }],
+		details: { _type: "multiEditInfo", editCount: 4, diffLineCount: 16, hunks: 4, totalAdded: 7, totalRemoved: 4 },
+		isError: false,
+	} as any, false);
+	let completedFourHunkPreview = "";
+	for (let attempt = 0; attempt < 80; attempt++) {
+		completedFourHunkPreview = plain(editCluster.render(100));
+		if (completedFourHunkPreview.includes("Edit 4/4")) break;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	assert.ok(completedFourHunkPreview.includes("Edit 4/4"), `settled multi-edits keep every diff block instead of collapsing to stats: ${JSON.stringify(completedFourHunkPreview)}`);
 }
 
 const thought = {
