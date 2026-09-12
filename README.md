@@ -66,6 +66,8 @@ Set in `.pi/settings.json` or `~/.pi/settings.json`:
   "bashCommandPreviewLines": 8,
   "liveToolPreview": true,
   "liveToolPreviewLines": 5,
+  "diffViewMode": "auto",
+  "diffSplitMinWidth": 120,
   "diffCollapsedLines": 24,
   "themeAdaptive": true,
   "diffTheme": "github-dark"
@@ -223,6 +225,8 @@ immediately and to plugin tools the next time they register.
 | `bashCommandPreviewLines` | `8` | Verbatim script lines shown while bash runs or after failure; `0` disables them |
 | `liveToolPreview` | `true` | Show a small live output preview while tools are still running |
 | `liveToolPreviewLines` | `5` | Lines shown in the collapsed live preview |
+| `diffViewMode` | `auto` | `auto` uses split left/right previews at `diffSplitMinWidth` and unified previews below it; `split` and `unified` force a layout when physically possible |
+| `diffSplitMinWidth` | `120` | Minimum available width where `auto` switches to a split preview |
 | `diffCollapsedLines` | `24` | Diff lines before collapsing |
 
 ## Notes

@@ -30,12 +30,13 @@
   "files": [
     "extensions/index.ts",
     "extensions/bash-command.ts",
+    "extensions/diff-mode.ts",
     "config/config.example.json",
     "README.md",
     "CHANGELOG.md"
   ],
   "scripts": {
-    "test": "node --experimental-strip-types --test scripts/bash-command.test.ts",
+    "test": "node --experimental-strip-types --test scripts/bash-command.test.ts scripts/diff-mode.test.ts",
     "typecheck": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck extensions/index.ts",
     "pack:dry-run": "npm pack --dry-run",
     "publish:dry-run": "npm publish --dry-run",

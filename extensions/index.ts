@@ -53,6 +53,7 @@ import {
 	formatBashDuration,
 	getLastBashOutputLine,
 } from "./bash-command";
+import { resolveDiffPresentationMode, type DiffViewMode } from "./diff-mode";
 
 const RESET = "\x1b[0m";
 const TRANSPARENT_BG = "\x1b[49m";
@@ -111,6 +112,10 @@ interface SettingsFile {
 	liveToolPreviewLines?: number;
 	showTruncationHints?: boolean;
 	diffCollapsedLines?: number;
+	/** Diff layout: auto selects split at diffSplitMinWidth, otherwise unified. */
+	diffViewMode?: DiffViewMode;
+	/** Minimum available columns for auto mode to use a split diff. Defaults to 120. */
+	diffSplitMinWidth?: number;
 	diffTheme?: string;
 	diffColors?: Record<string, string>;
 	/**
@@ -3964,10 +3969,6 @@ let DIFF_THEME: BundledTheme = (process.env.DIFF_THEME as BundledTheme | undefin
 let _diffOnLightBg = false;
 let codeToAnsiLoader: Promise<any> | null = null;
 
-const SPLIT_MIN_WIDTH = 150;
-const SPLIT_MIN_CODE_WIDTH = 60;
-const SPLIT_MAX_WRAP_RATIO = 0.2;
-const SPLIT_MAX_WRAP_LINES = 8;
 const MAX_TERM_WIDTH = 210;
 const DEFAULT_TERM_WIDTH = 200;
 const MAX_PREVIEW_LINES = 60;
@@ -4883,27 +4884,16 @@ function maxLineNumber(lines: DiffLine[]): number {
 	return max;
 }
 
-function shouldUseSplit(diff: ParsedDiff, tw: number, maxRows = MAX_PREVIEW_LINES): boolean {
+function shouldUseSplit(diff: ParsedDiff, width: number, _maxRows = MAX_PREVIEW_LINES): boolean {
 	if (!diff.lines.length) return false;
-	if (tw < SPLIT_MIN_WIDTH) return false;
-	const nw = Math.max(2, String(maxLineNumber(diff.lines)).length);
-	const half = Math.floor((tw - 1) / 2);
-	const gw = nw + 5;
-	const cw = Math.max(12, half - gw);
-	if (cw < SPLIT_MIN_CODE_WIDTH) return false;
-	const vis = diff.lines.slice(0, maxRows);
-	let contentLines = 0;
-	let wrapCandidates = 0;
-	for (const line of vis) {
-		if (line.type === "sep") continue;
-		contentLines++;
-		if (tabs(line.content).length > cw) wrapCandidates++;
-	}
-	if (contentLines === 0) return true;
-	const wrapRatio = wrapCandidates / contentLines;
-	if (wrapCandidates >= SPLIT_MAX_WRAP_LINES) return false;
-	if (wrapRatio >= SPLIT_MAX_WRAP_RATIO) return false;
-	return true;
+	const settings = readSettings();
+	return resolveDiffPresentationMode(
+		{
+			diffViewMode: settings.diffViewMode,
+			diffSplitMinWidth: settings.diffSplitMinWidth,
+		},
+		width,
+	) === "split";
 }
 
 const EXT_LANG: Record<string, BundledLanguage> = {
