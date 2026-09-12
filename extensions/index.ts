@@ -60,7 +60,7 @@ const TRANSPARENT_BG = "\x1b[49m";
 const TRANSPARENT_RESET = `${RESET}${TRANSPARENT_BG}`;
 
 // Code box borders and thinking/thought text: branch color + OUTLINE_CHROME_BRIGHTEN.
-// Branch ├└│ stay at `currentToolBranchAnsi` (see syncOutlineChromeFromBranch).
+// Branch ├╰│ stay at `currentToolBranchAnsi` (see syncOutlineChromeFromBranch).
 let BORDER_COLOR = "\x1b[38;5;238m";
 let CODE_BLOCK_LANG_FG = "\x1b[38;2;95;95;95m";
 const CHROME_ITALIC = "\x1b[3m";
@@ -132,7 +132,7 @@ interface SettingsFile {
 	 * renders expanded, like stock pi.
 	 */
 	thinkingMode?: "live" | "full";
-	/** Gray level 0–255 for ├ └ │ when branch color mode is `fixed`. */
+	/** Gray level 0–255 for ├ ╰ │ when branch color mode is `fixed`. */
 	toolBranchRgbGray?: number;
 	/** `fixed` (default): rgb gray 72, theme-independent. `theme`: dim → muted → borderMuted. */
 	toolBranchColorMode?: "theme" | "fixed";
@@ -478,7 +478,7 @@ function isTerminalImageLine(line: string): boolean {
 }
 
 function normalizeLeadingCheckGlyph(line: string): string {
-	return line.replace(/^((?:\x1b\[[0-9;]*m|[ \t]|[├└│─])*)[✔]((?:\x1b\[[0-9;]*m)*)(?=\s)/, "$1✓$2");
+	return line.replace(/^((?:\x1b\[[0-9;]*m|[ \t]|[├└╰│─])*)[✔]((?:\x1b\[[0-9;]*m)*)(?=\s)/, "$1✓$2");
 }
 
 function stripOuterBackgroundAnsi(line: string): string {
@@ -693,7 +693,7 @@ function stripLeadingToolStatus(line: string): string {
 	// Include Agent breathe glyphs (·) and the blank off-phase (space) so the title
 	// never keeps a leftover marker that shifts when size changes.
 	return line.replace(
-		/^((?:\x1b\[[0-9;]*m|[ \t]|[├└│─])*)(?:\x1b\[[0-9;]*m)*(?:[●○✗■⬤•·✓✔!\u2800-\u28FF]| )(?:\x1b\[[0-9;]*m)*\s+/,
+		/^((?:\x1b\[[0-9;]*m|[ \t]|[├└╰│─])*)(?:\x1b\[[0-9;]*m)*(?:[●○✗■⬤•·✓✔!\u2800-\u28FF]| )(?:\x1b\[[0-9;]*m)*\s+/,
 		"$1",
 	);
 }
@@ -3243,7 +3243,7 @@ function toolStatusDot(ctx: any, theme: Theme): string {
 
 function branchIndent(text: string, continued = false, theme?: Theme): string {
 	const rule = currentToolBranchAnsi(theme);
-	// Align under bare `├ `/`└ ` (│ + one space, or two spaces when closed).
+	// Align under bare `├ `/`╰ ` (│ + one space, or two spaces when closed).
 	const prefix = continued ? `${rule}│${TRANSPARENT_RESET} ` : "  ";
 	return `${prefix}${WRAP_MARK}${text}`;
 }
@@ -3251,7 +3251,7 @@ function branchIndent(text: string, continued = false, theme?: Theme): string {
 function branchLead(text: string, continued = false, theme?: Theme): string {
 	const rule = currentToolBranchAnsi(theme);
 	// Bare tee/corner only — no horizontal ─ arm.
-	return `${rule}${continued ? "├" : "└"}${TRANSPARENT_RESET} ${WRAP_MARK}${text}`;
+	return `${rule}${continued ? "├" : "╰"}${TRANSPARENT_RESET} ${WRAP_MARK}${text}`;
 }
 
 function withBranch(content: string, theme: Theme, _isError = false, continued = false): string {
@@ -3616,8 +3616,8 @@ function padToWidth(line: string, width: number): string {
 
 function markedContinuationPrefix(prefix: string): string {
 	const plain = stripAnsi(prefix);
-	// Match bare leads (`├ `/`└ `/`│ `) and legacy armed forms (`├─ `/`└─ `/`│  `).
-	const branchMatch = /^(\s*)(│  |│ |├─ |└─ |├ |└ )/.exec(plain);
+	// Match rounded/current leads plus legacy square/armed forms.
+	const branchMatch = /^(\s*)(│  |│ |├─ |└─ |╰─ |├ |└ |╰ )/.exec(plain);
 	if (branchMatch) {
 		const indent = branchMatch[1];
 		// Keep the same structure width as the lead glyph so wraps stay aligned.
@@ -4072,7 +4072,7 @@ let FG_DEL = "\x1b[38;2;200;100;100m";
 let FG_DIM = "\x1b[38;2;80;80;80m";
 let FG_LNUM = "\x1b[38;2;100;100;100m";
 let FG_RULE = "\x1b[38;2;50;50;50m";
-// Tool branch connectors (├ └ │). Default fixed gray 72 — independent of pi theme.
+// Tool branch connectors (├ ╰ │). Default fixed gray 72 — independent of pi theme.
 const DEFAULT_TOOL_BRANCH_GRAY = 72;
 
 function toolBranchRgbAnsi(gray: number): string {
@@ -4149,7 +4149,7 @@ function resolveThemeChromeFg(theme: any): string | null {
 	return raw ? attenuateChromeAnsi(raw, theme) : null;
 }
 
-/** Resolve ├ └ │ color from settings + theme on every use (not a stale global). */
+/** Resolve ├ ╰ │ color from settings + theme on every use (not a stale global). */
 let _toolBranchThemeHint: any;
 
 function currentToolBranchAnsi(theme?: any): string {
@@ -4190,10 +4190,10 @@ function applyToolBranchColor(theme?: any): void {
 	syncOutlineChromeFromBranch(theme);
 }
 
-/** Strip baked ├/└/│ prefixes (short or long arm) so branch color can be reapplied. */
+/** Strip baked ├/╰/│ prefixes (plus legacy └) so branch color can be reapplied. */
 function stripBranchMarkupLine(line: string): string {
 	let plain = stripAnsi(line);
-	plain = plain.replace(/^\s*[├└]─?\s*/, "");
+	plain = plain.replace(/^\s*[├└╰]─?\s*/, "");
 	plain = plain.replace(/^\s*│\s{0,2}/, "");
 	return plain;
 }
@@ -4586,7 +4586,7 @@ function applyThemePaletteIfNeeded(theme: any): void {
 	const muted = safeFgAnsi(theme, "muted");
 	const dim = safeFgAnsi(theme, "dim") ?? muted;
 
-	// Code fences, thinking/thought text, and ├ └ │ all follow branch chrome.
+	// Code fences, thinking/thought text, and ├ ╰ │ all follow branch chrome.
 	applyToolBranchColor(theme);
 
 	const chromeFg = BORDER_COLOR;
@@ -4893,7 +4893,9 @@ function lnum(n: number | null, width: number, fg = FG_LNUM): string {
 }
 
 function stripes(width: number): string {
-	return BG_BASE + FG_STRIPE + "╱".repeat(width) + D_RST;
+	// Empty split cells use the same chrome color as borders/dividers so the
+	// hatch cannot drift darker or lighter after a theme/config rebind.
+	return BG_BASE + FG_RULE + "╱".repeat(width) + D_RST;
 }
 
 function renderDiffStatBar(added: number, removed: number, width = termW()): string {
@@ -5348,7 +5350,7 @@ async function renderSplit(
 		side: "left" | "right",
 	): HalfResult {
 		if (!line) {
-			const gPat = FG_STRIPE + "╱".repeat(nw + 2) + D_RST;
+			const gPat = FG_RULE + "╱".repeat(nw + 2) + D_RST;
 			const gutter = ` ${gPat}${FG_RULE}│${D_RST} `;
 			return { gutter, contGutter: gutter, bodyRows: [stripes(cw)] };
 		}
@@ -7043,7 +7045,7 @@ export default function (pi: ExtensionAPI) {
 							: m === "pending" ? "Per-call pending light: circle-breathe (default), braille spinner, or blinking dot (group headers stay steady)"
 							: m === "thinking" ? "Thinking display: live (default) or full"
 							: m === "detail" ? "Toggle Ctrl+Shift+O extra-detail mode"
-							: m === "branch" ? "├ └ │ gray (0-255), theme, fixed, or reset"
+							: m === "branch" ? "├ ╰ │ gray (0-255), theme, fixed, or reset"
 							: m === "status" ? "Show tool UI settings"
 							: m === "outlines" ? "Horizontal rules around each tool (default)"
 							: m === "transparent" ? "No borders or backgrounds"

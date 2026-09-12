@@ -90,9 +90,11 @@ assert.ok(nativeRenders > 0);
 	for (const previewLine of mutationLines.filter((line) => line.includes("preview line"))) {
 		assert.match(previewLine, /^ │\s+/, `the cluster rail must continue beside mutation previews: ${JSON.stringify(previewLine)}`);
 	}
-
 	const pendingCluster = new Container();
-	const pendingWriteContent = readFileSync("package.json", "utf8").replace('"name": "pi-claude-code-ui"', '"name": "pi-claude-code-ui-preview"');
+	const pendingWriteContent = readFileSync("package.json", "utf8").replace(
+		'"name": "pi-claude-code-ui"',
+		'"name": "pi-claude-code-ui-preview",\n  "previewOnly": true,\n  "previewLayout": "split"',
+	);
 	const pendingWriteArgs = { path: "package.json", content: pendingWriteContent, activity: "implementing" };
 	const pendingWrite = new ToolExecutionComponent(
 		"write",
@@ -132,6 +134,15 @@ assert.ok(nativeRenders > 0);
 	assert.ok(indentedBoundaryWide.includes("• split"), "auto mode switches only when the indented diff itself has 120 columns");
 	const widePending = await waitForPendingMode(140, "split");
 	assert.ok(widePending.includes("• split"), `wide pending writes use a split diff: ${JSON.stringify(widePending)}`);
+	const coloredWidePending = pendingCluster.render(140);
+	const hatchLine = coloredWidePending.find((line) => line.includes("╱"));
+	const borderLine = coloredWidePending.find((line) => line.includes("─"));
+	assert.ok(hatchLine && borderLine, "split fixture must contain both hatch and border chrome");
+	const fgBefore = (line: string, glyph: string) => {
+		const prefix = line.slice(0, line.indexOf(glyph));
+		return prefix.match(/\x1b\[38;(?:2;\d+;\d+;\d+|5;\d+)m/g)?.at(-1);
+	};
+	assert.equal(fgBefore(hatchLine!, "╱"), fgBefore(borderLine!, "─"), "split hatching and border rules use the same gray");
 	for (const width of [20, 48, 80, 100, 140]) {
 		for (const line of pendingCluster.render(width)) {
 			assert.ok(visibleWidth(line) <= width, `pending write overflow at ${width}: ${visibleWidth(line)}`);
