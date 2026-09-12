@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import { readFile as readFileAsync } from "node:fs/promises";
 import { basename, dirname, extname, relative, resolve } from "node:path";
 
@@ -2993,6 +2993,8 @@ function fileExistsForTool(cwd: string, filePath: string): boolean {
 }
 
 const WRITE_EXISTED_BEFORE = new Map<string, boolean>();
+const WRITE_CONTENT_BEFORE = new Map<string, string | undefined>();
+const MAX_PENDING_DIFF_READ_BYTES = 1_000_000;
 
 interface RtkRewriteRecord {
 	original: string;
@@ -3166,6 +3168,52 @@ function getWriteWasNewFile(ctx: any, cwd: string, filePath: string, reveal = sh
 	const wasNew = existedBefore === undefined ? !fileExistsForTool(cwd, filePath) : !existedBefore;
 	if (ctx?.state) ctx.state._writeWasNewFile = wasNew;
 	return wasNew;
+}
+
+interface PendingWriteBaseline {
+	existed: boolean;
+	content?: string;
+	notice?: string;
+}
+
+function getPendingWriteBaseline(ctx: any, cwd: string, filePath: string): PendingWriteBaseline {
+	const toolCallId = typeof ctx?.toolCallId === "string" ? ctx.toolCallId : undefined;
+	if (toolCallId && WRITE_EXISTED_BEFORE.has(toolCallId)) {
+		return {
+			existed: WRITE_EXISTED_BEFORE.get(toolCallId) === true,
+			content: WRITE_CONTENT_BEFORE.get(toolCallId),
+		};
+	}
+	const key = `${cwd}\u0000${filePath}`;
+	if (ctx?.state?._pendingWriteBaselineKey === key && ctx.state._pendingWriteBaseline) {
+		return ctx.state._pendingWriteBaseline as PendingWriteBaseline;
+	}
+	let baseline: PendingWriteBaseline;
+	try {
+		const fullPath = resolve(cwd, filePath);
+		if (!existsSync(fullPath)) {
+			baseline = { existed: false };
+		} else {
+			const stats = statSync(fullPath);
+			if (!stats.isFile()) {
+				baseline = { existed: true, notice: "Preview unavailable: target is not a regular file." };
+			} else if (stats.size > MAX_PENDING_DIFF_READ_BYTES) {
+				baseline = { existed: true, notice: `Preview unavailable: existing file exceeds ${MAX_PENDING_DIFF_READ_BYTES} bytes.` };
+			} else {
+				baseline = { existed: true, content: readFileSync(fullPath, "utf8") };
+			}
+		}
+	} catch (error) {
+		baseline = {
+			existed: true,
+			notice: `Preview unavailable: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
+	if (ctx?.state) {
+		ctx.state._pendingWriteBaselineKey = key;
+		ctx.state._pendingWriteBaseline = baseline;
+	}
+	return baseline;
 }
 
 function toolStatusDot(ctx: any, theme: Theme): string {
@@ -5527,6 +5575,39 @@ async function computeLocalizedEditDiffs(filePath: string, operations: Array<{ o
 	}
 }
 
+function renderPendingWritePreviewBody(
+	ctx: any,
+	key: string,
+	theme: Theme,
+	filePath: string,
+	previousContent: string,
+	nextContent: string,
+	existedBefore: boolean,
+): void {
+	const diff = getCachedParsedDiff(ctx, `pending-write-diff:${key}`, previousContent, nextContent);
+	const hunks = countDiffHunks(diff);
+	const diffWidth = contextDiffWidth(ctx, 3);
+	const previewLines = ctx.expanded ? MAX_RENDER_LINES : diffCollapsedLimit();
+	const mode = existedBefore && shouldUseSplit(diff, diffWidth, previewLines) ? "split" : "unified";
+	const summary = diffSummaryWithMeta(diff.added, diff.removed, hunks, mode);
+	const action = theme.fg("muted", existedBefore ? "pending overwrite" : "pending create");
+	const dc = resolveDiffColors(theme);
+	const render = mode === "split" ? renderSplit : renderUnified;
+	render(diff, lang(filePath), previewLines, dc, diffWidth)
+		.then((rendered) => {
+			if (ctx.state._pendingWritePreviewKey !== key) return;
+			ctx.state._pendingWritePreviewBody = `${action} ${summary}\n${rendered}`;
+			ctx.state._pendingWritePreviewDisplay = indentBranchBlock(withBranch(ctx.state._pendingWritePreviewBody, theme, false, true));
+			safeInvalidate(ctx);
+		})
+		.catch(() => {
+			if (ctx.state._pendingWritePreviewKey !== key) return;
+			ctx.state._pendingWritePreviewBody = `${action} ${summary}`;
+			ctx.state._pendingWritePreviewDisplay = indentBranchBlock(withBranch(ctx.state._pendingWritePreviewBody, theme, false, true));
+			safeInvalidate(ctx);
+		});
+}
+
 function renderEditPreviewBody(
 	ctx: any,
 	key: string,
@@ -7499,6 +7580,7 @@ export default function (pi: ExtensionAPI) {
 			} catch {
 				old = null;
 			}
+			WRITE_CONTENT_BEFORE.set(toolCallId, old ?? undefined);
 			const result = await writeTool.execute(toolCallId, params, signal, onUpdate);
 			const content = params.content ?? "";
 			if (old !== null && old !== content) {
@@ -7522,7 +7604,26 @@ export default function (pi: ExtensionAPI) {
 				return shouldRevealCallArgs(ctx) ? `${base} ${theme.fg("muted", `(${lineCount(args.content ?? "")} lines)`)}` : base;
 			}, revealSummary);
 			const hdr = toolHeader(label, summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme));
-			return makeText(ctx.lastComponent, hdr);
+			const content = typeof args?.content === "string" ? args.content : undefined;
+			if (!(ctx.argsComplete && ctx.isPartial && fp && content !== undefined)) {
+				return makeText(ctx.lastComponent, hdr);
+			}
+			const baseline = getPendingWriteBaseline(ctx, cwd, fp);
+			if (baseline.notice) {
+				const notice = indentBranchBlock(withBranch(theme.fg("warning", baseline.notice), theme, false, true));
+				return makeText(ctx.lastComponent, `${hdr}\n${notice}`);
+			}
+			const diffWidth = contextDiffWidth(ctx, 3);
+			const key = `pending-write:${fp}:${hashText(baseline.content ?? "")}:${hashText(content)}:${diffWidth}:${ctx.expanded ? 1 : 0}`;
+			if (ctx.state._pendingWritePreviewKey !== key) {
+				ctx.state._pendingWritePreviewKey = key;
+				const action = theme.fg("muted", baseline.existed ? "pending overwrite" : "pending create");
+				ctx.state._pendingWritePreviewBody = `${action}\n${theme.fg("muted", "rendering diff…")}`;
+				ctx.state._pendingWritePreviewDisplay = indentBranchBlock(withBranch(ctx.state._pendingWritePreviewBody, theme, false, true));
+				renderPendingWritePreviewBody(ctx, key, theme, fp, baseline.content ?? "", content, baseline.existed);
+			}
+			const body = ctx.state._pendingWritePreviewDisplay as string | undefined;
+			return makeResponsiveDiffText(ctx, ctx.lastComponent, body ? `${hdr}\n${body}` : hdr);
 		},
 		renderResult(result, { expanded, isPartial }, theme, ctx) {
 			if (isPartial) {
@@ -7530,7 +7631,10 @@ export default function (pi: ExtensionAPI) {
 			}
 			clearBlinkTimer(ctx);
 			setToolStatus(ctx, ctx.isError ? "error" : "success");
-			if (typeof ctx?.toolCallId === "string") WRITE_EXISTED_BEFORE.delete(ctx.toolCallId);
+			if (typeof ctx?.toolCallId === "string") {
+				WRITE_EXISTED_BEFORE.delete(ctx.toolCallId);
+				WRITE_CONTENT_BEFORE.delete(ctx.toolCallId);
+			}
 			if (ctx.isError) {
 				const e =
 					result.content
@@ -7828,6 +7932,7 @@ export default function (pi: ExtensionAPI) {
 		clearAllBashDurationContexts();
 		clearRtkRewriteState();
 		WRITE_EXISTED_BEFORE.clear();
+		WRITE_CONTENT_BEFORE.clear();
 		clearHighlightCache();
 		invalidateThemePaletteCache();
 		bumpToolBranchVisualEpoch();

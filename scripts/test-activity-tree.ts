@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { AssistantMessageComponent, ToolExecutionComponent, UserMessageComponent } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text, visibleWidth } from "@earendil-works/pi-tui";
 import { initTheme, theme } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
@@ -88,6 +89,49 @@ assert.ok(nativeRenders > 0);
 	assert.equal(mutationLines.filter((line) => line.includes("preview line one")).length, 2, "settled edit and write previews stay visible");
 	for (const previewLine of mutationLines.filter((line) => line.includes("preview line"))) {
 		assert.match(previewLine, /^ │\s+/, `the cluster rail must continue beside mutation previews: ${JSON.stringify(previewLine)}`);
+	}
+
+	const pendingCluster = new Container();
+	const pendingWriteContent = readFileSync("package.json", "utf8").replace('"name": "pi-claude-code-ui"', '"name": "pi-claude-code-ui-preview"');
+	const pendingWriteArgs = { path: "package.json", content: pendingWriteContent, activity: "implementing" };
+	const pendingWrite = new ToolExecutionComponent(
+		"write",
+		"pending-write-preview",
+		pendingWriteArgs,
+		{},
+		tools.get("write") as any,
+		ui as any,
+		process.cwd(),
+	);
+	pendingWrite.updateArgs(pendingWriteArgs);
+	pendingWrite.setArgsComplete();
+	pendingWrite.markExecutionStarted();
+	pendingWrite.updateResult({ content: [{ type: "text", text: "" }], isError: false } as any, true);
+	pendingCluster.addChild(pendingWrite);
+	pendingCluster.addChild(tool("after-pending-write", "print('verify pending')", true));
+	const initialPendingLines = plain(pendingCluster.render(100)).split("\n");
+	assert.ok(initialPendingLines.some((line) => line.includes("pending overwrite")), `write shows an opencode-style diff preview while it is running: ${JSON.stringify(initialPendingLines)}`);
+	for (const previewLine of initialPendingLines.filter((line) => line.includes("pending overwrite") || line.includes("rendering diff"))) {
+		assert.match(previewLine, /^ │\s+/, `the pending write rail must reach the next clustered call: ${JSON.stringify(previewLine)}`);
+	}
+
+	async function waitForPendingMode(width: number, mode: "split" | "unified"): Promise<string> {
+		let rendered = "";
+		for (let attempt = 0; attempt < 50; attempt++) {
+			rendered = plain(pendingCluster.render(width));
+			if (rendered.includes(`• ${mode}`)) return rendered;
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		return rendered;
+	}
+	const narrowPending = await waitForPendingMode(100, "unified");
+	assert.ok(narrowPending.includes("• unified"), `narrow pending writes use a unified diff: ${JSON.stringify(narrowPending)}`);
+	const widePending = await waitForPendingMode(140, "split");
+	assert.ok(widePending.includes("• split"), `wide pending writes use a split diff: ${JSON.stringify(widePending)}`);
+	for (const width of [20, 48, 80, 100, 140]) {
+		for (const line of pendingCluster.render(width)) {
+			assert.ok(visibleWidth(line) <= width, `pending write overflow at ${width}: ${visibleWidth(line)}`);
+		}
 	}
 }
 

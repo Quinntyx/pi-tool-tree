@@ -23,7 +23,7 @@ Claude Code inspired tool rendering for Pi — Shiki-powered diffs, status dots,
 - **Compact built-in tool rendering** for `read`, `bash`, `grep`, `find`, `ls`, `edit`, and `write`
 - **Claude-style OpenAI tool rendering** for `apply_patch` plus common Pi/OpenAI-style tools like `webfetch`, `web_search`, `fetch_content`, task tools, and context tools
 - **`apply_patch` diff previews** that render parsed file patches in the call phase, similar to `edit`/`write`
-- **Adaptive edit/write diffs** with split or unified layouts, syntax highlighting, and inline word-level emphasis
+- **Always-visible edit/write previews** below each mutation row, including pending write previews, with automatic split left/right layout when space allows and unified layout on narrow terminals
 - **Diff stat bar** with colored add/remove summary and hunk metadata
 - **Progressive collapsed diff hints** that shorten on narrow terminals
 - **Live-only thinking** (default) — thinking streams inside its tree child; finished thinking collapses to a one-line `Thought for Xs` row (`/cc-tools thinking full` restores always-expanded, `Ctrl+T` still expands thinking)

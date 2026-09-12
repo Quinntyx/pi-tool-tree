@@ -68,6 +68,7 @@ function startTool(name: string, args: any, activity?: string) {
 	advance(120);
 	handlers.get("tool_execution_start")?.forEach((h) => h({ toolCallId: id, toolName: name, args: payload }, ui));
 	const component = new ToolExecutionComponent(name, id, payload, {}, tools.get(name), ui, process.cwd());
+	component.setArgsComplete();
 	component.markExecutionStarted();
 	return { id, component };
 }
