@@ -62,6 +62,35 @@ assert.ok(plain(parent.render(100)).includes("completed output"), "Ctrl+O must r
 second.setExpanded(false);
 assert.ok(nativeRenders > 0);
 
+// File mutations keep their model-authored preview visible after settlement. When a
+// later call follows in the same cluster, the outer rail must continue beside every
+// preview row rather than stopping at the edit/write heading.
+{
+	const mutationDefinition = (name: "edit" | "write") => ({
+		name,
+		label: name,
+		description: `${name} fixture`,
+		parameters: {},
+		renderCall: () => new Text(`${name} src/example.ts`, 0, 0),
+		renderResult: () => new Text("preview line one\npreview line two", 0, 0),
+	});
+	const mutation = (name: "edit" | "write", id: string) => {
+		const component = new ToolExecutionComponent(name, id, { path: "src/example.ts", activity: "implementing" }, {}, mutationDefinition(name) as any, ui as any, process.cwd());
+		component.markExecutionStarted();
+		component.updateResult({ content: [{ type: "text", text: "done" }], isError: false } as any, false);
+		return component;
+	};
+	const cluster = new Container();
+	cluster.addChild(mutation("edit", "persistent-edit"));
+	cluster.addChild(mutation("write", "persistent-write"));
+	cluster.addChild(tool("after-mutations", "print('verify')", true));
+	const mutationLines = plain(cluster.render(100)).split("\n");
+	assert.equal(mutationLines.filter((line) => line.includes("preview line one")).length, 2, "settled edit and write previews stay visible");
+	for (const previewLine of mutationLines.filter((line) => line.includes("preview line"))) {
+		assert.match(previewLine, /^ │\s+/, `the cluster rail must continue beside mutation previews: ${JSON.stringify(previewLine)}`);
+	}
+}
+
 const thought = {
 	role: "assistant", content: [{ type: "thinking", thinking: "Reasoning about 界 and 👩‍💻" }], stopReason: "pending",
 	_piClaudeStyleThinkingActive: true,

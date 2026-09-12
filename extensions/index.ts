@@ -850,10 +850,20 @@ function assistantActivityRows(component: any, width: number): ActivityTreeRow[]
 	return rows;
 }
 
+function toolKeepsDisplayInActivityTree(tool: any): boolean {
+	const name = getToolName(tool);
+	return name === "edit" || name === "write";
+}
+
 function toolActivityLines(tool: any, width: number): string[] {
 	const childWidth = Math.max(1, width - 5);
 	const status = getToolStatusForGroup(tool);
-	const showDetails = tool.expanded === true || (tool.isPartial === true && tool.executionStarted === true);
+	// Edits and writes are the model's proposed file changes, not incidental output:
+	// keep their preview below the call after settlement. The group's continuation
+	// rail is then drawn beside every preview row until the next item in the cluster.
+	const showDetails = toolKeepsDisplayInActivityTree(tool)
+		|| tool.expanded === true
+		|| (tool.isPartial === true && tool.executionStarted === true);
 	// Rendering the actual tool component preserves native partial-result animations.
 	// Never memoize an active component: its animation can change without new text.
 	let lines = showDetails ? stripToolChrome(tool.render(childWidth)) : [getCompactToolLine(tool, childWidth)];
