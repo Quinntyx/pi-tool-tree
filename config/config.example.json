@@ -19,7 +19,7 @@
   "liveToolPreview": true,
   "liveToolPreviewLines": 5,
   "diffViewMode": "auto",
-  "diffSplitMinWidth": 120,
+  "diffSplitMinWidth": 132,
   "diffCollapsedLines": 24,
   "showTruncationHints": false,
   "themeAdaptive": true,

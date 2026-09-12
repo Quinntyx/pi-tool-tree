@@ -114,7 +114,7 @@ interface SettingsFile {
 	diffCollapsedLines?: number;
 	/** Diff layout: auto selects split at diffSplitMinWidth, otherwise unified. */
 	diffViewMode?: DiffViewMode;
-	/** Minimum available columns for auto mode to use a split diff. Defaults to 120. */
+	/** Minimum available columns for auto mode to use a split diff. Defaults to 132. */
 	diffSplitMinWidth?: number;
 	diffTheme?: string;
 	diffColors?: Record<string, string>;
@@ -684,8 +684,11 @@ function isChromeOnlyLine(line: string): boolean {
 	return plain.length === 0 || /^[─━╭╮╰╯┌┐└┘│├┤┬┴┼\s]+$/.test(plain);
 }
 
-function stripToolChrome(lines: string[]): string[] {
-	return trimRenderedBlankLines(lines).filter((line) => !isChromeOnlyLine(line));
+function stripToolChrome(lines: string[], preserveDiffRules = false): string[] {
+	return trimRenderedBlankLines(lines).filter((line) => {
+		if (!isChromeOnlyLine(line)) return true;
+		return preserveDiffRules && /─{5,}/.test(stripAnsi(line));
+	});
 }
 
 function stripLeadingToolStatus(line: string): string {
@@ -855,7 +858,9 @@ function toolKeepsDisplayInActivityTree(tool: any): boolean {
 	return name === "edit" || name === "write";
 }
 
-const ACTIVITY_TREE_CHILD_CHROME_WIDTH = 5;
+// The outer tree uses ` glyph ` for both first and continuation rows. Keeping
+// both prefixes the same width aligns mutation previews with their tool row.
+const ACTIVITY_TREE_CHILD_CHROME_WIDTH = 3;
 const TOOL_SHELL_HORIZONTAL_CHROME_WIDTH = 2;
 
 function toolActivityLines(tool: any, width: number): string[] {
@@ -879,7 +884,7 @@ function toolActivityLines(tool: any, width: number): string[] {
 		|| (tool.isPartial === true && tool.executionStarted === true);
 	// Rendering the actual tool component preserves native partial-result animations.
 	// Never memoize an active component: its animation can change without new text.
-	let lines = showDetails ? stripToolChrome(tool.render(childWidth)) : [getCompactToolLine(tool, childWidth)];
+	let lines = showDetails ? stripToolChrome(tool.render(childWidth), toolKeepsDisplayInActivityTree(tool)) : [getCompactToolLine(tool, childWidth)];
 	if (lines.length === 0) lines = [getCompactToolLine(tool, childWidth)];
 	lines[0] = `${groupStatusLight(status, { agentBreathe: isAgentFamilyToolName(getToolName(tool)) })} ${removeGroupedToolPrefix(lines[0])}`;
 	return lines;
@@ -1316,7 +1321,7 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 			const last = index === items.length - 1;
 			const glyph = last ? "╰" : "├";
 			const prefix = `${margin}${connector}${glyph}${TRANSPARENT_RESET} `;
-			const continuation = `${margin}${connector}${last ? " " : "│"}${TRANSPARENT_RESET}   `;
+			const continuation = `${margin}${connector}${last ? " " : "│"}${TRANSPARENT_RESET} `;
 			item.lines.forEach((line, j) => {
 				// Image protocol payloads must not be modified or truncated as text.
 				output.push(isTerminalImageLine(line) ? line : clampLineWidth(`${j === 0 ? prefix : continuation}${line}`, width));
@@ -3658,6 +3663,7 @@ class ToolText extends Text {
 	private pendingObservedWidth?: number;
 	private widthObserver?: (width: number) => void;
 	private widthObserverScheduled = false;
+	private responsiveDiff = false;
 
 	constructor(text = "") {
 		super("", 0, 0);
@@ -3672,6 +3678,7 @@ class ToolText extends Text {
 
 	setWidthObserver(observer?: (width: number) => void): void {
 		this.widthObserver = observer;
+		this.responsiveDiff = Boolean(observer);
 		if (!observer) this.pendingObservedWidth = undefined;
 	}
 
@@ -3697,7 +3704,16 @@ class ToolText extends Text {
 	}
 
 	render(width: number): string[] {
+		// A split diff is an ANSI string laid out for one exact width. On the first
+		// frame after a pane resize, do not wrap that stale two-column grid into a
+		// corrupted intermediate frame. Notify the renderer and show only its stable
+		// tool heading until the width-keyed diff has been rebuilt.
+		const reflowing = this.responsiveDiff && this.observedWidth !== undefined && this.observedWidth !== width;
 		this.observeWidth(width);
+		if (reflowing) {
+			const heading = this.value.split("\n", 1)[0] ?? "";
+			return heading ? [padToWidth(heading, width)] : [];
+		}
 		const branchKey = toolBranchRenderCacheKey();
 		if (
 			this.toolCachedLines
@@ -4601,7 +4617,11 @@ function applyThemePaletteIfNeeded(theme: any): void {
 	// we only touch the ones not explicitly set.
 	if (!_explicitFgFields.has("fgDim") && muted) FG_DIM = muted;
 	if (!_explicitFgFields.has("fgLnum") && muted) FG_LNUM = muted;
-	const ruleChrome = chromeFg ?? borderMuted;
+	// On light themes the brightened outline can become nearly white, while the
+	// old fallback was nearly black. Use the activity-rail gray as a readable
+	// light gray; dark themes keep the brighter outline gray. Hatching and rules
+	// deliberately share this exact ANSI color.
+	const ruleChrome = isLightThemeBackground(theme) ? activityTreeBranchAnsi() : (chromeFg ?? borderMuted);
 	if (!_explicitFgFields.has("fgRule") && ruleChrome) FG_RULE = ruleChrome;
 	if (!_explicitFgFields.has("fgStripe") && ruleChrome) FG_STRIPE = ruleChrome;
 	if (!_explicitFgFields.has("fgSafeMuted") && muted) FG_SAFE_MUTED = muted;
@@ -4742,11 +4762,15 @@ function termW(): number {
 	return Math.max(40, Math.min(raw - 4, MAX_TERM_WIDTH));
 }
 
+// Pi's fullscreen scrollbar owns the final cell. Diff backgrounds must stop one
+// column before it or their add/remove tint paints underneath the thumb.
+const FULLSCREEN_SCROLLBAR_GUTTER = 1;
+
 function branchDiffWidth(componentWidth?: number, chromeWidth = 2): number {
 	const width = typeof componentWidth === "number" && Number.isFinite(componentWidth)
 		? Math.floor(componentWidth)
 		: termW();
-	return Math.max(20, Math.min(width - chromeWidth, MAX_TERM_WIDTH));
+	return Math.max(20, Math.min(width - chromeWidth - FULLSCREEN_SCROLLBAR_GUTTER, MAX_TERM_WIDTH));
 }
 
 function contextDiffWidth(ctx: any, chromeWidth = 2): number {
@@ -4957,16 +4981,32 @@ function maxLineNumber(lines: DiffLine[]): number {
 	return max;
 }
 
-function shouldUseSplit(diff: ParsedDiff, width: number, _maxRows = MAX_PREVIEW_LINES): boolean {
+function shouldUseSplit(diff: ParsedDiff, width: number, maxRows = MAX_PREVIEW_LINES): boolean {
 	if (!diff.lines.length) return false;
 	const settings = readSettings();
-	return resolveDiffPresentationMode(
+	const configured = resolveDiffPresentationMode(
 		{
 			diffViewMode: settings.diffViewMode,
 			diffSplitMinWidth: settings.diffSplitMinWidth,
 		},
 		width,
 	) === "split";
+	if (!configured || settings.diffViewMode === "split") return configured;
+
+	// Auto mode should never choose a nominally-wide split whose half-columns
+	// immediately wrap the visible source. Unified mode has almost twice the code
+	// width and remains legible during common pane splits and resize operations.
+	const half = Math.floor((width - 1) / 2);
+	const numberWidth = Math.max(2, String(maxLineNumber(diff.lines)).length);
+	const codeWidth = Math.max(0, half - (numberWidth + 4));
+	if (codeWidth < 12) return false;
+	let seen = 0;
+	for (const line of diff.lines) {
+		if (line.type === "sep") continue;
+		if (seen++ >= maxRows) break;
+		if (visibleWidth(tabs(line.content)) > codeWidth) return false;
+	}
+	return true;
 }
 
 const EXT_LANG: Record<string, BundledLanguage> = {
@@ -5206,7 +5246,7 @@ async function renderUnified(
 	const vis = diff.lines.slice(0, max);
 	const tw = width;
 	const nw = Math.max(2, String(maxLineNumber(vis)).length);
-	const gw = nw + 5;
+	const gw = nw + 4;
 	const cw = Math.max(20, tw - gw);
 	const canHL = diff.chars <= MAX_HL_CHARS && vis.length <= MAX_RENDER_LINES;
 
@@ -5225,12 +5265,14 @@ async function renderUnified(
 	let index = 0;
 	const out: string[] = [diffRule(tw)];
 
-	function emitRow(num: number | null, sign: string, gutterBg: string, signFg: string, body: string, bodyBg = ""): void {
+	function emitRow(num: number | null, sign: string, gutterBg: string, body: string, bodyBg = ""): void {
 		const borderFg = sign === "-" ? dc.fgDel : sign === "+" ? dc.fgAdd : "";
 		const border = borderFg ? `${borderFg}▌${D_RST}` : `${BG_BASE} `;
 		const numFg = borderFg || FG_LNUM;
-		const gutter = `${border}${gutterBg}${lnum(num, nw, numFg)}${signFg}${sign} ${D_RST}${DIVIDER} `;
-		const cont = `${border}${gutterBg}${" ".repeat(nw + 2)}${D_RST}${DIVIDER} `;
+		// Add/remove state is carried by color and the edge bar; omitting the
+		// redundant +/- marker recovers one source-code column.
+		const gutter = `${border}${gutterBg}${lnum(num, nw, numFg)} ${D_RST}${DIVIDER} `;
+		const cont = `${border}${gutterBg}${" ".repeat(nw + 1)}${D_RST}${DIVIDER} `;
 		const rows = wrapAnsi(tabs(body), cw, adaptiveWrapRows(), bodyBg);
 		out.push(`${gutter}${rows[0]}${D_RST}`);
 		for (let r = 1; r < rows.length; r++) out.push(`${cont}${rows[r]}${D_RST}`);
@@ -5251,7 +5293,7 @@ async function renderUnified(
 		}
 		if (line.type === "ctx") {
 			const hl = oldHL[oldIndex] ?? line.content;
-			emitRow(line.newNum, " ", BG_BASE, dc.fgCtx, `${BG_BASE}${D_DIM}${hl}`, BG_BASE);
+			emitRow(line.newNum, " ", BG_BASE, `${BG_BASE}${D_DIM}${hl}`, BG_BASE);
 			oldIndex++;
 			newIndex++;
 			index++;
@@ -5274,18 +5316,18 @@ async function renderUnified(
 		const isPaired = dels.length === 1 && adds.length === 1;
 		const wd = isPaired ? wordDiffAnalysis(dels[0].l.content, adds[0].l.content) : null;
 		if (isPaired && wd && wd.similarity >= WORD_DIFF_MIN_SIM && canHL) {
-			emitRow(dels[0].l.oldNum, "-", BG_GUTTER_DEL, `${dc.fgDel}${D_BOLD}`, injectBg(dels[0].hl, wd.oldRanges, BG_DEL, BG_DEL_W), BG_DEL);
-			emitRow(adds[0].l.newNum, "+", BG_GUTTER_ADD, `${dc.fgAdd}${D_BOLD}`, injectBg(adds[0].hl, wd.newRanges, BG_ADD, BG_ADD_W), BG_ADD);
+			emitRow(dels[0].l.oldNum, "-", BG_GUTTER_DEL, injectBg(dels[0].hl, wd.oldRanges, BG_DEL, BG_DEL_W), BG_DEL);
+			emitRow(adds[0].l.newNum, "+", BG_GUTTER_ADD, injectBg(adds[0].hl, wd.newRanges, BG_ADD, BG_ADD_W), BG_ADD);
 			continue;
 		}
 		if (isPaired && wd && wd.similarity >= WORD_DIFF_MIN_SIM && !canHL) {
 			const pwd = plainWordDiff(dels[0].l.content, adds[0].l.content);
-			emitRow(dels[0].l.oldNum, "-", BG_GUTTER_DEL, `${dc.fgDel}${D_BOLD}`, `${BG_DEL}${pwd.old}`, BG_DEL);
-			emitRow(adds[0].l.newNum, "+", BG_GUTTER_ADD, `${dc.fgAdd}${D_BOLD}`, `${BG_ADD}${pwd.new}`, BG_ADD);
+			emitRow(dels[0].l.oldNum, "-", BG_GUTTER_DEL, `${BG_DEL}${pwd.old}`, BG_DEL);
+			emitRow(adds[0].l.newNum, "+", BG_GUTTER_ADD, `${BG_ADD}${pwd.new}`, BG_ADD);
 			continue;
 		}
-		for (const d of dels) emitRow(d.l.oldNum, "-", BG_GUTTER_DEL, `${dc.fgDel}${D_BOLD}`, `${BG_DEL}${canHL ? d.hl : d.l.content}`, BG_DEL);
-		for (const a of adds) emitRow(a.l.newNum, "+", BG_GUTTER_ADD, `${dc.fgAdd}${D_BOLD}`, `${BG_ADD}${canHL ? a.hl : a.l.content}`, BG_ADD);
+		for (const d of dels) emitRow(d.l.oldNum, "-", BG_GUTTER_DEL, `${BG_DEL}${canHL ? d.hl : d.l.content}`, BG_DEL);
+		for (const a of adds) emitRow(a.l.newNum, "+", BG_GUTTER_ADD, `${BG_ADD}${canHL ? a.hl : a.l.content}`, BG_ADD);
 	}
 
 	out.push(diffRule(tw));
@@ -5325,7 +5367,7 @@ async function renderSplit(
 	const vis = rows.slice(0, max);
 	const half = Math.floor((tw - 1) / 2);
 	const nw = Math.max(2, String(maxLineNumber(diff.lines)).length);
-	const gw = nw + 5;
+	const gw = nw + 4;
 	const cw = Math.max(12, half - gw);
 	const canHL = diff.chars <= MAX_HL_CHARS && vis.length * 2 <= MAX_RENDER_LINES * 2;
 
@@ -5350,22 +5392,20 @@ async function renderSplit(
 		side: "left" | "right",
 	): HalfResult {
 		if (!line) {
-			const gPat = FG_RULE + "╱".repeat(nw + 2) + D_RST;
+			const gPat = FG_RULE + "╱".repeat(nw + 1) + D_RST;
 			const gutter = ` ${gPat}${FG_RULE}│${D_RST} `;
 			return { gutter, contGutter: gutter, bodyRows: [stripes(cw)] };
 		}
 		if (line.type === "sep") {
 			const gap = line.newNum;
 			const label = gap && gap > 0 ? `··· ${gap} lines ···` : "···";
-			const gutter = `${BG_BASE} ${FG_DIM}${fit("", nw + 2)}${D_RST}${FG_RULE}│${D_RST} `;
+			const gutter = `${BG_BASE} ${FG_DIM}${fit("", nw + 1)}${D_RST}${FG_RULE}│${D_RST} `;
 			return { gutter, contGutter: gutter, bodyRows: [`${BG_BASE}${FG_DIM}${fit(label, cw)}${D_RST}`] };
 		}
 		const isDel = line.type === "del";
 		const isAdd = line.type === "add";
 		const gBg = isDel ? BG_GUTTER_DEL : isAdd ? BG_GUTTER_ADD : BG_BASE;
 		const cBg = isDel ? BG_DEL : isAdd ? BG_ADD : BG_BASE;
-		const sFg = isDel ? dc.fgDel : isAdd ? dc.fgAdd : dc.fgCtx;
-		const sign = isDel ? "-" : isAdd ? "+" : " ";
 		const num = isDel ? line.oldNum : isAdd ? line.newNum : side === "left" ? line.oldNum : line.newNum;
 		const borderFg = isDel ? dc.fgDel : isAdd ? dc.fgAdd : "";
 		const border = borderFg ? `${borderFg}▌${D_RST}` : ` ${BG_BASE}`;
@@ -5374,15 +5414,12 @@ async function renderSplit(
 		if (ranges && ranges.length > 0) body = injectBg(hl, ranges, cBg, isDel ? BG_DEL_W : BG_ADD_W);
 		else if (isDel || isAdd) body = `${cBg}${hl}`;
 		else body = `${BG_BASE}${D_DIM}${hl}`;
-		const gutter = `${border}${gBg}${lnum(num, nw, numFg)}${sFg}${D_BOLD}${sign} ${D_RST}${FG_RULE}│${D_RST} `;
-		const contGutter = `${border}${gBg}${" ".repeat(nw + 2)}${D_RST}${FG_RULE}│${D_RST} `;
+		const gutter = `${border}${gBg}${lnum(num, nw, numFg)} ${D_RST}${FG_RULE}│${D_RST} `;
+		const contGutter = `${border}${gBg}${" ".repeat(nw + 1)}${D_RST}${FG_RULE}│${D_RST} `;
 		return { gutter, contGutter, bodyRows: wrapAnsi(tabs(body), cw, adaptiveWrapRows(), cBg) };
 	}
 
 	const out: string[] = [];
-	const hdrOld = `${BG_BASE}${" ".repeat(Math.max(0, nw - 2))}${dc.fgDel}${D_DIM}old${D_RST}`;
-	const hdrNew = `${BG_BASE}${" ".repeat(Math.max(0, nw - 2))}${dc.fgAdd}${D_DIM}new${D_RST}`;
-	out.push(`${BG_BASE}${hdrOld}${" ".repeat(Math.max(0, half - nw - 1))}${FG_RULE}┊${D_RST}${hdrNew}`);
 	out.push(`${diffRule(half)}${FG_RULE}┊${D_RST}${diffRule(half)}`);
 
 	for (const row of vis) {
@@ -5693,6 +5730,17 @@ function renderProjectedEditPreviewBody(
 		});
 }
 
+function joinEditDiffSections(sections: string[]): string {
+	return sections.map((section, index) => {
+		if (index === 0) return section;
+		const lines = section.split("\n");
+		// Each renderer frames its block. Drop only the next block's opening rule,
+		// leaving the previous closing rule as the single divider between edits.
+		if (lines.length > 1 && /^[─┊]+$/.test(diffStrip(lines[0]))) lines.shift();
+		return lines.join("\n");
+	}).join("\n");
+}
+
 function renderEditPreviewBody(
 	ctx: any,
 	key: string,
@@ -5700,24 +5748,22 @@ function renderEditPreviewBody(
 	language: BundledLanguage | undefined,
 	operations: Array<{ oldText: string; newText: string }>,
 	diffs: ParsedDiff[],
-	lines: number[],
 	summary: string,
 ): void {
 	const dc = resolveDiffColors(theme);
 	const branchWidth = contextDiffWidth(ctx, 3);
 	if (operations.length === 1) {
 		const [diff] = diffs;
-		const line = lines[0] ?? getFirstChangedNewLine(diff);
 		renderSplit(diff, language, ctx.expanded ? MAX_PREVIEW_LINES : 32, dc, branchWidth)
 			.then((rendered) => {
 				if (ctx.state._pk !== key) return;
-				ctx.state._ptBody = `${summarizeDiff(diff.added, diff.removed)}${formatLineMeta(line, theme)}\n${rendered}`;
+				ctx.state._ptBody = `${summarizeDiff(diff.added, diff.removed)}\n${rendered}`;
 				ctx.state._ptDisplay = indentBranchBlock(withBranch(ctx.state._ptBody, theme, false, true));
 				safeInvalidate(ctx);
 			})
 			.catch(() => {
 				if (ctx.state._pk !== key) return;
-				ctx.state._ptBody = `${summarizeDiff(diff.added, diff.removed)}${formatLineMeta(line, theme)}`;
+				ctx.state._ptBody = summarizeDiff(diff.added, diff.removed);
 				ctx.state._ptDisplay = indentBranchBlock(withBranch(ctx.state._ptBody, theme, false, true));
 				safeInvalidate(ctx);
 			});
@@ -5725,11 +5771,9 @@ function renderEditPreviewBody(
 	}
 	const maxShown = operations.length;
 	const previewLines = Math.max(8, Math.floor(MAX_RENDER_LINES / Math.max(1, maxShown)));
-	mapWithConcurrency(diffs.slice(0, maxShown), DIFF_RENDER_CONCURRENCY, async (diff, index) => {
-		const line = lines[index] ?? getFirstChangedNewLine(diff);
+	mapWithConcurrency(diffs.slice(0, maxShown), DIFF_RENDER_CONCURRENCY, async (diff) => {
 		return renderSplit(diff, language, previewLines, dc, branchWidth)
-			.then((rendered) => `Edit ${index + 1}/${operations.length}${formatLineMeta(line, theme)}\n${rendered}`)
-			.catch(() => `Edit ${index + 1}/${operations.length}${formatLineMeta(line, theme)} ${summarizeDiff(diff.added, diff.removed)}`);
+			.catch(() => summarizeDiff(diff.added, diff.removed));
 	})
 		.then((sections) => {
 			if (ctx.state._pk !== key) return;
@@ -5737,7 +5781,7 @@ function renderEditPreviewBody(
 			const suffix = remainder > 0
 				? `\n${theme.fg("muted", `… ${remainder} more edit blocks${toolOutputDetailHint(theme, ctx.expanded, true)}`)}`
 				: "";
-			ctx.state._ptBody = `${operations.length} edits ${summary}\n\n${sections.join("\n\n")}${suffix}`;
+			ctx.state._ptBody = `${operations.length} edits ${summary}\n${joinEditDiffSections(sections)}${suffix}`;
 			ctx.state._ptDisplay = indentBranchBlock(withBranch(ctx.state._ptBody, theme, false, true));
 			safeInvalidate(ctx);
 		})
@@ -7856,12 +7900,11 @@ export default function (pi: ExtensionAPI) {
 						const localizedDiffs = await computeLocalizedEditDiffs(fp, operations, cwd);
 						if (ctx.state._pk !== key) return;
 						const diffs = localizedDiffs?.map((entry) => entry.diff) ?? fallbackDiffs;
-						const lines = localizedDiffs?.map((entry) => entry.line) ?? diffs.map((diff) => getFirstChangedNewLine(diff));
-						renderEditPreviewBody(ctx, key, theme, lg, operations, diffs, lines, editSummary);
+						renderEditPreviewBody(ctx, key, theme, lg, operations, diffs, editSummary);
 					})
 					.catch(() => {
 						if (ctx.state._pk !== key) return;
-						renderEditPreviewBody(ctx, key, theme, lg, operations, fallbackDiffs, fallbackDiffs.map((diff) => getFirstChangedNewLine(diff)), editSummary);
+						renderEditPreviewBody(ctx, key, theme, lg, operations, fallbackDiffs, editSummary);
 					});
 			}
 			const body = liveBranchDisplay(ctx.state, theme) ?? (ctx.state._ptDisplay as string | undefined);
@@ -7903,7 +7946,6 @@ export default function (pi: ExtensionAPI) {
 							lang(fp),
 							operations,
 							diffs,
-							diffs.map((diff) => getFirstChangedNewLine(diff)),
 							summary,
 						);
 					}

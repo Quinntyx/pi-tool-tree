@@ -13,10 +13,10 @@ test("auto uses split when wide and unified below the threshold", () => {
 	assert.equal(resolveDiffPresentationMode({ diffViewMode: "auto", diffSplitMinWidth: 120 }, 120), "split");
 });
 
-test("auto defaults to pi-tool-display's 120-column split threshold", () => {
-	assert.equal(getDiffSplitMinWidth({}), 120);
-	assert.equal(resolveDiffPresentationMode({}, 119), "unified");
-	assert.equal(resolveDiffPresentationMode({}, 120), "split");
+test("auto defaults to a conservative 132-column split threshold", () => {
+	assert.equal(getDiffSplitMinWidth({}), 132);
+	assert.equal(resolveDiffPresentationMode({}, 131), "unified");
+	assert.equal(resolveDiffPresentationMode({}, 132), "split");
 });
 
 test("forced modes remain width-safe", () => {
@@ -30,6 +30,6 @@ test("forced modes remain width-safe", () => {
 test("width and threshold inputs are normalized", () => {
 	assert.equal(normalizeDiffRenderWidth(Number.NaN), 0);
 	assert.equal(normalizeDiffRenderWidth(120.9), 120);
-	assert.equal(getDiffSplitMinWidth({ diffSplitMinWidth: -1 }), 120);
+	assert.equal(getDiffSplitMinWidth({ diffSplitMinWidth: -1 }), 132);
 	assert.equal(getDiffSplitMinWidth({ diffSplitMinWidth: 132.8 }), 132);
 });

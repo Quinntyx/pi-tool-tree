@@ -67,7 +67,7 @@ Set in `.pi/settings.json` or `~/.pi/settings.json`:
   "liveToolPreview": true,
   "liveToolPreviewLines": 5,
   "diffViewMode": "auto",
-  "diffSplitMinWidth": 120,
+  "diffSplitMinWidth": 132,
   "diffCollapsedLines": 24,
   "themeAdaptive": true,
   "diffTheme": "github-dark"
@@ -226,7 +226,7 @@ immediately and to plugin tools the next time they register.
 | `liveToolPreview` | `true` | Show a small live output preview while tools are still running |
 | `liveToolPreviewLines` | `5` | Lines shown in the collapsed live preview |
 | `diffViewMode` | `auto` | `auto` uses split left/right previews at `diffSplitMinWidth` and unified previews below it; `split` and `unified` force a layout when physically possible |
-| `diffSplitMinWidth` | `120` | Minimum available width where `auto` switches to a split preview |
+| `diffSplitMinWidth` | `132` | Minimum available width where `auto` may use a split preview (long visible lines still select unified mode) |
 | `diffCollapsedLines` | `24` | Diff lines before collapsing |
 
 ## Notes

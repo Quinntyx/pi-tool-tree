@@ -91,11 +91,11 @@ assert.ok(nativeRenders > 0);
 		assert.match(previewLine, /^ │\s+/, `the cluster rail must continue beside mutation previews: ${JSON.stringify(previewLine)}`);
 	}
 	const pendingCluster = new Container();
-	const pendingWriteContent = readFileSync("package.json", "utf8").replace(
-		'"name": "pi-claude-code-ui"',
-		'"name": "pi-claude-code-ui-preview",\n  "previewOnly": true,\n  "previewLayout": "split"',
+	const pendingWriteContent = readFileSync("config/config.example.json", "utf8").replace(
+		'"diffSplitMinWidth": 132',
+		'"diffSplitMinWidth": 144,\n  "previewOnly": true,\n  "previewLayout": "split"',
 	);
-	const pendingWriteArgs = { path: "package.json", content: pendingWriteContent, activity: "implementing" };
+	const pendingWriteArgs = { path: "config/config.example.json", content: pendingWriteContent, activity: "implementing" };
 	const pendingWrite = new ToolExecutionComponent(
 		"write",
 		"pending-write-preview",
@@ -128,13 +128,37 @@ assert.ok(nativeRenders > 0);
 	}
 	const narrowPending = await waitForPendingMode(100, "unified");
 	assert.ok(narrowPending.includes("• unified"), `narrow pending writes use a unified diff: ${JSON.stringify(narrowPending)}`);
-	const indentedBoundaryNarrow = await waitForPendingMode(129, "unified");
-	assert.ok(indentedBoundaryNarrow.includes("• unified"), "auto mode subtracts the activity rail and tool-shell indentation before its width check");
-	const indentedBoundaryWide = await waitForPendingMode(130, "split");
-	assert.ok(indentedBoundaryWide.includes("• split"), "auto mode switches only when the indented diff itself has 120 columns");
-	const widePending = await waitForPendingMode(140, "split");
+	const indentedBoundaryNarrow = await waitForPendingMode(140, "unified");
+	assert.ok(indentedBoundaryNarrow.includes("• unified"), "auto mode subtracts tree, tool-shell, branch, and scrollbar chrome before its width check");
+	const indentedBoundaryWide = await waitForPendingMode(141, "split");
+	assert.ok(indentedBoundaryWide.includes("• split"), "auto mode switches only when the indented diff itself has 132 columns");
+	const widePending = await waitForPendingMode(152, "split");
 	assert.ok(widePending.includes("• split"), `wide pending writes use a split diff: ${JSON.stringify(widePending)}`);
-	const coloredWidePending = pendingCluster.render(140);
+	assert.ok(!/^\s*(old|new)\s*$/m.test(widePending), "split previews omit redundant old/new headings");
+
+	// Width alone is not enough: auto mode must stay unified when either half
+	// would wrap visible code, even though the configured split cutoff fits.
+	const longWriteContent = readFileSync("config/config.example.json", "utf8").replace(
+		'"diffViewMode": "auto"',
+		'"diffViewMode": "auto-with-a-deliberately-long-value-that-cannot-fit-in-one-split-column"',
+	);
+	const longWriteArgs = { path: "config/config.example.json", content: longWriteContent, activity: "implementing" };
+	const longWrite = new ToolExecutionComponent("write", "long-line-write", longWriteArgs, {}, tools.get("write") as any, ui as any, process.cwd());
+	longWrite.updateArgs(longWriteArgs);
+	longWrite.setArgsComplete();
+	longWrite.markExecutionStarted();
+	longWrite.updateResult({ content: [{ type: "text", text: "" }], isError: false } as any, true);
+	const longCluster = new Container();
+	longCluster.addChild(longWrite);
+	let longPreview = "";
+	for (let attempt = 0; attempt < 50; attempt++) {
+		longPreview = plain(longCluster.render(152));
+		if (longPreview.includes("• unified")) break;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	assert.ok(longPreview.includes("• unified"), `auto mode avoids wrapped split columns: ${JSON.stringify(longPreview)}`);
+
+	const coloredWidePending = pendingCluster.render(152);
 	const hatchLine = coloredWidePending.find((line) => line.includes("╱"));
 	const borderLine = coloredWidePending.find((line) => line.includes("─"));
 	assert.ok(hatchLine && borderLine, "split fixture must contain both hatch and border chrome");
@@ -143,7 +167,8 @@ assert.ok(nativeRenders > 0);
 		return prefix.match(/\x1b\[38;(?:2;\d+;\d+;\d+|5;\d+)m/g)?.at(-1);
 	};
 	assert.equal(fgBefore(hatchLine!, "╱"), fgBefore(borderLine!, "─"), "split hatching and border rules use the same gray");
-	for (const width of [20, 48, 80, 100, 140]) {
+	assert.match(fgBefore(hatchLine!, "╱") ?? "", /38;2;1(?:[0-9]{2}|[3-9][0-9]);/, "default hatch chrome is a light gray, not near-black");
+	for (const width of [20, 48, 80, 100, 140, 152, 80, 152]) {
 		for (const line of pendingCluster.render(width)) {
 			assert.ok(visibleWidth(line) <= width, `pending write overflow at ${width}: ${visibleWidth(line)}`);
 		}
@@ -154,9 +179,9 @@ assert.ok(nativeRenders > 0);
 		activity: "implementing",
 		edits: [
 			{ oldText: 'export type DiffViewMode = "auto" | "split" | "unified";', newText: 'export type DiffViewMode = "auto-wide" | "split" | "unified";' },
-			{ oldText: "const DEFAULT_SPLIT_MIN_WIDTH = 120;", newText: "const DEFAULT_SPLIT_MIN_WIDTH = 132;" },
+			{ oldText: "const DEFAULT_SPLIT_MIN_WIDTH = 132;", newText: "const DEFAULT_SPLIT_MIN_WIDTH = 144;" },
 			{ oldText: "export function getDiffSplitMinWidth(config: DiffModeConfig): number {", newText: "export function resolveDiffSplitMinWidth(config: DiffModeConfig): number {" },
-			{ oldText: " * Match pi-tool-display's responsive diff mode: auto uses side-by-side columns", newText: " * Mirror pi-tool-display's responsive diff mode: auto uses side-by-side columns" },
+			{ oldText: " * Use side-by-side columns only once the configured threshold fits; the renderer", newText: " * Prefer side-by-side columns only once the configured threshold fits; the renderer" },
 		],
 	};
 	const editCluster = new Container();
@@ -174,11 +199,11 @@ assert.ok(nativeRenders > 0);
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
 	assert.ok(fourHunkPreview.includes("4 hunks"), `all edit hunks must render instead of a summary: ${JSON.stringify(fourHunkPreview)}`);
-	for (const changedText of ["auto-wide", "132", "resolveDiffSplitMinWidth", "Mirror pi-tool-display"]) {
+	for (const changedText of ["auto-wide", "144", "resolveDiffSplitMinWidth", "Prefer side-by-side"]) {
 		assert.ok(fourHunkPreview.includes(changedText), `the full four-hunk preview must include ${changedText}: ${JSON.stringify(fourHunkPreview)}`);
 	}
 	assert.ok(fourHunkPreview.includes("MIN_SPLIT_COLUMN_WIDTH"), "the projected edit diff includes unchanged context around its hunks");
-	for (const line of fourHunkPreview.split("\n").filter((line) => /auto-wide|resolveDiffSplitMinWidth|Mirror pi-tool-display/.test(line))) {
+	for (const line of fourHunkPreview.split("\n").filter((line) => /auto-wide|resolveDiffSplitMinWidth|Prefer side-by-side/.test(line))) {
 		assert.match(line, /^ │\s+/, `the edit preview rail must reach the next clustered call: ${JSON.stringify(line)}`);
 	}
 
@@ -190,10 +215,13 @@ assert.ok(nativeRenders > 0);
 	let completedFourHunkPreview = "";
 	for (let attempt = 0; attempt < 80; attempt++) {
 		completedFourHunkPreview = plain(editCluster.render(100));
-		if (completedFourHunkPreview.includes("Edit 4/4")) break;
+		if (completedFourHunkPreview.includes("Prefer side-by-side")) break;
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
-	assert.ok(completedFourHunkPreview.includes("Edit 4/4"), `settled multi-edits keep every diff block instead of collapsing to stats: ${JSON.stringify(completedFourHunkPreview)}`);
+	assert.ok(completedFourHunkPreview.includes("Prefer side-by-side"), `settled multi-edits keep every diff block instead of collapsing to stats: ${JSON.stringify(completedFourHunkPreview)}`);
+	assert.ok(!/Edit \d+\/\d+|^\s*(old|new)\s*$/m.test(completedFourHunkPreview), "diffs omit per-edit and old/new column headings");
+	assert.equal(completedFourHunkPreview.split("\n").filter((line) => /─{10,}/.test(line)).length, 5, "four edit blocks use one shared horizontal rule between neighbors");
+	assert.ok(!/\d[+-]\s*│/.test(completedFourHunkPreview), "line-number gutters omit redundant +/- markers");
 }
 
 const thought = {
