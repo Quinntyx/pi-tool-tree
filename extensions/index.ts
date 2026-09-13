@@ -70,6 +70,7 @@ const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const ANSI_PRESENT_RE = /\x1b\[[0-9;]*m/;
 const PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-container-render");
 const TOOL_RENDER_CACHE = Symbol.for("pi-claude-style-tools:tool-render-cache");
+const ACTIVITY_RENDER_CACHE = Symbol.for("pi-claude-style-tools:activity-render-cache");
 const COMPONENT_PARENT = Symbol.for("pi-claude-style-tools:component-parent");
 const PARENT_TRACKING_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-parent-tracking");
 const TOOL_CACHE_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-tool-cache-invalidation");
@@ -451,6 +452,15 @@ function terminalColumnCeiling(): number {
 	return Number.isFinite(cols) && (cols as number) > 0 ? (cols as number) : 0;
 }
 
+/**
+ * Memo for clampLineWidth. A grouped transcript re-emits every line on every repaint, and
+ * measuring grapheme clusters costs ~30µs per line — so the same thousands of lines were
+ * measured again and again (the whole cost of typing in a long session). The composed strings
+ * are byte-identical between frames, so the answer is cached per (ceiling, line).
+ */
+const CLAMP_CACHE = new Map<number, Map<string, string>>();
+const CLAMP_CACHE_MAX_ENTRIES = 20000;
+
 function clampLineWidth(line: string, width: number): string {
 	if (width <= 0) return "";
 	// Hard ceiling: never emit a line wider than the real terminal. pi sometimes
@@ -458,7 +468,18 @@ function clampLineWidth(line: string, width: number): string {
 	// in a narrower side panel), which trips pi's render width-assertion crash.
 	const ceiling = Math.min(width, terminalColumnCeiling() || width);
 	if (ceiling <= 0) return "";
-	return visibleWidth(line) > ceiling ? truncateToWidth(line, ceiling) : line;
+	let bucket = CLAMP_CACHE.get(ceiling);
+	if (bucket) {
+		const hit = bucket.get(line);
+		if (hit !== undefined) return hit;
+	} else {
+		bucket = new Map();
+		CLAMP_CACHE.set(ceiling, bucket);
+	}
+	const clamped = visibleWidth(line) > ceiling ? truncateToWidth(line, ceiling) : line;
+	if (bucket.size >= CLAMP_CACHE_MAX_ENTRIES) bucket.clear();
+	bucket.set(line, clamped);
+	return clamped;
 }
 
 function isToolExecutionLike(value: unknown): value is { toolName: string; toolCallId: string } {
@@ -872,10 +893,13 @@ function toolActivityLines(tool: any, width: number): string[] {
 		// In an activity group that first pass used the whole terminal, so a split diff
 		// was built before the outer tree prefix and the tool shell padding were known.
 		// Seed the exact component budget before renderCall/renderResult chooses a mode.
-		tool.rendererState._diffComponentWidth = Math.max(
-			1,
-			childWidth - TOOL_SHELL_HORIZONTAL_CHROME_WIDTH,
-		);
+		// Only when it actually changes: re-seeding the same value every frame churns the
+		// renderer state and, with the activity memo, would look like a content change.
+		const diffWidth = Math.max(1, childWidth - TOOL_SHELL_HORIZONTAL_CHROME_WIDTH);
+		if (tool.rendererState._diffComponentWidth !== diffWidth) {
+			tool.rendererState._diffComponentWidth = diffWidth;
+			_activityContentEpoch++;
+		}
 	}
 	// Edits and writes are the model's proposed file changes, not incidental output:
 	// keep their preview below the call after settlement. The group's continuation
@@ -1778,6 +1802,28 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 	if (!parent.children.some((child: any) => child instanceof ToolExecutionComponent || child instanceof AssistantMessageComponent)) return undefined;
 	if (width <= 0) return [];
 
+	// Rebuilding the grouped transcript is O(all lines) per repaint — and pi repaints on every
+	// keystroke, so an idle session paid to re-measure a whole transcript it was not changing.
+	// The output is a pure function of the children (identity + render flags), the width, the
+	// theme/branch visuals and our own content epoch, so memoise it. Renders that find a live
+	// group are never cached: those frames animate by definition.
+	const memo = parent[ACTIVITY_RENDER_CACHE];
+	if (
+		// While a run is in flight this transcript animates by itself: live durations tick and the
+		// trailing chunk shimmers, none of which shows up in the children or their flags. Never
+		// reuse (or keep) a memo then — those frames exist to repaint.
+		!agentWorking() &&
+		memo &&
+		memo.width === width &&
+		memo.contentEpoch === _activityContentEpoch &&
+		memo.branchEpoch === _toolBranchVisualEpoch &&
+		memo.branchKey === toolBranchRenderCacheKey() &&
+		memo.mode === toolBackgroundMode &&
+		sameActivityChildren(parent.children, memo.children)
+	) {
+		return memo.lines;
+	}
+
 	type ToolEntry = { kind: "tool"; tool: any; label: string };
 	type ThinkingEntry = { kind: "thinking"; lines: string[]; label: string; durationMs?: number };
 	type ContentEntry = { kind: "content"; lines: string[]; trimEdges?: boolean; ambient?: boolean };
@@ -2018,6 +2064,19 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 	// Nothing in this transcript is live any more (prose, a closed chunk, or the run
 	// ended): release the frame loop so it cannot outlive the animation.
 	if (!armedLive) stopLiveGroupFrame(parent);
+	if (!armedLive && !agentWorking()) {
+		parent[ACTIVITY_RENDER_CACHE] = {
+			width,
+			contentEpoch: _activityContentEpoch,
+			branchEpoch: _toolBranchVisualEpoch,
+			branchKey: toolBranchRenderCacheKey(),
+			mode: toolBackgroundMode,
+			children: parent.children.slice(),
+			lines: output,
+		};
+	} else {
+		delete parent[ACTIVITY_RENDER_CACHE];
+	}
 	return output;
 }
 
@@ -2205,12 +2264,35 @@ function unrefTimer(timer: ReturnType<typeof setTimeout> | null | undefined): vo
 	(timer as any)?.unref?.();
 }
 
+/**
+ * Bumped whenever we mutate rendered content. The activity render is memoised per container
+ * (see renderActivityTranscript); anything that changes what a row should say has to bump
+ * this, or a repaint would reuse the previous lines.
+ */
+let _activityContentEpoch = 0;
+
 function safeInvalidate(ctx: any): void {
 	try {
+		_activityContentEpoch++;
 		if (typeof ctx?.invalidate === "function") ctx.invalidate();
 	} catch {
 		// Tool render contexts may outlive their row during reload/session switches.
 	}
+}
+
+/** Do the container's children (and their render-relevant flags) match the cached render? */
+function sameActivityChildren(
+	children: any[],
+	cached: any[],
+): boolean {
+	if (children.length !== cached.length) return false;
+	for (let i = 0; i < children.length; i++) {
+		const a = children[i];
+		const b = cached[i];
+		if (a !== b) return false;
+		if (a?.isPartial !== b?.isPartial || a?.expanded !== b?.expanded) return false;
+	}
+	return true;
 }
 
 const ASSISTANT_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-assistant-message");
@@ -5674,6 +5756,27 @@ function maxLineNumber(lines: DiffLine[]): number {
 	return max;
 }
 
+/**
+ * Auto diff layout is decided from the diff's *current* content, so a diff that is still
+ * streaming can flip between split and unified from one frame to the next — the row count then
+ * halves or doubles and the transcript reflows under the reader, which is what made scrolling
+ * jump onto whichever edit was streaming. Hold the first decision while the width and the diff
+ * stay the same; a resize or a different diff is free to re-decide.
+ */
+function stickyUseSplit(
+	state: any,
+	key: string,
+	diff: ParsedDiff,
+	width: number,
+	maxRows: number,
+): boolean {
+	const prev = state?._diffStickySplit;
+	if (prev && prev.key === key && prev.width === width) return prev.split;
+	const split = shouldUseSplit(diff, width, maxRows);
+	if (state && typeof state === "object") state._diffStickySplit = { key, width, split };
+	return split;
+}
+
 function shouldUseSplit(diff: ParsedDiff, width: number, maxRows = MAX_PREVIEW_LINES): boolean {
 	if (!diff.lines.length) return false;
 	const settings = readSettings();
@@ -6371,7 +6474,7 @@ function renderPendingWritePreviewBody(
 	const hunks = countDiffHunks(diff);
 	const diffWidth = contextDiffWidth(ctx, 3);
 	const previewLines = ctx.expanded ? MAX_RENDER_LINES : diffCollapsedLimit();
-	const mode = existedBefore && shouldUseSplit(diff, diffWidth, previewLines) ? "split" : "unified";
+	const mode = existedBefore && stickyUseSplit(ctx.state, `pending-write:${key}`, diff, diffWidth, previewLines) ? "split" : "unified";
 	const summary = diffSummaryWithMeta(diff.added, diff.removed, hunks, mode);
 	const action = theme.fg("muted", existedBefore ? "pending overwrite" : "pending create");
 	const dc = resolveDiffColors(theme);
@@ -6406,7 +6509,7 @@ function renderProjectedEditPreviewBody(
 		? MAX_RENDER_LINES
 		: Math.min(MAX_RENDER_LINES, Math.max(diffCollapsedLimit(), diff.lines.length));
 	const hunks = countDiffHunks(diff);
-	const mode = shouldUseSplit(diff, diffWidth, previewLines) ? "split" : "unified";
+	const mode = stickyUseSplit(ctx.state, `projected-edit:${key}`, diff, diffWidth, previewLines) ? "split" : "unified";
 	const summary = diffSummaryWithMeta(diff.added, diff.removed, hunks, mode);
 	const dc = resolveDiffColors(theme);
 	const render = mode === "split" ? renderSplit : renderUnified;
@@ -8471,9 +8574,10 @@ export default function (pi: ExtensionAPI) {
 				const previewLines = ctx.expanded ? MAX_RENDER_LINES : diffCollapsedLimit();
 				const hunks = d.diff?.lines?.filter((l: any) => l.type === "sep").length + (d.diff?.lines?.length ? 1 : 0);
 				const diffWidth = contextDiffWidth(ctx);
-				const mode = shouldUseSplit(d.diff, diffWidth, previewLines) ? "split" : "unified";
-				const richSummary = diffSummaryWithMeta(d.diff.added, d.diff.removed, hunks, mode);
 				const key = `wd:${diffWidth}:${d.summary}:${d.diff?.lines?.length ?? 0}:${d.language ?? ""}:${ctx.expanded ? 1 : 0}`;
+				// Sticky per tool result (not per frame): the line count changes while the diff renders.
+				const mode = stickyUseSplit(ctx.state, `write-diff:${d.summary ?? ""}:${d.language ?? ""}`, d.diff, diffWidth, previewLines) ? "split" : "unified";
+				const richSummary = diffSummaryWithMeta(d.diff.added, d.diff.removed, hunks, mode);
 				if (ctx.state._wdk !== key) {
 					ctx.state._wdk = key;
 					ctx.state._wdt = withFinalBranchBlock(`${richSummary}\n${theme.fg("muted", "rendering diff…")}`, theme);
