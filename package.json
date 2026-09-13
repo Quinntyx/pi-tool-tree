@@ -28,6 +28,7 @@
     "url": "https://github.com/FammasMaz/pi-cc-tools/issues"
   },
   "files": [
+    "API.md",
     "extensions/index.ts",
     "extensions/bash-command.ts",
     "extensions/diff-mode.ts",

@@ -951,6 +951,260 @@ console.log("OK: flush-left prose, blank-line block spacing, tool-only call coun
 	console.log("OK  activity param: core tools, plugin opt-in, /cc-tools toggle, disabled no-op");
 }
 
+// ---------------------------------------------------------------------------
+// Activity API: other extensions can ask what this session is doing right now
+// and what it has done, without scraping the transcript or the renderer.
+// ---------------------------------------------------------------------------
+{
+	const api = (globalThis as any)[Symbol.for("pi-tool-tree:api")];
+	assert.ok(api, "the API must be published on globalThis");
+	assert.equal(
+		api,
+		(globalThis as any)[Symbol.for("pi-tool-tree:activity-api")],
+		"the legacy label-integration key must resolve to the same object",
+	);
+	for (const name of ["getActivity", "getStats", "subscribe"]) assert.equal(typeof api[name], "function", `${name} must be callable`);
+	assert.equal(api.formatDuration(1500), "1s", "durations format like the transcript");
+	assert.equal(api.formatDuration(65_000), "1m 05s");
+
+	const realNow = Date.now;
+	let now = 1_800_000_000_000;
+	Date.now = () => now;
+	const apiCtx = { hasUI: true, ui: { theme, notify() {}, getToolsExpanded: () => false, setToolsExpanded() {} } };
+	const fire = async (name: string, event: any = {}, ctxArg: any = apiCtx) => {
+		for (const handler of handlers.get(name) ?? []) await handler(event, ctxArg);
+	};
+	const assistantStream = (type: string) => ({ message: { role: "assistant" }, assistantMessageEvent: { type } });
+	try {
+		// Counters survive a resume: replaying a branch seeds them (call counts, failures,
+		// reasoning time, runs/turns) so stats cover the session, not just this process.
+		const branch = [
+			{ type: "message", message: { role: "user", content: [{ type: "text", text: "go" }] } },
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					stopReason: "toolUse",
+					content: [
+						{ type: "thinking", thinking: "weighing options" },
+						{ type: "toolCall", id: "seeded-1", name: "bash", arguments: { command: "bun test", activity: "testing" } },
+					],
+					_piClaudeStyleThinkingDurationMs: 4000,
+				},
+			},
+			{ type: "message", message: { role: "toolResult", toolCallId: "seeded-1", toolName: "bash", isError: true, content: [] } },
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					stopReason: "stop",
+					content: [{ type: "toolCall", id: "seeded-2", name: "edit", arguments: { path: "a.ts", activity: "implementing" } }],
+					_piClaudeStyleWorkedDurationMs: 9000,
+					_piClaudeStyleWorkedTurns: 2,
+				},
+			},
+		];
+		await fire("session_start", { reason: "resume" }, { ...apiCtx, sessionManager: { getBranch: () => branch } });
+		assert.equal(api.getActivity().phase, "idle", "a resume starts idle");
+		let stats = api.getStats();
+		assert.equal(stats.toolCalls, 2, "seeded call counts");
+		assert.equal(stats.toolCallsFailed, 1, "seeded failure counts");
+		assert.equal(stats.thinkingMs, 4000, "seeded reasoning time from the stamped blocks");
+		assert.equal(stats.thinkingBlocks, 1);
+		assert.equal(stats.runs, 1, "seeded completed runs");
+		assert.equal(stats.turns, 2, "seeded turn count");
+		assert.equal(stats.workedMs, 9000, "seeded work total");
+		assert.deepEqual(stats.byTool.bash, { calls: 1, failed: 1, durationMs: 0 }, "call time is not recoverable from history");
+		assert.deepEqual(stats.byLabel.testing, { calls: 1, durationMs: 0 });
+		assert.deepEqual(Object.keys(stats.byTool).sort(), ["bash", "edit"]);
+
+		// --- a live run -----------------------------------------------------
+		const changes: any[] = [];
+		const unsubscribe = api.subscribe((activity: any, change: any) => {
+			changes.push({
+				type: change.type,
+				phase: activity.phase,
+				label: activity.label,
+				changeLabel: change.label,
+				toolCallId: change.toolCallId,
+				isError: change.isError,
+				durationMs: change.durationMs,
+				toolCalls: change.run?.toolCalls,
+			});
+		});
+		await fire("before_agent_start");
+		let activity = api.getActivity();
+		assert.equal(activity.phase, "waiting", "a run that has produced nothing yet is waiting");
+		assert.equal(activity.isWorking, true);
+		assert.equal(activity.label, "working", "an unnamed phase falls back to the default label");
+		assert.equal(activity.labelCalls, 0);
+		assert.deepEqual(activity.calls, []);
+
+		now += 500;
+		await fire("turn_start");
+		assert.equal(api.getActivity().run.turns, 1);
+		// before_agent_start + agent_start both fire in a real run; the second must not
+		// restart the run clock.
+		now += 500;
+		await fire("agent_start");
+		assert.equal(api.getActivity().run.elapsedMs, 1000, "a repeated run start must not reset the clock");
+
+		// Thinking streams.
+		now += 1000;
+		await fire("message_start", { message: { role: "assistant" } });
+		await fire("message_update", assistantStream("thinking_start"));
+		activity = api.getActivity();
+		assert.equal(activity.phase, "thinking");
+		assert.equal(activity.isThinking, true);
+		assert.equal(activity.isRunningTool, false);
+		now += 2000;
+		activity = api.getActivity();
+		assert.equal(activity.thinkingElapsedMs, 2000, "reasoning time is measured live");
+		assert.equal(activity.run.thinkingMs, 2000, "and counts toward the run's reasoning total");
+		// Some providers skip thinking_end; the next kind of stream output ends it. A
+		// repeated thinking_start must not restart (and so lose) the block's clock.
+		now += 1000;
+		await fire("message_update", assistantStream("thinking_start"));
+		assert.equal(api.getActivity().thinkingElapsedMs, 3000);
+		await fire("message_update", assistantStream("text_start"));
+		activity = api.getActivity();
+		assert.equal(activity.isThinking, false, "text output ends an unterminated reasoning block");
+		assert.equal(activity.phase, "responding");
+		await fire("message_update", assistantStream("text_end"));
+		assert.equal(api.getActivity().phase, "waiting");
+
+		// A call starts: the phase, its label, and the running-call list all follow.
+		now += 100;
+		await fire("tool_execution_start", { toolCallId: "live-1", toolName: "bash", args: { command: "bun test", activity: "testing" } });
+		activity = api.getActivity();
+		assert.equal(activity.phase, "tool");
+		assert.equal(activity.isRunningTool, true);
+		assert.equal(activity.label, "testing", "the model's label names the current activity");
+		assert.equal(activity.labelCalls, 1);
+		assert.equal(activity.run.toolCalls, 1);
+		assert.deepEqual(activity.calls.map((call: any) => [call.toolName, call.label]), [["bash", "testing"]]);
+		now += 3000;
+		activity = api.getActivity();
+		assert.equal(activity.calls[0].elapsedMs, 3000, "a running call reports live elapsed time");
+		assert.equal(activity.run.toolMs, 3000, "and counts toward the run's tool time while it runs");
+		// Unlabeled calls (plugins, MCP) continue the label in effect instead of
+		// starting a new phase, and parallel calls are all reported.
+		now += 1000;
+		await fire("tool_execution_start", { toolCallId: "live-2", toolName: "read", args: { path: "a.ts" } });
+		activity = api.getActivity();
+		assert.equal(activity.label, "testing");
+		assert.equal(activity.labelCalls, 2);
+		assert.equal(activity.calls.length, 2, "parallel calls are all listed");
+		assert.equal(activity.run.toolMs, 4000, "parallel spans each contribute their own time");
+
+		// Settling: a success and a failure, then a new label starts a new phase.
+		now += 1000;
+		await fire("tool_execution_end", { toolCallId: "live-1", toolName: "bash", isError: false });
+		now += 1000;
+		await fire("tool_execution_end", { toolCallId: "live-2", toolName: "read", isError: true });
+		activity = api.getActivity();
+		assert.equal(activity.calls.length, 0);
+		assert.equal(activity.phase, "waiting", "no calls and no stream: waiting on the model");
+		assert.equal(activity.run.toolCalls, 2);
+		assert.equal(activity.run.toolCallsFailed, 1);
+		assert.equal(activity.run.toolMs, 5000 + 2000, "settled calls keep the span they recorded");
+		const settledStats = api.getStats();
+		assert.equal(settledStats.toolCalls, 4, "settled calls land in the session totals");
+		assert.equal(settledStats.byTool.read.failed, 1);
+		assert.equal(settledStats.byLabel.testing.calls, 3, "seeded plus the two live calls under this label");
+
+		now += 500;
+		await fire("tool_execution_start", { toolCallId: "live-3", toolName: "edit", args: { path: "a.ts", activity: "implementing" } });
+		activity = api.getActivity();
+		assert.equal(activity.label, "implementing", "a new label supersedes the phase");
+		assert.equal(activity.labelCalls, 1, "per-label call counts reset with the label");
+		assert.equal(activity.labelElapsedMs, 0);
+		now += 7000;
+		activity = api.getActivity();
+		assert.equal(activity.labelElapsedMs, 7000, "time spent on the current activity is wall clock");
+		assert.equal(activity.run.toolCalls, 3);
+		await fire("tool_execution_end", { toolCallId: "live-3", toolName: "edit", isError: false });
+
+		// A final answer ends the run: session totals grow, the run resets.
+		now += 1000;
+		const workedBefore = api.getStats().workedMs;
+		await fire("message_end", { message: { role: "assistant", content: [], stopReason: "stop" } });
+		assert.ok(api.getStats().workedMs > workedBefore, "a finished run adds its work time");
+		await fire("agent_end");
+		activity = api.getActivity();
+		assert.equal(activity.phase, "idle");
+		assert.equal(activity.isWorking, false);
+		assert.equal(activity.label, null, "an idle session has no current activity");
+		assert.equal(activity.run.elapsedMs, 0);
+		assert.equal(activity.run.toolCalls, 0, "run counters reset for the next run");
+		stats = api.getStats();
+		assert.equal(stats.toolCalls, 5, "session totals survive the run");
+		assert.equal(stats.toolCallsFailed, 2);
+		assert.equal(stats.thinkingMs, 4000 + 3000);
+		assert.equal(stats.thinkingBlocks, 2);
+		assert.equal(stats.runs, 2);
+		assert.equal(stats.turns, 3, "turns accumulate across finished runs");
+		assert.equal(stats.byLabel.implementing.calls, 2);
+
+		// Change events, in order, with per-event detail.
+		assert.deepEqual(
+			changes.map((change) => change.type),
+			[
+				"run-start", "turn-start", "thinking-start", "thinking-end",
+				"stream-start", "stream-end",
+				"label-change", "tool-start", "tool-start", "tool-end", "tool-end",
+				"label-change", "tool-start", "tool-end", "run-end",
+			],
+		);
+		assert.deepEqual(
+			changes.filter((change) => change.type === "label-change").map((change) => change.changeLabel),
+			["testing", "implementing"],
+			"a label change reports the label the model named",
+		);
+		assert.equal(changes.find((change) => change.type === "tool-end" && change.isError)?.toolCallId, "live-2");
+		assert.equal(changes.find((change) => change.type === "thinking-end")?.durationMs, 3000);
+		const runEnd = changes.find((change) => change.type === "run-end");
+		assert.equal(runEnd.phase, "idle", "a run-end listener sees the session already idle");
+		assert.equal(runEnd.toolCalls, 3, "and the finished run's own totals");
+		unsubscribe();
+
+		// Listener hygiene: a throwing listener must not break the agent, and an
+		// unsubscribe must actually stop delivery.
+		const seen: string[] = [];
+		const stop = api.subscribe(() => { throw new Error("listener blew up"); });
+		const stopGood = api.subscribe(() => { seen.push("ok"); });
+		await fire("agent_start");
+		assert.deepEqual(seen, ["ok"], "one bad listener must not stop the others");
+		stop();
+		stopGood();
+		await fire("turn_start");
+		assert.deepEqual(seen, ["ok"], "unsubscribed listeners stop receiving changes");
+		await fire("agent_end");
+
+		// Snapshots are copies: a consumer cannot corrupt tracked state.
+		await fire("agent_start");
+		await fire("tool_execution_start", { toolCallId: "live-4", toolName: "bash", args: { activity: "testing" } });
+		const handed = api.getActivity();
+		handed.calls.push({ toolCallId: "fake" } as any);
+		handed.run.toolCalls = 999;
+		const fresh = api.getActivity();
+		assert.equal(fresh.calls.length, 1);
+		assert.equal(fresh.run.toolCalls, 1);
+		// A call that never ends before the run does is settled as a failure rather than
+		// silently dropped from the totals.
+		await fire("agent_end");
+		assert.equal(api.getStats().byTool.bash.failed, 2, "the seeded failure plus the interrupted call");
+		assert.equal(api.getActivity().phase, "idle");
+		// Events that arrive without a run, or twice, must not corrupt the state.
+		await fire("agent_end");
+		await fire("tool_execution_end", { toolCallId: "never-started", toolName: "bash", isError: true });
+		assert.equal(api.getStats().toolCalls, 7, "an unmatched end still counts as a settled call");
+	} finally {
+		Date.now = realNow;
+	}
+	console.log("OK  activity API: live phase, labels, running calls, session stats, subscriptions, seeding");
+}
+
 process.env.HOME = realHome;
 const { execFileSync } = await import("node:child_process");
 execFileSync("trash", [tmpHome]);

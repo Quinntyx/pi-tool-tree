@@ -42,6 +42,7 @@ Claude Code inspired tool rendering for Pi — Shiki-powered diffs, status dots,
 - **Quieter layout**: short `├` / `╰` connectors, assistant prose left in pi's own flush-left Markdown rendering, blank lines between transcript blocks, and default Markdown bullets. Settled calls use green `✓` or red `!`; running calls breathe a sized light (`● → • → · → · → •`) — group headers keep a steady `●`, since their label already shimmers. `pendingIndicator` also offers `spinner` (braille `⠃⠉⠘⠰⢠⣀⡄⠆`) and `dot` (classic blinking `●`).
 - **Extra detail toggle** with `Ctrl+Shift+O`, increasing expanded preview caps without making the default view heavy
 - **Global border patch** for all tool rows, including unknown/custom tools
+- **Activity API for other extensions** — ask what the session is doing (phase, current activity label, calls running now) and what it has done (work time, runs, turns, call counts, per-tool and per-label breakdowns), or subscribe to changes. See the [API](#api) section and [API.md](./API.md).
 
 ## Configuration
 
@@ -197,7 +198,8 @@ pi.registerTool(activity?.wrapTool ? activity.wrapTool(tool) : tool);
 `working` in `prepareArguments`, and strips the label from the arguments your
 `execute` receives. It is a no-op when `toolActivityParam` is `false`, so plugins
 can call it unconditionally. Toggling the setting applies to the core tools
-immediately and to plugin tools the next time they register.
+immediately and to plugin tools the next time they register. The same object also
+answers the activity queries — see [API.md](./API.md).
 ### Output modes
 
 | Setting | Values | Default |
@@ -228,6 +230,40 @@ immediately and to plugin tools the next time they register.
 | `diffViewMode` | `auto` | `auto` uses split left/right previews at `diffSplitMinWidth` and unified previews below it; `split` and `unified` force a layout when physically possible |
 | `diffSplitMinWidth` | `132` | Minimum available width where `auto` may use a split preview (long visible lines still select unified mode) |
 | `diffCollapsedLines` | `24` | Diff lines before collapsing |
+
+## API
+
+Other extensions can ask what the session is doing and what it has done, without
+scraping the transcript or hooking the renderer. The API is published on
+`globalThis` under `Symbol.for("pi-tool-tree:api")` (and under the legacy
+`Symbol.for("pi-tool-tree:activity-api")`, which resolves to the same object):
+
+```ts
+const api = (globalThis as any)[Symbol.for("pi-tool-tree:api")];
+if (api?.getActivity) {
+	const { phase, label, isThinking, isRunningTool, run } = api.getActivity();
+	// phase: "idle" | "waiting" | "thinking" | "responding" | "tool"
+	// label: "implementing"   run: { elapsedMs, turns, toolCalls, toolMs, … }
+}
+```
+
+| Method | Returns |
+|--------|---------|
+| `getActivity()` | Live snapshot: phase (idle / waiting / thinking / responding / tool), the current activity label and how long it has been current, calls running right now, and the current run's counters |
+| `getStats()` | Cumulative session statistics: completed work time, runs, turns, tool calls and failures, tool and reasoning time, plus per-tool and per-label breakdowns (resumed history included) |
+| `subscribe(listener)` | Change notifications (`run-start`, `turn-start`, `label-change`, `thinking-start/end`, `stream-start/end`, `tool-start/end`, `run-end`) with the resulting snapshot; returns an unsubscribe function |
+| `formatDuration(ms)` | The transcript's own duration formatting (`<1s`, `12s`, `3m 05s`, `1h 02m`) |
+| `wrapTool(tool)` | The opt-in `activity` param hook for tools another extension registers (see [Plugin integration](#plugin-integration-opt-in)) |
+
+State is fed by pi's own events rather than by the renderer, so it is correct in
+hosts that never paint the grouped rows (RPC, headless, tests), and durations are
+measured at the moment you ask — a status line can poll `getActivity()` on its own
+repaint cadence. Snapshots are copies, listeners that throw are ignored, and
+subscriptions do not survive a reload.
+
+See [API.md](./API.md) for the full reference: every field, the change table,
+what counts as a run/turn/call, live-versus-settled semantics, the resume-seeding
+rules, and copy-pasteable TypeScript types.
 
 ## Notes
 

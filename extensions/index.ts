@@ -900,7 +900,11 @@ function toolActivityLines(tool: any, width: number): string[] {
 /** Activity labels group neighboring tool calls into model-named phases. */
 const ACTIVITY_PARAM = "activity";
 const ACTIVITY_WRAPPED = Symbol.for("pi-tool-tree:activity-wrapped");
-/** Opt-in integration key other tool plugins use to apply the activity param. */
+/**
+ * Opt-in integration key other tool plugins use to apply the activity param.
+ * Kept for plugins written before the query API existed; it resolves to the same
+ * object as `TOOL_TREE_API_KEY`.
+ */
 const ACTIVITY_API_KEY = Symbol.for("pi-tool-tree:activity-api");
 const DEFAULT_ACTIVITY_LABEL = "working";
 
@@ -1107,36 +1111,622 @@ function wrapWithActivity(record: any): any {
 }
 
 /**
- * Opt-in hook for other tool plugins.
+ * Public API for other extensions: the opt-in activity-label hook plus a
+ * read-only view of what the session is doing.
  *
  * `pi.getAllTools()` only exposes ToolInfo (name/description/parameters — no
  * `execute`), so the activity param cannot be swept onto tools this extension
  * does not own. A plugin opts in by wrapping its own definition before
  * registering it:
  *
- *   const activity = (globalThis as any)[Symbol.for("pi-tool-tree:activity-api")];
+ *   const activity = (globalThis as any)[Symbol.for("pi-tool-tree:api")];
  *   pi.registerTool(activity?.wrapTool ? activity.wrapTool(tool) : tool);
  *
  * `wrapTool` is a no-op when the `toolActivityParam` setting is off, so plugins
  * can call it unconditionally.
+ *
+ * The same object answers what the session is doing right now (`getActivity`),
+ * what it has done so far (`getStats`), and when either changes (`subscribe`).
+ * State is fed by pi's own events rather than by the transcript renderer, so it
+ * is correct in hosts that never paint the grouped rows (RPC, headless, tests)
+ * and never depends on a component being on screen. Durations are measured to
+ * the moment a getter or listener runs, so a status line can poll them on its
+ * own repaint cadence. Full reference: API.md.
  */
-interface ActivityIntegration {
+/** Canonical key. `pi-tool-tree:activity-api` is the key the label hook shipped
+ *  with and resolves to the same object, so existing plugins keep working. */
+const TOOL_TREE_API_KEY = Symbol.for("pi-tool-tree:api");
+
+/** What the agent is doing. `idle` has no run in flight; `waiting` has one but
+ *  nothing is streaming (awaiting the model, or between calls). */
+type ActivityPhase = "idle" | "waiting" | "thinking" | "responding" | "tool";
+
+/** A tool call that is executing right now. */
+interface ActivityRunningCall {
+	toolCallId: string;
+	toolName: string;
+	/** Activity label in effect when the call started. */
+	label: string;
+	/** Epoch milliseconds. */
+	startedAt: number;
+	/** Milliseconds this call has been running, measured to this call. */
+	elapsedMs: number;
+}
+
+/** Counters for the current agent run. All zero while idle. */
+interface ActivityRunStats {
+	startedAt: number | null;
+	/** Wall time since the run started. */
+	elapsedMs: number;
+	turns: number;
+	/** Calls started in this run, including the ones still running. */
+	toolCalls: number;
+	toolCallsRunning: number;
+	toolCallsFailed: number;
+	/** Summed call spans, including running calls measured to this call. Parallel
+	 *  calls each contribute their own span, so this can exceed the run's wall time. */
+	toolMs: number;
+	/** Summed reasoning time, including a block that is still streaming. */
+	thinkingMs: number;
+}
+
+/** A point-in-time answer to "what is happening right now". */
+interface ActivitySnapshot {
+	phase: ActivityPhase;
+	/** A run is in flight (equivalent to `phase !== "idle"`). */
+	isWorking: boolean;
+	/** Reasoning is streaming right now. */
+	isThinking: boolean;
+	/** At least one tool call is executing right now. */
+	isRunningTool: boolean;
+	/** Model-declared activity label for the current phase, e.g. "implementing".
+	 *  Never null while working: a phase the model has not named yet reports
+	 *  `defaultLabel`, and unlabeled calls inherit the previous label. */
+	label: string | null;
+	/** When the current label took effect. */
+	labelStartedAt: number | null;
+	/** Wall time spent on the current label, measured to this call. */
+	labelElapsedMs: number;
+	/** Calls started under the current label. */
+	labelCalls: number;
+	/** Start of the reasoning block that is streaming, or null. */
+	thinkingStartedAt: number | null;
+	thinkingElapsedMs: number;
+	/** Calls executing right now, in start order. */
+	calls: ActivityRunningCall[];
+	run: ActivityRunStats;
+}
+
+interface ActivityToolStat {
+	calls: number;
+	failed: number;
+	/** Milliseconds; only measured for calls made in this process. */
+	durationMs: number;
+}
+
+interface ActivityLabelStat {
+	calls: number;
+	durationMs: number;
+}
+
+/** Cumulative statistics since the session began (resumed history included). */
+interface ActivitySessionStats {
+	/** Completed agent work: the sum of finished runs, idle time excluded. This is
+	 *  the same number the transcript's `Total time` reports. */
+	workedMs: number;
+	runs: number;
+	/** Turns across the finished runs of this session. */
+	turns: number;
+	/** Calls that finished, in this session and in resumed history. */
+	toolCalls: number;
+	toolCallsFailed: number;
+	toolMs: number;
+	thinkingMs: number;
+	thinkingBlocks: number;
+	byTool: Record<string, ActivityToolStat>;
+	byLabel: Record<string, ActivityLabelStat>;
+}
+
+type ActivityChangeType =
+	| "run-start"
+	| "turn-start"
+	| "label-change"
+	| "thinking-start"
+	| "thinking-end"
+	| "stream-start"
+	| "stream-end"
+	| "tool-start"
+	| "tool-end"
+	| "run-end";
+
+/** What changed, delivered alongside the resulting snapshot. */
+interface ActivityChange {
+	type: ActivityChangeType;
+	toolCallId?: string;
+	toolName?: string;
+	/** Set on `label-change` and `tool-start`. */
+	label?: string;
+	/** Set on `tool-end`. */
+	isError?: boolean;
+	/** Set on `thinking-end`, `tool-end`, and `run-end`. */
+	durationMs?: number;
+	/** Set on `run-end`: the run that just finished. The snapshot is already idle,
+	 *  so this is where a finished run's totals stay readable. */
+	run?: ActivityRunStats;
+}
+
+type ActivityListener = (activity: ActivitySnapshot, change: ActivityChange) => void;
+
+interface ActivityApi {
+	/** Integration contract version for `wrapTool`. The query methods are
+	 *  additive, so feature-detect them instead of branching on this. */
 	version: 1;
 	param: string;
 	defaultLabel: string;
 	enabled(): boolean;
 	wrapTool<T extends object>(tool: T): T;
+	getActivity(): ActivitySnapshot;
+	getStats(): ActivitySessionStats;
+	subscribe(listener: ActivityListener): () => void;
+	/** The transcript's own duration formatting (`<1s`, `12s`, `3m 05s`, `1h 02m`). */
+	formatDuration(ms: number): string;
 }
 
-function publishActivityIntegration(): void {
-	const integration: ActivityIntegration = {
+interface ActivityCallState {
+	toolCallId: string;
+	toolName: string;
+	label: string;
+	startedAt: number;
+}
+
+const activityState = {
+	/** Start of the run in flight, or null while idle. */
+	runStartedAt: null as number | null,
+	turns: 0,
+	label: null as string | null,
+	labelStartedAt: null as number | null,
+	labelCalls: 0,
+	/** Start of the reasoning block streaming right now, or null. */
+	thinkingStartedAt: null as number | null,
+	/** Reasoning finished within this run. */
+	thinkingMs: 0,
+	/** The model is streaming output right now (answer text or call arguments). */
+	streaming: false,
+	calls: new Map<string, ActivityCallState>(),
+	toolCalls: 0,
+	toolFailures: 0,
+	toolMs: 0,
+	listeners: new Set<ActivityListener>(),
+	session: {
+		runs: 0,
+		turns: 0,
+		toolCalls: 0,
+		toolCallsFailed: 0,
+		toolMs: 0,
+		thinkingMs: 0,
+		thinkingBlocks: 0,
+		byTool: {} as Record<string, ActivityToolStat>,
+		byLabel: {} as Record<string, ActivityLabelStat>,
+	},
+};
+
+function bumpActivityToolStat(stats: Record<string, ActivityToolStat>, key: string, durationMs: number, failed: boolean): void {
+	const entry = stats[key] ?? (stats[key] = { calls: 0, failed: 0, durationMs: 0 });
+	entry.calls++;
+	if (failed) entry.failed++;
+	entry.durationMs += Math.max(0, durationMs);
+}
+
+function bumpActivityLabelStat(stats: Record<string, ActivityLabelStat>, key: string, durationMs: number): void {
+	const entry = stats[key] ?? (stats[key] = { calls: 0, durationMs: 0 });
+	entry.calls++;
+	entry.durationMs += Math.max(0, durationMs);
+}
+
+function activityRunStats(now: number): ActivityRunStats {
+	const started = activityState.runStartedAt;
+	let liveToolMs = 0;
+	for (const call of activityState.calls.values()) liveToolMs += Math.max(0, now - call.startedAt);
+	const liveThinkingMs = activityState.thinkingStartedAt === null ? 0 : Math.max(0, now - activityState.thinkingStartedAt);
+	return {
+		startedAt: started,
+		elapsedMs: started === null ? 0 : Math.max(0, now - started),
+		turns: activityState.turns,
+		toolCalls: activityState.toolCalls,
+		toolCallsRunning: activityState.calls.size,
+		toolCallsFailed: activityState.toolFailures,
+		toolMs: activityState.toolMs + liveToolMs,
+		thinkingMs: activityState.thinkingMs + liveThinkingMs,
+	};
+}
+
+function activitySnapshot(): ActivitySnapshot {
+	const now = Date.now();
+	const calls = [...activityState.calls.values()].map((call) => ({
+		toolCallId: call.toolCallId,
+		toolName: call.toolName,
+		label: call.label,
+		startedAt: call.startedAt,
+		elapsedMs: Math.max(0, now - call.startedAt),
+	}));
+	const thinking = activityState.thinkingStartedAt !== null;
+	const phase: ActivityPhase = activityState.runStartedAt === null
+		? "idle"
+		: calls.length > 0
+			? "tool"
+			: thinking
+				? "thinking"
+				: activityState.streaming
+					? "responding"
+					: "waiting";
+	return {
+		phase,
+		isWorking: activityState.runStartedAt !== null,
+		isThinking: thinking,
+		isRunningTool: calls.length > 0,
+		label: activityState.label,
+		labelStartedAt: activityState.labelStartedAt,
+		labelElapsedMs: activityState.labelStartedAt === null ? 0 : Math.max(0, now - activityState.labelStartedAt),
+		labelCalls: activityState.labelCalls,
+		thinkingStartedAt: activityState.thinkingStartedAt,
+		thinkingElapsedMs: thinking ? Math.max(0, now - (activityState.thinkingStartedAt as number)) : 0,
+		calls,
+		run: activityRunStats(now),
+	};
+}
+
+function activitySessionStats(): ActivitySessionStats {
+	const session = activityState.session;
+	const byTool: Record<string, ActivityToolStat> = {};
+	for (const [name, stat] of Object.entries(session.byTool)) byTool[name] = { ...stat };
+	const byLabel: Record<string, ActivityLabelStat> = {};
+	for (const [label, stat] of Object.entries(session.byLabel)) byLabel[label] = { ...stat };
+	return {
+		workedMs: Math.max(0, sessionWorkedTotalMs),
+		runs: session.runs,
+		turns: session.turns,
+		toolCalls: session.toolCalls,
+		toolCallsFailed: session.toolCallsFailed,
+		toolMs: session.toolMs,
+		thinkingMs: session.thinkingMs,
+		thinkingBlocks: session.thinkingBlocks,
+		byTool,
+		byLabel,
+	};
+}
+
+/** Tell subscribers what changed. The snapshot is built once per change and
+ *  never handed out live, so listeners cannot corrupt tracked state — and a
+ *  throwing listener must never take the agent down, so each call is guarded. */
+function emitActivityChange(type: ActivityChangeType, detail: Omit<ActivityChange, "type"> = {}): void {
+	if (activityState.listeners.size === 0) return;
+	const activity = activitySnapshot();
+	const change: ActivityChange = { type, ...detail };
+	for (const listener of [...activityState.listeners]) {
+		try {
+			listener(activity, change);
+		} catch { /* noop */ }
+	}
+}
+
+/** A run is one prompt-to-answer cycle; `agent_end` closes it. Guarded so the
+ *  `before_agent_start` / `agent_start` pair and steering injections (which can
+ *  re-fire while the agent is busy) do not reset a run mid-flight. */
+function activityStartRun(): void {
+	if (activityState.runStartedAt !== null) return;
+	const now = Date.now();
+	activityState.runStartedAt = now;
+	activityState.turns = 0;
+	// Nothing has named this phase yet; the transcript's own fallback is `working`.
+	activityState.label = DEFAULT_ACTIVITY_LABEL;
+	activityState.labelStartedAt = now;
+	activityState.labelCalls = 0;
+	activityState.thinkingStartedAt = null;
+	activityState.thinkingMs = 0;
+	activityState.streaming = false;
+	activityState.calls.clear();
+	activityState.toolCalls = 0;
+	activityState.toolFailures = 0;
+	activityState.toolMs = 0;
+	emitActivityChange("run-start");
+}
+
+function activityStartTurn(): void {
+	if (activityState.runStartedAt === null) {
+		// Hosts that never emit agent_start: the first turn is the run boundary.
+		activityStartRun();
+		activityState.turns = 1;
+	} else {
+		activityState.turns++;
+	}
+	emitActivityChange("turn-start");
+}
+
+function activityStartThinking(): void {
+	if (activityState.thinkingStartedAt !== null) return;
+	activityState.thinkingStartedAt = Date.now();
+	emitActivityChange("thinking-start");
+}
+
+function activityEndThinking(): void {
+	const started = activityState.thinkingStartedAt;
+	if (started === null) return;
+	const durationMs = Math.max(0, Date.now() - started);
+	activityState.thinkingStartedAt = null;
+	activityState.thinkingMs += durationMs;
+	activityState.session.thinkingMs += durationMs;
+	activityState.session.thinkingBlocks++;
+	emitActivityChange("thinking-end", { durationMs });
+}
+
+function activityStartStreaming(): void {
+	if (activityState.streaming) return;
+	activityState.streaming = true;
+	emitActivityChange("stream-start");
+}
+
+function activityEndStreaming(): void {
+	if (!activityState.streaming) return;
+	activityState.streaming = false;
+	emitActivityChange("stream-end");
+}
+
+/** Reasoning streams from `thinking_start` to `thinking_end`, but some providers
+ *  skip the end (or the start) marker. Any other stream event on the same
+ *  message means reasoning is over, and a delta with no start means it began. */
+function activityMessageUpdate(event: any): void {
+	const evt = event?.assistantMessageEvent;
+	const message = event?.message;
+	if (!evt || typeof evt.type !== "string") return;
+	if (message && typeof message === "object" && message.role !== "assistant") return;
+	switch (evt.type) {
+		case "thinking_start":
+			activityStartThinking();
+			return;
+		case "thinking_delta":
+			activityStartThinking();
+			return;
+		case "thinking_end":
+			activityEndThinking();
+			return;
+		case "text_start":
+		case "text_delta":
+		case "toolcall_start":
+		case "toolcall_delta":
+			// Model output means reasoning is over, even without a thinking_end.
+			activityEndThinking();
+			activityStartStreaming();
+			return;
+		case "text_end":
+		case "toolcall_end":
+			activityEndStreaming();
+			return;
+		default:
+			return;
+	}
+}
+
+/** A new assistant message owns a fresh thinking/streaming lifecycle; a missing
+ *  end marker on the previous one must not leak a phase into this one. */
+function activityMessageStart(event: any): void {
+	const message = event?.message;
+	if (message && typeof message === "object" && message.role !== "assistant") return;
+	activityEndThinking();
+	activityEndStreaming();
+}
+
+function activityMessageEnd(event: any): void {
+	const message = event?.message;
+	if (message && typeof message === "object" && message.role !== "assistant") return;
+	activityEndThinking();
+	activityEndStreaming();
+}
+
+/** Resolve the phase label for a call: what the model declared, else the label
+ *  already in effect (unlabeled calls continue the current group), else the
+ *  transcript's fallback label. */
+function activityResolveLabel(args: any): string {
+	const declared = normalizeActivityLabel(args?.[ACTIVITY_PARAM]);
+	if (declared) return declared;
+	return activityState.label ?? DEFAULT_ACTIVITY_LABEL;
+}
+
+function activityToolStart(event: any): void {
+	const toolCallId = typeof event?.toolCallId === "string" ? event.toolCallId : "";
+	if (!toolCallId) return;
+	// A call can only happen inside a run, but be forgiving: an extension loaded
+	// mid-run (or a replayed event) should still report the call.
+	if (activityState.runStartedAt === null) activityStartRun();
+	const now = Date.now();
+	const label = activityResolveLabel(event?.args);
+	if (label !== activityState.label) {
+		activityState.label = label;
+		activityState.labelStartedAt = now;
+		activityState.labelCalls = 0;
+		emitActivityChange("label-change", { label });
+	}
+	activityState.labelCalls++;
+	activityState.toolCalls++;
+	const toolName = typeof event?.toolName === "string" && event.toolName ? event.toolName : "tool";
+	activityState.calls.set(toolCallId, { toolCallId, toolName, label, startedAt: now });
+	emitActivityChange("tool-start", { toolCallId, toolName, label });
+}
+
+function activityToolEnd(event: any): void {
+	const toolCallId = typeof event?.toolCallId === "string" ? event.toolCallId : "";
+	const call = toolCallId ? activityState.calls.get(toolCallId) : undefined;
+	const isError = event?.isError === true;
+	const toolName = call?.toolName
+		?? (typeof event?.toolName === "string" && event.toolName ? event.toolName : "tool");
+	const label = call?.label ?? activityState.label ?? DEFAULT_ACTIVITY_LABEL;
+	const durationMs = call ? Math.max(0, Date.now() - call.startedAt) : 0;
+	if (toolCallId) activityState.calls.delete(toolCallId);
+	activityState.toolMs += durationMs;
+	if (isError) activityState.toolFailures++;
+	const session = activityState.session;
+	session.toolCalls++;
+	if (isError) session.toolCallsFailed++;
+	session.toolMs += durationMs;
+	bumpActivityToolStat(session.byTool, toolName, durationMs, isError);
+	bumpActivityLabelStat(session.byLabel, label, durationMs);
+	emitActivityChange("tool-end", { toolCallId, toolName, isError, durationMs });
+}
+
+function activityEndRun(): void {
+	if (activityState.runStartedAt === null) return;
+	// A call still in flight when the run ends never produced a result; settle it
+	// as a failure so it is counted rather than silently dropped.
+	for (const call of [...activityState.calls.values()]) {
+		activityToolEnd({ toolCallId: call.toolCallId, toolName: call.toolName, isError: true });
+	}
+	activityEndThinking();
+	activityEndStreaming();
+	const run = activityRunStats(Date.now());
+	activityState.session.runs++;
+	activityState.session.turns += run.turns;
+	activityState.runStartedAt = null;
+	activityState.turns = 0;
+	activityState.label = null;
+	activityState.labelStartedAt = null;
+	activityState.labelCalls = 0;
+	activityState.toolCalls = 0;
+	activityState.toolFailures = 0;
+	activityState.toolMs = 0;
+	activityState.thinkingMs = 0;
+	emitActivityChange("run-end", { durationMs: run.elapsedMs, run });
+}
+
+/** Counters survive resume/reload: walked back from the active branch so
+ *  `getStats()` reports the whole session, not just this process. Durations of
+ *  calls made before this process start are unknown (they were never recorded),
+ *  so call counts are seeded while call time is not; reasoning time is, because
+ *  completed thinking blocks stamp their duration into the message. */
+function seedActivitySession(messages: any[]): void {
+	const session = activityState.session;
+	session.runs = 0;
+	session.turns = 0;
+	session.toolCalls = 0;
+	session.toolCallsFailed = 0;
+	session.toolMs = 0;
+	session.thinkingMs = 0;
+	session.thinkingBlocks = 0;
+	session.byTool = {};
+	session.byLabel = {};
+	// Calls are counted from the assistant's own `toolCall` blocks; a failed
+	// `toolResult` marks that call as failed rather than counting a second call.
+	const countedCalls = new Set<string>();
+	let runTurns = 0;
+	for (const message of messages) {
+		if (!message || typeof message !== "object") continue;
+		if (message.role === "user") {
+			runTurns = 0;
+			continue;
+		}
+		if (message.role === "toolResult") {
+			if (message.isError !== true) continue;
+			session.toolCallsFailed++;
+			const failedTool = typeof message.toolName === "string" && message.toolName ? message.toolName : "tool";
+			const entry = session.byTool[failedTool] ?? (session.byTool[failedTool] = { calls: 0, failed: 0, durationMs: 0 });
+			entry.failed++;
+			// A result whose call is not in the branch (compacted or edited history)
+			// still stands for a call that happened.
+			const resultCallId = typeof message.toolCallId === "string" ? message.toolCallId : "";
+			if (!resultCallId || !countedCalls.has(resultCallId)) entry.calls++;
+			continue;
+		}
+		if (message.role !== "assistant") continue;
+		runTurns++;
+		for (const block of Array.isArray(message.content) ? message.content : []) {
+			if (!block || typeof block !== "object") continue;
+			if (block.type === "toolCall") {
+				session.toolCalls++;
+				if (typeof block.id === "string" && block.id) countedCalls.add(block.id);
+				bumpActivityToolStat(session.byTool, typeof block.name === "string" && block.name ? block.name : "tool", 0, false);
+				bumpActivityLabelStat(session.byLabel, normalizeActivityLabel(block.arguments?.[ACTIVITY_PARAM]) || DEFAULT_ACTIVITY_LABEL, 0);
+				continue;
+			}
+			if (block.type !== "thinking") continue;
+			const durationMs = message[THINKING_DURATION_KEY];
+			if (typeof durationMs !== "number" || !(durationMs > 0)) continue;
+			session.thinkingMs += durationMs;
+			session.thinkingBlocks++;
+		}
+		if (message.stopReason !== "stop") continue;
+		if (typeof message[WORKED_DURATION_KEY] !== "number") continue;
+		session.runs++;
+		const stamped = message[WORKED_TURNS_KEY];
+		session.turns += typeof stamped === "number" && stamped > 0 ? stamped : runTurns;
+	}
+}
+
+function activityResetRun(): void {
+	activityState.runStartedAt = null;
+	activityState.turns = 0;
+	activityState.label = null;
+	activityState.labelStartedAt = null;
+	activityState.labelCalls = 0;
+	activityState.thinkingStartedAt = null;
+	activityState.thinkingMs = 0;
+	activityState.streaming = false;
+	activityState.calls.clear();
+	activityState.toolCalls = 0;
+	activityState.toolFailures = 0;
+	activityState.toolMs = 0;
+}
+
+function activitySubscribe(listener: ActivityListener): () => void {
+	if (typeof listener !== "function") return () => {};
+	activityState.listeners.add(listener);
+	let subscribed = true;
+	return () => {
+		if (!subscribed) return;
+		subscribed = false;
+		activityState.listeners.delete(listener);
+	};
+}
+
+function publishActivityApi(): void {
+	const api: ActivityApi = {
 		version: 1,
 		param: ACTIVITY_PARAM,
 		defaultLabel: DEFAULT_ACTIVITY_LABEL,
 		enabled: toolActivityParamEnabled,
 		wrapTool: <T extends object>(tool: T): T => (toolActivityParamEnabled() ? wrapWithActivity(tool) : tool),
+		getActivity: activitySnapshot,
+		getStats: activitySessionStats,
+		subscribe: activitySubscribe,
+		formatDuration: formatBashDuration,
 	};
-	(globalThis as any)[ACTIVITY_API_KEY] = integration;
+	// One object, two keys: plugins written against either name share the same
+	// state and subscriptions.
+	(globalThis as any)[TOOL_TREE_API_KEY] = api;
+	(globalThis as any)[ACTIVITY_API_KEY] = api;
+}
+
+/** Feed the tracker from pi's events and publish the API. Registered early so
+ *  the object is in place before any tool registers or a run starts. */
+function registerActivityApi(pi: ExtensionAPI): void {
+	publishActivityApi();
+	pi.on("before_agent_start", async () => { activityStartRun(); });
+	pi.on("agent_start", async () => { activityStartRun(); });
+	pi.on("turn_start", async () => { activityStartTurn(); });
+	pi.on("message_start", async (event) => { activityMessageStart(event); });
+	pi.on("message_update", async (event) => { activityMessageUpdate(event); });
+	pi.on("message_end", async (event) => { activityMessageEnd(event); });
+	pi.on("tool_execution_start", async (event) => { activityToolStart(event); });
+	pi.on("tool_execution_end", async (event) => { activityToolEnd(event); });
+	pi.on("agent_end", async () => { activityEndRun(); });
+	// Rebuild counters from the active branch on resume/reload/fork, the same way
+	// the transcript re-seeds its work totals.
+	pi.on("session_start", async (_event, ctx) => {
+		activityResetRun();
+		const messages = sessionBranchMessages(ctx);
+		if (messages) seedActivitySession(messages);
+	});
+	pi.on("session_shutdown", async () => {
+		activityResetRun();
+		activityState.listeners.clear();
+	});
 }
 
 /** Tools this extension owns, kept as factories so `/cc-tools activity` can
@@ -7522,8 +8112,9 @@ export default function (pi: ExtensionAPI) {
 	const cwd = process.cwd();
 	const sp = (path: string) => shortPath(cwd, path);
 
-	// Advertise the opt-in activity integration before any tool registers.
-	publishActivityIntegration();
+	// Advertise the opt-in activity integration and start tracking activity before
+	// any tool registers or a run starts.
+	registerActivityApi(pi);
 
 	const readTool = createReadTool(cwd);
 	registerCoreTool(pi, "read", () => ({
