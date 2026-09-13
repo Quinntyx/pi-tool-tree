@@ -914,15 +914,22 @@ const DEFAULT_ACTIVITY_LABEL = "working";
  * Shift+Tab, and model switches. The level color is used as-is: pushing it toward the
  * panel's emphasis color costs the chroma that makes it read as a palette color.
  */
-const SHIMMER_PERIOD_MS = 1200;
+const SHIMMER_PERIOD_MS = 1800;
 /** Re-render cadence while a shimmering group is on screen (the ● blink stays 500ms). */
 const SHIMMER_INTERVAL_MS = 80;
 /** Highlight band half-width, as a fraction of the label length. */
-const SHIMMER_BAND_RATIO = 0.5;
+const SHIMMER_BAND_RATIO = 0.65;
 /** Mix toward the band color at the band's center: the level color itself. */
 const SHIMMER_PEAK_MIX = 1;
 /** Exponent on the cosine falloff; >1 keeps the tint in a hot core instead of a wash. */
 const SHIMMER_FALLOFF_POW = 1.5;
+/**
+ * Minimum distance between the band and the label's own color. A muted level (or a level
+ * color close to the theme's text) left the band indistinguishable from the label, so the
+ * "sweep" read as a static word — the band always steps away from the label to keep at
+ * least this much separation.
+ */
+const SHIMMER_MIN_BAND_DELTA = 72;
 /** Pi thinking level -> theme color key (the same mapping pi uses for thinking borders). */
 const THINKING_LEVEL_KEYS: Record<string, string> = {
 	off: "thinkingOff",
@@ -982,6 +989,34 @@ const TOOL_TIMINGS = new Map<string, { start: number; end?: number }>();
  * moment prose arrived. Also lost on restart, like the timings it is measured from.
  */
 const GROUP_ELAPSED_HIGH_WATER = new Map<string, number>();
+
+/**
+ * Wall-clock start of a live chunk, recorded the first time the group renders live.
+ *
+ * A running group ticks against real time, but the rows it sums are re-measured on
+ * every render: several thinking rows can share one in-flight block, and a chatty
+ * provider keeps the text-length fallback growing with the stream. Summing those
+ * made the header climb many times faster than the clock ("20 seconds per second"),
+ * so the live value comes from this single anchor instead.
+ */
+const GROUP_WALL_START = new Map<string, number>();
+
+function liveGroupSpanMs(toolCallId: string, seedMs: number): number {
+	const now = Date.now();
+	let start = GROUP_WALL_START.get(toolCallId);
+	if (start === undefined) {
+		if (GROUP_WALL_START.size > 4096) {
+			let dropped = 0;
+			for (const key of GROUP_WALL_START.keys()) {
+				GROUP_WALL_START.delete(key);
+				if (++dropped >= 1024) break;
+			}
+		}
+		start = now - Math.max(0, seedMs);
+		GROUP_WALL_START.set(toolCallId, start);
+	}
+	return Math.max(0, now - start);
+}
 
 function recordGroupElapsed(toolCallId: string, ms: number): void {
 	if (GROUP_ELAPSED_HIGH_WATER.size > 4096) {
@@ -1279,15 +1314,25 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 		// different activity label supersedes it, or the run ends. Individual calls settling
 		// does not close it — the agent is still thinking, or about to call again.
 		const live = trailing && (agentWorking() || pendingCount > 0);
-		// While live the header clock runs on the wall (`max(sum, now - chunkStart)`), so it
-		// keeps ticking between calls instead of freezing on the last measured activity. A
-		// closed chunk keeps the highest value it reached: the measured sum would otherwise
-		// restart from its recorded spans and make the total drop back on the next frame.
-		const measuredMs = live ? Math.max(totalMs + thinkingMs, Date.now() - groupChunkStartMs(items)) : 0;
+		// A live chunk ticks against one wall clock anchored when it first rendered live,
+		// so it keeps counting between calls instead of freezing on the last measured
+		// activity. The measured sum can only ever *lower* that live reading (its rows can
+		// overlap — see GROUP_WALL_START), so it is capped by the wall span while live and
+		// used as-is once the chunk settles and the rows no longer overlap. A closed chunk
+		// keeps the highest value it reached: recomputing from the recorded spans alone
+		// would make the total drop back on the next frame.
 		const anchorId = tools.length > 0 ? tools[0].tool?.toolCallId : undefined;
+		const measuredSumMs = totalMs + thinkingMs;
+		const wallSpanMs = live
+			? typeof anchorId === "string"
+				? liveGroupSpanMs(anchorId, measuredSumMs)
+				: Math.max(0, Date.now() - groupChunkStartMs(items))
+			: 0;
+		const boundedSumMs = live ? Math.min(measuredSumMs, wallSpanMs) : measuredSumMs;
+		const measuredMs = live ? Math.max(boundedSumMs, wallSpanMs) : 0;
 		if (live && typeof anchorId === "string") recordGroupElapsed(anchorId, measuredMs);
 		const reachedMs = typeof anchorId === "string" ? (GROUP_ELAPSED_HIGH_WATER.get(anchorId) ?? 0) : 0;
-		const elapsedMs = Math.max(totalMs + thinkingMs, measuredMs, reachedMs);
+		const elapsedMs = Math.max(boundedSumMs, measuredMs, reachedMs);
 		// A reading of 0 still prints (`<1s`): a call that just started is a measurement,
 		// while a group with no timing data at all prints none.
 		if (timed > 0 || thought > 0) parts.push(formatBashDuration(elapsedMs));
@@ -1641,6 +1686,8 @@ const LEGACY_WORKED_DURATION_MARKER = "Turn took";
 const WORKED_DURATION_MARKERS = [WORKED_DURATION_MARKER, LEGACY_WORKED_DURATION_MARKER];
 const WORKED_DURATION_LINE_PATTERN = /^✻ (?:Agent|Turn) took [^\r\n]+$/;
 const THINKING_DURATION_KEY = "_piClaudeStyleThinkingDurationMs";
+/** Pinned text-rate estimate, used only when no wall clock exists for a live block. */
+const THINKING_ESTIMATE_KEY = "_piClaudeStyleThinkingEstimateMs";
 const THINKING_ACTIVE_KEY = "_piClaudeStyleThinkingActive";
 const MIN_THINKING_SUMMARY_MS = 100;
 
@@ -1806,6 +1853,17 @@ class HiddenThinkingSummary {
 	}
 }
 
+/** Wall-clock elapsed since this assistant message started streaming, or null when
+ *  the message is not an in-flight assistant message. */
+function liveMessageElapsedMs(message: any): number | null {
+	if (!message || message.role !== "assistant") return null;
+	if (isAssistantThinkingComplete(undefined, message)) return null;
+	const stamped = (message as any)?.[WORKED_START_KEY];
+	const started = typeof stamped === "number" && stamped > 0 ? stamped : currentAssistantMessageStartMs;
+	if (typeof started !== "number" || started <= 0) return null;
+	return Math.max(0, Date.now() - started);
+}
+
 function getMessageThinkingDurationMs(message: any): number {
 	const stored = (message as any)?.[THINKING_DURATION_KEY];
 	if (typeof stored === "number" && stored > 0) return stored;
@@ -1815,6 +1873,13 @@ function getMessageThinkingDurationMs(message: any): number {
 	if (typeof (message as any)?.[WORKED_DURATION_KEY] === "number" && (message as any)[WORKED_DURATION_KEY] > 0) {
 		return (message as any)[WORKED_DURATION_KEY];
 	}
+	// A block that is still streaming without any timing event (some providers send
+	// thinking deltas but never a start/end marker) has no measured duration. Fall
+	// back to the message's own wall clock: the text-length estimate below assumes
+	// 150 chars/s of thinking, so a model streaming thousands of chars per second
+	// reported tens of seconds per second and the number climbed absurdly.
+	const liveElapsed = liveMessageElapsedMs(message);
+	if (liveElapsed !== null) return liveElapsed;
 	let totalChars = 0;
 	if (Array.isArray(message?.content)) {
 		for (const block of message.content) {
@@ -1823,7 +1888,15 @@ function getMessageThinkingDurationMs(message: any): number {
 			}
 		}
 	}
-	return Math.max(1000, Math.round((totalChars / 150) * 1000));
+	// Last resort, with no clock to measure from: a historical message's thinking text
+	// yields a fixed estimate, but an in-flight one would keep re-estimating against a
+	// growing stream. Pin the first reading so it cannot climb with it.
+	const estimate = Math.max(1000, Math.round((totalChars / 150) * 1000));
+	if (isAssistantThinkingComplete(undefined, message)) return estimate;
+	const pinned = (message as any)?.[THINKING_ESTIMATE_KEY];
+	if (typeof pinned === "number" && pinned > 0) return pinned;
+	if (message && typeof message === "object") (message as any)[THINKING_ESTIMATE_KEY] = estimate;
+	return estimate;
 }
 
 function assistantMessageThinkingComplete(this: any, message: any): boolean {
@@ -4469,11 +4542,28 @@ function readableOnPanel(rgb: Rgb, panel: Rgb | null, light: boolean): Rgb {
 function shimmerHighlightRgb(base: Rgb): Rgb {
 	const light = isLightThemeBackground(_toolBranchThemeHint);
 	const sweep = shimmerSweepRgb();
-	if (sweep && rgbDistance(base, sweep) >= SHIMMER_MIN_SWEEP_DELTA) {
-		return readableOnPanel(sweep, themePanelBgRgb(_toolBranchThemeHint), light);
+	const band = sweep && rgbDistance(base, sweep) >= SHIMMER_MIN_SWEEP_DELTA
+		? readableOnPanel(sweep, themePanelBgRgb(_toolBranchThemeHint), light)
+		: light
+			? mixRgb(base, { r: 12, g: 16, b: 18 }, 0.75)
+			: mixRgb(base, { r: 255, g: 255, b: 255 }, 0.92);
+	return ensureBandContrast(base, band, light);
+}
+
+/**
+ * Keep the band visibly different from the label's own color. A muted thinking level can
+ * land close to the theme's text color, which left the sweep looking like a static word;
+ * step the band away from the label until it separates.
+ */
+function ensureBandContrast(base: Rgb, band: Rgb, light: boolean): Rgb {
+	if (rgbDistance(base, band) >= SHIMMER_MIN_BAND_DELTA) return band;
+	const away = light ? { r: 12, g: 16, b: 18 } : { r: 255, g: 255, b: 255 };
+	let out = band;
+	for (const push of [0.3, 0.5, 0.7, 0.85]) {
+		out = mixRgb(band, away, push);
+		if (rgbDistance(base, out) >= SHIMMER_MIN_BAND_DELTA) return out;
 	}
-	if (light) return mixRgb(base, { r: 12, g: 16, b: 18 }, 0.75);
-	return mixRgb(base, { r: 255, g: 255, b: 255 }, 0.92);
+	return out;
 }
 
 /**

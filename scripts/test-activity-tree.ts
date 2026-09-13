@@ -619,52 +619,64 @@ assert.ok(listOutput.includes("first item"));
 			return [...region.matchAll(/\x1b\[38;2;\d+;\d+;\d+m/g)].map((m) => m[0]);
 		};
 		const header = (lines: string[]) => plain(lines).split("\n")[0];
+		// The band only covers part of the label at any instant, so a single arbitrary frame can
+		// legitimately show the resting color alone. Sample a whole sweep at the live repaint
+		// cadence: these assertions are about how the sweep behaves over time.
+		const sampleSweep = (render: () => string[], text = "implementing", samples = 16): string[][] => {
+			const frames: string[][] = [];
+			for (let i = 0; i < samples; i++) {
+				frames.push(labelColors(render(), text));
+				fakeNow += 120;
+			}
+			return frames;
+		};
+		const distinct = (frames: string[][]) => new Set(frames.flat());
+		const phases = (frames: string[][]) => new Set(frames.map((f) => f.join()).filter(Boolean)).size;
+
 		const firstFrame = shimmerParent.render(100);
 		assert.ok(/implementing/.test(plain(firstFrame)), "the label text survives the gradient");
-		assert.ok(new Set(labelColors(firstFrame)).size >= 3, `a running label must be a gradient, got ${new Set(labelColors(firstFrame)).size} colors`);
-		fakeNow += 250;
-		const secondFrame = shimmerParent.render(100);
-		assert.notEqual(labelColors(firstFrame).join(), labelColors(secondFrame).join(), "the running label must animate between frames");
+		const running = sampleSweep(() => shimmerParent.render(100));
+		assert.ok(distinct(running).size >= 3, `a running label must be a gradient, got ${distinct(running).size} colors`);
+		assert.ok(phases(running) >= 2, "the running label must animate between frames");
 		// The call settles. The light becomes the steady success dot — the chunk never
 		// blinks a dot of its own — but the sweep keeps going: the agent still owns this
 		// chunk (it is thinking, or composing the next call).
 		pendingTool.updateResult({ content: [{ type: "text", text: "ok" }], isError: false } as any, false);
 		const settledFrame = shimmerParent.render(100);
 		assert.ok(/^ ● implementing 1 call/.test(header(settledFrame)), `a settled call keeps a steady light: ${JSON.stringify(header(settledFrame))}`);
-		const settledColors = labelColors(settledFrame);
-		assert.ok(new Set(settledColors).size >= 3, `settling a call must not stop the chunk's sweep: ${JSON.stringify(settledColors)}`);
-		fakeNow += 250;
-		assert.notEqual(settledColors.join(), labelColors(shimmerParent.render(100)).join(), "the sweep keeps moving after the call settles");
+		const settled = sampleSweep(() => shimmerParent.render(100));
+		assert.ok(distinct(settled).size >= 3, `settling a call must not stop the chunk's sweep: ${JSON.stringify([...distinct(settled)])}`);
+		assert.ok(phases(settled) >= 2, "the sweep keeps moving after the call settles");
 		// pi prints status notices into the transcript while a run is in flight — the
 		// `Thinking level: …` and `Switched to …` lines that Shift+Tab and Ctrl+P post. They are
 		// chrome, not the conversation moving on, so they must not close the live chunk: closing
 		// it froze the sweep and the duration mid-run.
 		shimmerParent.addChild(new Spacer(1));
 		shimmerParent.addChild(new Text("Thinking level: max", 1, 0));
-		fakeNow += 250;
-		const noticed = shimmerParent.render(100);
-		assert.ok(plain(noticed).includes("Thinking level: max"), "the notice still renders");
-		assert.ok(new Set(labelColors(noticed)).size >= 3, `a status notice must not stop the sweep: ${JSON.stringify(labelColors(noticed))}`);
-		fakeNow += 250;
-		assert.notEqual(labelColors(noticed).join(), labelColors(shimmerParent.render(100)).join(), "the sweep keeps moving past a notice");
+		assert.ok(plain(shimmerParent.render(100)).includes("Thinking level: max"), "the notice still renders");
+		const noticed = sampleSweep(() => shimmerParent.render(100));
+		assert.ok(distinct(noticed).size >= 3, `a status notice must not stop the sweep: ${JSON.stringify([...distinct(noticed)])}`);
+		assert.ok(phases(noticed) >= 2, "the sweep keeps moving past a notice");
 		// A different activity label supersedes the chunk: the closed label is done, the
 		// new trailing chunk takes over the sweep.
 		const next = new ToolExecutionComponent("code_execution", "shimmer-next", { code: "print(2)", activity: "testing" }, {}, definition as any, ui as any, process.cwd());
 		next.markExecutionStarted();
 		next.updateResult({ content: [{ type: "text", text: "ok" }], isError: false } as any, true);
 		shimmerParent.addChild(next);
-		const superseded = shimmerParent.render(100);
-		assert.ok(new Set(labelColors(superseded)).size <= 1, `a superseded chunk must stop sweeping: ${JSON.stringify(labelColors(superseded))}`);
-		assert.ok(new Set(labelColors(superseded, "testing")).size >= 3, "the label that superseded it is the live one");
+		const superseded = sampleSweep(() => shimmerParent.render(100));
+		assert.ok(distinct(superseded).size <= 1, `a superseded chunk must stop sweeping: ${JSON.stringify([...distinct(superseded)])}`);
+		const superseding = sampleSweep(() => shimmerParent.render(100), "testing");
+		assert.ok(distinct(superseding).size >= 3, `the label that superseded it is the live one: ${JSON.stringify([...distinct(superseding)])}`);
 		// Prose after the group closes the trailing chunk as well.
 		const prose = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "writing the answer" }] } as any;
 		const answer = new AssistantMessageComponent(prose, false);
 		answer.updateContent(prose, false);
 		shimmerParent.addChild(answer);
-		const closed = shimmerParent.render(100);
-		assert.ok(new Set(labelColors(closed, "testing")).size <= 1, `prose must close the chunk and stop the sweep: ${JSON.stringify(labelColors(closed, "testing"))}`);
+		const closed = sampleSweep(() => shimmerParent.render(100), "testing");
+		assert.ok(distinct(closed).size <= 1, `prose must close the chunk and stop the sweep: ${JSON.stringify([...distinct(closed)])}`);
+		const closedFrame = shimmerParent.render(100);
 		fakeNow += 250;
-		assert.equal(closed.join("\n"), shimmerParent.render(100).join("\n"), "a closed chunk must not animate");
+		assert.equal(closedFrame.join("\n"), shimmerParent.render(100).join("\n"), "a closed chunk must not animate");
 	} finally {
 		Date.now = realNow;
 	}
@@ -675,7 +687,8 @@ assert.ok(listOutput.includes("first item"));
 // runtime level change repaints the running sweep, and a muted level stays visible.
 {
 	const realNow = Date.now;
-	Date.now = () => 1_700_000_000_000;
+	let fakeNow = 1_700_000_000_000;
+	Date.now = () => fakeNow;
 	try {
 		// everforest-tui-light: text #5c6a72, toolSuccessBg #edf0df, and the thinking-level
 		// colors (medium = aqua, max = orange, off = a surface tone that needs the guard).
@@ -715,7 +728,7 @@ assert.ok(listOutput.includes("first item"));
 			accentParent.addChild(live);
 			// Everything up to the counts is the header: the label's own gradient plus the light
 			// in front of it (whose gray is nowhere near any expected color).
-			const frameColors = () => {
+			const rawFrameColors = () => {
 				const raw =
 					accentParent
 						.render(100)
@@ -725,6 +738,16 @@ assert.ok(listOutput.includes("first item"));
 					+m[2],
 					+m[3],
 				]);
+			};
+			// Sample a whole sweep: the band only sits over the label for part of the cycle, so
+			// the color under test has to come from the cycle's union rather than one frame.
+			const frameColors = () => {
+				const colors: number[][] = [];
+				for (let i = 0; i < 16; i++) {
+					colors.push(...rawFrameColors());
+					fakeNow += 120;
+				}
+				return colors;
 			};
 			const dist = (a: number[], b: number[]) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
 			const nearest = (colors: number[][], target: number[]) => Math.min(...colors.map((c) => dist(c, target)));
@@ -757,6 +780,18 @@ assert.ok(listOutput.includes("first item"));
 			const lum = (c: number[]) => 0.2126 * lin(c[0]) + 0.7152 * lin(c[1]) + 0.0722 * lin(c[2]);
 			const [hi, lo] = [lum(offBand), lum([237, 240, 223])].sort((a, b) => b - a);
 			assert.ok((hi + 0.05) / (lo + 0.05) >= 1.6, `a muted level still has to read against the panel: ${JSON.stringify(off)}`);
+			// The band must also separate from the label's own color. A level color that lands
+			// near the theme's text left the sweep indistinguishable from the resting label,
+			// which is exactly what "the shimmer is on but I can't see it" looks like.
+			for (const level of ["medium", "max", "off"]) {
+				await chooseLevel(level);
+				const colors = frameColors();
+				const band = colors.reduce((a, b) => (dist(b, [92, 106, 114]) > dist(a, [92, 106, 114]) ? b : a));
+				assert.ok(
+					dist(band, [92, 106, 114]) >= 72,
+					`thinking=${level} must sweep a band that separates from the label: ${JSON.stringify(colors)}`,
+				);
+			}
 		} finally {
 			(globalThis as any)[globalThemeKey] = previousGlobalTheme;
 		}
@@ -764,6 +799,83 @@ assert.ok(listOutput.includes("first item"));
 		Date.now = realNow;
 	}
 }
+// A model that streams thinking at thousands of characters per second must not make the
+// thinking clock climb tens of seconds per second. The text-length fallback assumes 150
+// chars/s, so any provider that streams without thinking start/end markers used to report
+// 20s per real second — in the thinking row and, summed, in the group header.
+{
+	const realNow = Date.now;
+	let fakeNow = 1_700_000_000_000;
+	Date.now = () => fakeNow;
+	try {
+		const ctx = { hasUI: true, ui: { theme, notify() {}, getToolsExpanded: () => false, setToolsExpanded() {} } };
+		for (const handler of handlers.get("agent_start") ?? []) await handler({}, ctx);
+
+		const done = new ToolExecutionComponent("code_execution", "rate-done", { code: "print(1)", activity: "implementing" }, {}, definition as any, ui as any, process.cwd());
+		done.markExecutionStarted();
+		done.updateResult({ content: [{ type: "text", text: "ok" }], isError: false } as any, false);
+		const rateParent = new Container();
+		rateParent.addChild(done);
+
+		// A live assistant message streaming ~3000 chars/s, with no thinking_start event.
+		let text = "Let me reason about this. ";
+		const message: any = {
+			role: "assistant",
+			content: [{ type: "thinking", thinking: text }],
+			stopReason: "pending",
+			_piClaudeStyleThinkingActive: true,
+		};
+		for (const handler of handlers.get("message_start") ?? []) await handler({ message }, ctx);
+		const assistant = new AssistantMessageComponent(message, false);
+		assistant.updateContent(message, true);
+		rateParent.addChild(assistant);
+
+		// A second live thinking row in the same chunk shares the same wall clock. Two rows
+		// reporting one growing block must not be summed into a total that runs at 2x.
+		let secondText = "Second message thinking. ";
+		const secondMessage: any = {
+			role: "assistant",
+			content: [{ type: "thinking", thinking: secondText }],
+			stopReason: "pending",
+			_piClaudeStyleThinkingActive: true,
+		};
+		for (const handler of handlers.get("message_start") ?? []) await handler({ message: secondMessage }, ctx);
+		const secondAssistant = new AssistantMessageComponent(secondMessage, false);
+		secondAssistant.updateContent(secondMessage, true);
+		rateParent.addChild(secondAssistant);
+
+		const seconds = (line: string, prefix: RegExp) => {
+			const m = line.match(prefix);
+			return m ? Number(m[1]) : 0;
+		};
+		let worst = 0;
+		for (let frame = 1; frame <= 20; frame++) {
+			fakeNow += 100;
+			text += "x".repeat(300);
+			message.content[0].thinking = text;
+			assistant.updateContent(message, true);
+			secondText += "y".repeat(300);
+			secondMessage.content[0].thinking = secondText;
+			secondAssistant.updateContent(secondMessage, true);
+			const lines = plain(rateParent.render(120)).split("\n");
+			const row = lines.find((l) => /Thinking…|Thought for/.test(l)) ?? "";
+			const header = lines.find((l) => /calls?/.test(l)) ?? "";
+			const wallSeconds = (fakeNow - 1_700_000_000_000) / 1000;
+			worst = Math.max(
+				worst,
+				seconds(row, /Thinking… (\d+)s/),
+				seconds(header, /· (\d+)s/),
+			);
+			assert.ok(
+				worst <= wallSeconds + 1,
+				`streaming thinking must not report faster than the clock (wall ${wallSeconds}s, shown ${worst}s): ${JSON.stringify(row)} ${JSON.stringify(header)}`,
+			);
+		}
+	} finally {
+		Date.now = realNow;
+	}
+}
+
 // Light-mode tree connectors are quieter without fading the reasoning text.
 initTheme("light", false);
 const ctx = { hasUI: true, ui: { theme, notify() {}, getToolsExpanded: () => false, setToolsExpanded() {} } };

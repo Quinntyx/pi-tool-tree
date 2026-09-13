@@ -48,6 +48,11 @@
 
 - **The activity param is actually injected** — the previous sweep read `pi.getAllTools()`, which returns tool metadata without `execute`, so every tool was skipped and the model never saw the param. Core tools are now wrapped at their own registration sites and the dead sweep is gone. (`registerOpenAiToolOverrides` and `registerMcpToolOverrides` are gated on the same missing `execute` field, so they still never fire in the real harness — unchanged by this release).
 
+### Fixed
+
+- **Thinking time no longer runs faster than the clock** — a very fast model (thousands of thinking characters per second) made the thinking duration climb at ~20s per real second, because a block with no timing event fell back to a text-length estimate that assumes 150 chars/s. In-flight thinking now measures the message's own wall clock, a clockless fallback pins its first estimate instead of re-deriving it from the growing stream, and a live group's total is capped by its wall-clock span so several thinking rows sharing one in-flight block cannot be summed into a total that runs at a multiple of real time.
+- **The activity-label sweep is always visible** — the band now guarantees a minimum separation from the label's own color (a muted thinking level could sit close to the theme's text, leaving the sweep looking like a static word), sweeps a wider band, and completes a pass in 1.8s instead of 1.2s.
+
 ### Changed
 
 - **Cleaner responsive mutation diffs** — edit/write previews now use lighter shared hatch/rule/rail chrome, omit old/new and per-edit headings, share one rule between edit blocks, reserve the fullscreen scrollbar cell, and switch to unified mode before split columns wrap excessively. Width changes now always trigger a complete diff rebuild instead of leaving the one-frame reflow fallback behind; full-width panes tolerate modest wrapping and return to split mode. Compact gutters drop redundant +/- markers, and nested preview rails align directly beneath their tool status marks.
