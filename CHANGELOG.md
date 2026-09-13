@@ -50,7 +50,7 @@
 
 ### Changed
 
-- **Cleaner responsive mutation diffs** — edit/write previews now use lighter shared hatch/rule chrome, omit old/new and per-edit headings, share one rule between edit blocks, reserve the fullscreen scrollbar cell, switch to unified mode before split columns wrap, and reflow safely while a pane is resized. Compact gutters drop redundant +/- markers, and activity-tree continuation indentation is two columns shorter.
+- **Cleaner responsive mutation diffs** — edit/write previews now use lighter shared hatch/rule/rail chrome, omit old/new and per-edit headings, share one rule between edit blocks, reserve the fullscreen scrollbar cell, and switch to unified mode before split columns wrap excessively. Width changes now always trigger a complete diff rebuild instead of leaving the one-frame reflow fallback behind; full-width panes tolerate modest wrapping and return to split mode. Compact gutters drop redundant +/- markers, and nested preview rails align directly beneath their tool status marks.
 - **Flush-left assistant prose** — assistant text keeps pi's own Markdown rendering again: no ` ● ` dot and no extra three-space indent. Only prose containing display math (`\[…\]`, `$$…$$`) or task-status transcripts still uses the custom paragraph renderer (now flush left, matching pi's one-space assistant padding).
 - **Blank lines between transcript blocks** — a blank line follows agent prose and separates consecutive activity groups, so phases read as distinct blocks instead of one wall of rows.
 - **Only tool calls are counted** — a thinking row no longer inflates the group header (one thought plus four calls used to read `5 calls`), and a run with no tool call at all (a trailing thought, say) no longer prints a `N calls` header at all.

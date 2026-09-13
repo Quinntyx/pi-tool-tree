@@ -140,7 +140,7 @@ assert.ok(nativeRenders > 0);
 	// would wrap visible code, even though the configured split cutoff fits.
 	const longWriteContent = readFileSync("config/config.example.json", "utf8").replace(
 		'"diffViewMode": "auto"',
-		'"diffViewMode": "auto-with-a-deliberately-long-value-that-cannot-fit-in-one-split-column"',
+		`"diffViewMode": "auto-${"x".repeat(170)}"`,
 	);
 	const longWriteArgs = { path: "config/config.example.json", content: longWriteContent, activity: "implementing" };
 	const longWrite = new ToolExecutionComponent("write", "long-line-write", longWriteArgs, {}, tools.get("write") as any, ui as any, process.cwd());
@@ -157,6 +157,30 @@ assert.ok(nativeRenders > 0);
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
 	assert.ok(longPreview.includes("• unified"), `auto mode avoids wrapped split columns: ${JSON.stringify(longPreview)}`);
+	for (let attempt = 0; attempt < 50; attempt++) {
+		longPreview = plain(longCluster.render(200));
+		if (longPreview.includes("• split")) break;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	assert.ok(longPreview.includes("• split"), `full-width panes still use split mode for moderately long lines: ${JSON.stringify(longPreview)}`);
+
+	// A resize must rebuild the width-keyed body rather than leaving ToolText's
+	// one-frame reflow fallback as the permanent result.
+	for (const [width, mode] of [[80, "unified"], [152, "split"]] as const) {
+		let resized = "";
+		for (let attempt = 0; attempt < 50; attempt++) {
+			resized = plain(pendingCluster.render(width));
+			if (resized.includes(`• ${mode}`) && resized.includes("previewLayout")) break;
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		assert.ok(resized.includes(`• ${mode}`) && resized.includes("previewLayout"), `resize to ${width} must finish reflowing the ${mode} diff: ${JSON.stringify(resized)}`);
+	}
+
+	const alignedPending = plain(pendingCluster.render(152)).split("\n");
+	const pendingCallLine = alignedPending.find((line) => line.includes("write config/config.example.json"));
+	const pendingRailLine = alignedPending.find((line) => line.includes("pending overwrite"));
+	assert.ok(pendingCallLine && pendingRailLine, "pending write fixture exposes its tool row and preview rail");
+	assert.equal(pendingCallLine!.indexOf("write") - 2, pendingRailLine!.indexOf("├"), "mutation preview rail descends directly from the tool status mark");
 
 	const coloredWidePending = pendingCluster.render(152);
 	const hatchLine = coloredWidePending.find((line) => line.includes("╱"));
@@ -168,6 +192,30 @@ assert.ok(nativeRenders > 0);
 	};
 	assert.equal(fgBefore(hatchLine!, "╱"), fgBefore(borderLine!, "─"), "split hatching and border rules use the same gray");
 	assert.match(fgBefore(hatchLine!, "╱") ?? "", /38;2;1(?:[0-9]{2}|[3-9][0-9]);/, "default hatch chrome is a light gray, not near-black");
+
+	// The light-theme nested preview rail must use that same gray; the fixed
+	// dark-theme branch fallback previously made this bar look black.
+	initTheme("light", false);
+	const lightArgs = { ...pendingWriteArgs, content: pendingWriteContent.replace('"previewOnly": true', '"previewOnly": false') };
+	const lightWrite = new ToolExecutionComponent("write", "light-rail-write", lightArgs, {}, tools.get("write") as any, ui as any, process.cwd());
+	lightWrite.updateArgs(lightArgs);
+	lightWrite.setArgsComplete();
+	lightWrite.markExecutionStarted();
+	lightWrite.updateResult({ content: [{ type: "text", text: "" }], isError: false } as any, true);
+	const lightCluster = new Container();
+	lightCluster.addChild(lightWrite);
+	let coloredLight: string[] = [];
+	for (let attempt = 0; attempt < 50; attempt++) {
+		coloredLight = lightCluster.render(152);
+		if (plain(coloredLight).includes("pending overwrite") && coloredLight.some((line) => line.includes("─"))) break;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	const lightRailLine = coloredLight.find((line) => line.includes("pending overwrite"));
+	const lightRuleLine = coloredLight.find((line) => line.includes("─"));
+	assert.ok(lightRailLine && lightRuleLine, "light-theme fixture renders its preview rail and rule");
+	assert.equal(fgBefore(lightRailLine!, "├"), fgBefore(lightRuleLine!, "─"), "light-theme preview rail and diff chrome use the same gray");
+	initTheme("dark", false);
+
 	for (const width of [20, 48, 80, 100, 140, 152, 80, 152]) {
 		for (const line of pendingCluster.render(width)) {
 			assert.ok(visibleWidth(line) <= width, `pending write overflow at ${width}: ${visibleWidth(line)}`);

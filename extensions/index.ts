@@ -866,7 +866,8 @@ const TOOL_SHELL_HORIZONTAL_CHROME_WIDTH = 2;
 function toolActivityLines(tool: any, width: number): string[] {
 	const childWidth = Math.max(1, width - ACTIVITY_TREE_CHILD_CHROME_WIDTH);
 	const status = getToolStatusForGroup(tool);
-	if (toolKeepsDisplayInActivityTree(tool) && tool?.rendererState && typeof tool.rendererState === "object") {
+	const keepsDisplay = toolKeepsDisplayInActivityTree(tool);
+	if (keepsDisplay && tool?.rendererState && typeof tool.rendererState === "object") {
 		// Tool renderers normally learn their width only after returning a component.
 		// In an activity group that first pass used the whole terminal, so a split diff
 		// was built before the outer tree prefix and the tool shell padding were known.
@@ -879,13 +880,19 @@ function toolActivityLines(tool: any, width: number): string[] {
 	// Edits and writes are the model's proposed file changes, not incidental output:
 	// keep their preview below the call after settlement. The group's continuation
 	// rail is then drawn beside every preview row until the next item in the cluster.
-	const showDetails = toolKeepsDisplayInActivityTree(tool)
+	const showDetails = keepsDisplay
 		|| tool.expanded === true
 		|| (tool.isPartial === true && tool.executionStarted === true);
 	// Rendering the actual tool component preserves native partial-result animations.
 	// Never memoize an active component: its animation can change without new text.
-	let lines = showDetails ? stripToolChrome(tool.render(childWidth), toolKeepsDisplayInActivityTree(tool)) : [getCompactToolLine(tool, childWidth)];
+	let lines = showDetails ? stripToolChrome(tool.render(childWidth), keepsDisplay) : [getCompactToolLine(tool, childWidth)];
 	if (lines.length === 0) lines = [getCompactToolLine(tool, childWidth)];
+	if (keepsDisplay) {
+		// The default tool shell contributes two leading cells to result rows. The
+		// grouped tree supplies that indentation itself, so remove the shell padding
+		// and let the preview rail descend directly from the tool's status mark.
+		for (let i = 1; i < lines.length; i++) lines[i] = trimAnsiLeft(lines[i]);
+	}
 	lines[0] = `${groupStatusLight(status, { agentBreathe: isAgentFamilyToolName(getToolName(tool)) })} ${removeGroupedToolPrefix(lines[0])}`;
 	return lines;
 }
@@ -3247,14 +3254,18 @@ function toolStatusDot(ctx: any, theme: Theme): string {
 // ---------------------------------------------------------------------------
 
 function branchIndent(text: string, continued = false, theme?: Theme): string {
-	const rule = currentToolBranchAnsi(theme);
+	if (theme) _toolBranchThemeHint = theme;
+	// Mutation/output rails share the light-theme activity gray rather than the
+	// fixed near-black branch fallback used on dark panels.
+	const rule = activityTreeBranchAnsi();
 	// Align under bare `├ `/`╰ ` (│ + one space, or two spaces when closed).
 	const prefix = continued ? `${rule}│${TRANSPARENT_RESET} ` : "  ";
 	return `${prefix}${WRAP_MARK}${text}`;
 }
 
 function branchLead(text: string, continued = false, theme?: Theme): string {
-	const rule = currentToolBranchAnsi(theme);
+	if (theme) _toolBranchThemeHint = theme;
+	const rule = activityTreeBranchAnsi();
 	// Bare tee/corner only — no horizontal ─ arm.
 	return `${rule}${continued ? "├" : "╰"}${TRANSPARENT_RESET} ${WRAP_MARK}${text}`;
 }
@@ -3752,8 +3763,10 @@ function makeText(last: unknown, text: string): Text {
 function makeResponsiveDiffText(ctx: any, last: unknown, text: string): Text {
 	const component = makeText(last, text) as ToolText;
 	component.setWidthObserver((width) => {
-		if (ctx.state?._diffComponentWidth === width) return;
-		if (ctx.state) ctx.state._diffComponentWidth = width;
+		// Grouped rows seed this value before ToolText sees the new width. Equality
+		// therefore does not mean the width-keyed renderer has already re-run: always
+		// invalidate after an observed resize so the temporary reflow frame resolves.
+		if (ctx.state && ctx.state._diffComponentWidth !== width) ctx.state._diffComponentWidth = width;
 		safeInvalidate(ctx);
 	});
 	return component;
@@ -4993,18 +5006,20 @@ function shouldUseSplit(diff: ParsedDiff, width: number, maxRows = MAX_PREVIEW_L
 	) === "split";
 	if (!configured || settings.diffViewMode === "split") return configured;
 
-	// Auto mode should never choose a nominally-wide split whose half-columns
-	// immediately wrap the visible source. Unified mode has almost twice the code
-	// width and remains legible during common pane splits and resize operations.
+	// Medium panes tolerate a two-row source line; genuinely wide panes tolerate
+	// three. This keeps full-width terminals in split mode while rejecting the
+	// severe multi-row wrapping seen in narrower half-pane layouts.
 	const half = Math.floor((width - 1) / 2);
 	const numberWidth = Math.max(2, String(maxLineNumber(diff.lines)).length);
 	const codeWidth = Math.max(0, half - (numberWidth + 4));
 	if (codeWidth < 12) return false;
+	const allowedWrapRows = width >= 180 ? MAX_WRAP_ROWS_WIDE : MAX_WRAP_ROWS_MED;
 	let seen = 0;
 	for (const line of diff.lines) {
 		if (line.type === "sep") continue;
 		if (seen++ >= maxRows) break;
-		if (visibleWidth(tabs(line.content)) > codeWidth) return false;
+		const wrapRows = Math.max(1, Math.ceil(visibleWidth(tabs(line.content)) / codeWidth));
+		if (wrapRows > allowedWrapRows) return false;
 	}
 	return true;
 }
