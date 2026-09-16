@@ -1171,6 +1171,9 @@ interface ActivityRunningCall {
 	toolName: string;
 	/** Activity label in effect when the call started. */
 	label: string;
+	/** Short single-line preview of the call's first meaningful argument,
+	 *  for external consumers like the PTC subagent viewer. */
+	argPreview?: string;
 	/** Epoch milliseconds. */
 	startedAt: number;
 	/** Milliseconds this call has been running, measured to this call. */
@@ -1270,6 +1273,8 @@ interface ActivityChange {
 	toolName?: string;
 	/** Set on `label-change` and `tool-start`. */
 	label?: string;
+	/** Set on `tool-start`: one-line preview of the call's first argument. */
+	argPreview?: string;
 	/** Set on `tool-end`. */
 	isError?: boolean;
 	/** Set on `thinking-end`, `tool-end`, and `run-end`. */
@@ -1301,6 +1306,7 @@ interface ActivityCallState {
 	toolName: string;
 	label: string;
 	startedAt: number;
+	argPreview?: string;
 }
 
 const activityState = {
@@ -1572,8 +1578,27 @@ function activityToolStart(event: any): void {
 	activityState.labelCalls++;
 	activityState.toolCalls++;
 	const toolName = typeof event?.toolName === "string" && event.toolName ? event.toolName : "tool";
-	activityState.calls.set(toolCallId, { toolCallId, toolName, label, startedAt: now });
-	emitActivityChange("tool-start", { toolCallId, toolName, label });
+	const argPreview = activityArgPreview(event?.args);
+	activityState.calls.set(toolCallId, { toolCallId, toolName, label, startedAt: now, argPreview });
+	emitActivityChange("tool-start", { toolCallId, toolName, label, argPreview });
+}
+
+/** One-line preview of a tool call's arguments for external activity
+ *  consumers: the first meaningful string argument, whitespace-flattened and
+ *  trimmed. Never throws; undefined when nothing previewable is available. */
+function activityArgPreview(args: unknown): string | undefined {
+	if (!args || typeof args !== "object") return undefined;
+	try {
+		for (const value of Object.values(args as Record<string, unknown>)) {
+			if (typeof value === "string" && value.trim()) {
+				const flat = value.replace(/\s+/g, " ").trim();
+				return flat.length > 64 ? `${flat.slice(0, 61)}...` : flat;
+			}
+		}
+	} catch {
+		// preview is best-effort
+	}
+	return undefined;
 }
 
 function activityToolEnd(event: any): void {
