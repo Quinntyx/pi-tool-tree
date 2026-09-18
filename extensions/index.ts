@@ -746,8 +746,28 @@ function getToolArgSummary(tool: any): string {
 	}
 }
 
+// PTC tools (persistent Python sessions). `code_execution` is the pre-refactor
+// name, kept so older installs still summarize correctly.
+const PTC_CODE_TOOLS = new Set(["code_execution", "python_exec"]);
+
+function summarizePtcToolCall(name: string, args: any): string | undefined {
+	if (PTC_CODE_TOOLS.has(name)) {
+		return summarizeText(String(args?.code ?? "").trim().split("\n")[0] ?? "", 100);
+	}
+	if (name === "provision_python_session") {
+		const script = String(args?.script ?? "").trim();
+		return script ? summarizeText(script, 100) : "new session";
+	}
+	if (name === "python_session_to_script") {
+		const target = String(args?.path ?? args?.name ?? "").trim();
+		return target ? summarizeText(target, 100) : "export session";
+	}
+	return undefined;
+}
+
 function getToolArgSummaryUnsafe(args: any, name: string): string {
-	if (name === "code_execution") return summarizeText(String(args.code ?? "").trim().split("\n")[0] ?? "", 100);
+	const ptc = summarizePtcToolCall(name, args);
+	if (ptc !== undefined) return ptc;
 	if (name === "read") {
 		let value = shortPath(process.cwd(), args.path ?? "");
 		const parts: string[] = [];
@@ -7528,7 +7548,8 @@ function summarizeMcpToolCall(args: any, theme: Theme): string {
 }
 
 function summarizeGenericToolCall(name: string, args: any, theme: Theme, sp: (path: string) => string): string {
-	if (name === "code_execution") return summarizeText(String(args?.code ?? "").trim().split("\n")[0] ?? "", 100);
+	const ptc = summarizePtcToolCall(name, args);
+	if (ptc !== undefined) return ptc;
 	if (isMcpToolName(name)) return summarizeMcpToolCall(args, theme);
 	return summarizeOpenAiToolCall(name, args, theme, sp);
 }
