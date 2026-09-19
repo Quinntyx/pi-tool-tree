@@ -5965,6 +5965,22 @@ function touchCache(key: string, value: string[]): string[] {
 	return value;
 }
 
+/**
+ * Highlighting must not change the text it renders.
+ *
+ * Row layout is decided from line widths, so a highlighted line that is trimmed or wrapped
+ * differently from its source (Shiki drops trailing whitespace, and wraps or clips very long
+ * lines) shifts every following row: the diff then rows up differently from the unhighlighted
+ * fallback and from its own gutters and tint. When the widths disagree, the raw line is kept.
+ */
+function highlightPreservesSource(rendered: string[], source: string[]): boolean {
+	if (rendered.length !== source.length) return false;
+	for (let index = 0; index < rendered.length; index++) {
+		if (visibleWidth(rendered[index]) !== visibleWidth(source[index])) return false;
+	}
+	return true;
+}
+
 async function hlBlock(code: string, language: BundledLanguage | undefined): Promise<string[]> {
 	if (!code) return [""];
 	if (!language || code.length > MAX_HL_CHARS) return code.split("\n");
@@ -5974,6 +5990,7 @@ async function hlBlock(code: string, language: BundledLanguage | undefined): Pro
 	try {
 		const ansi = normalizeShikiContrast(await codeToAnsiLazy(code, language, DIFF_THEME));
 		const out = (ansi.endsWith("\n") ? ansi.slice(0, -1) : ansi).split("\n");
+		if (!highlightPreservesSource(out, code.split("\n"))) return code.split("\n");
 		return touchCache(key, out);
 	} catch {
 		return code.split("\n");
@@ -6113,30 +6130,45 @@ function plainWordDiff(oldText: string, newText: string): { old: string; new: st
 	return { old: oldOut, new: newOut };
 }
 
-async function renderUnified(
-	diff: ParsedDiff,
-	language: BundledLanguage | undefined,
-	max = MAX_RENDER_LINES,
-	dc: DiffColors = DEFAULT_DIFF_COLORS,
-	width = termW(),
-): Promise<string> {
-	if (!diff.lines.length) return "";
-	const vis = diff.lines.slice(0, max);
-	const tw = width;
-	const nw = Math.max(2, String(maxLineNumber(vis)).length);
-	const gw = nw + 4;
-	const cw = Math.max(20, tw - gw);
-	const canHL = diff.chars <= MAX_HL_CHARS && vis.length <= MAX_RENDER_LINES;
-
+/** Source lines the highlighter needs for each side of a unified diff. */
+function unifiedHighlightSources(vis: DiffLine[]): { oldSrc: string[]; newSrc: string[] } {
 	const oldSrc: string[] = [];
 	const newSrc: string[] = [];
 	for (const line of vis) {
 		if (line.type === "ctx" || line.type === "del") oldSrc.push(line.content);
 		if (line.type === "ctx" || line.type === "add") newSrc.push(line.content);
 	}
-	const [oldHL, newHL] = canHL
-		? await Promise.all([hlBlock(oldSrc.join("\n"), language), hlBlock(newSrc.join("\n"), language)])
-		: [oldSrc, newSrc];
+	return { oldSrc, newSrc };
+}
+
+/** Highlighting is capped by size; above the caps the raw text is rendered as-is. */
+function canHighlightDiff(diff: ParsedDiff, vis: DiffLine[]): boolean {
+	return diff.chars <= MAX_HL_CHARS && vis.length <= MAX_RENDER_LINES;
+}
+
+/**
+ * Rows for a unified diff.
+ *
+ * Highlighting lives in the callers so the same diff can also be rendered *without* it. Shiki is
+ * asynchronous, and a fallback body whose height differs from the highlighted one reflows the
+ * transcript under the reader (the scrolling jump), so the unhighlighted render goes through
+ * this exact function with the raw source lines: every row, wrap, gutter and hint is identical
+ * and only the colors differ. `emphasize` is the same size-cap decision for both renders, so
+ * the word-level diff branch takes the same path in each.
+ */
+function renderUnifiedRows(
+	diff: ParsedDiff,
+	vis: DiffLine[],
+	width: number,
+	dc: DiffColors,
+	oldHL: string[],
+	newHL: string[],
+	emphasize: boolean,
+): string {
+	const tw = width;
+	const nw = Math.max(2, String(maxLineNumber(vis)).length);
+	const gw = nw + 4;
+	const cw = Math.max(20, tw - gw);
 
 	let oldIndex = 0;
 	let newIndex = 0;
@@ -6193,19 +6225,19 @@ async function renderUnified(
 
 		const isPaired = dels.length === 1 && adds.length === 1;
 		const wd = isPaired ? wordDiffAnalysis(dels[0].l.content, adds[0].l.content) : null;
-		if (isPaired && wd && wd.similarity >= WORD_DIFF_MIN_SIM && canHL) {
+		if (isPaired && wd && wd.similarity >= WORD_DIFF_MIN_SIM && emphasize) {
 			emitRow(dels[0].l.oldNum, "-", BG_GUTTER_DEL, injectBg(dels[0].hl, wd.oldRanges, BG_DEL, BG_DEL_W), BG_DEL);
 			emitRow(adds[0].l.newNum, "+", BG_GUTTER_ADD, injectBg(adds[0].hl, wd.newRanges, BG_ADD, BG_ADD_W), BG_ADD);
 			continue;
 		}
-		if (isPaired && wd && wd.similarity >= WORD_DIFF_MIN_SIM && !canHL) {
+		if (isPaired && wd && wd.similarity >= WORD_DIFF_MIN_SIM && !emphasize) {
 			const pwd = plainWordDiff(dels[0].l.content, adds[0].l.content);
 			emitRow(dels[0].l.oldNum, "-", BG_GUTTER_DEL, `${BG_DEL}${pwd.old}`, BG_DEL);
 			emitRow(adds[0].l.newNum, "+", BG_GUTTER_ADD, `${BG_ADD}${pwd.new}`, BG_ADD);
 			continue;
 		}
-		for (const d of dels) emitRow(d.l.oldNum, "-", BG_GUTTER_DEL, `${BG_DEL}${canHL ? d.hl : d.l.content}`, BG_DEL);
-		for (const a of adds) emitRow(a.l.newNum, "+", BG_GUTTER_ADD, `${BG_ADD}${canHL ? a.hl : a.l.content}`, BG_ADD);
+		for (const d of dels) emitRow(d.l.oldNum, "-", BG_GUTTER_DEL, `${BG_DEL}${emphasize ? d.hl : d.l.content}`, BG_DEL);
+		for (const a of adds) emitRow(a.l.newNum, "+", BG_GUTTER_ADD, `${BG_ADD}${emphasize ? a.hl : a.l.content}`, BG_ADD);
 	}
 
 	out.push(diffRule(tw));
@@ -6213,22 +6245,48 @@ async function renderUnified(
 	return out.join("\n");
 }
 
-async function renderSplit(
+async function renderUnified(
 	diff: ParsedDiff,
 	language: BundledLanguage | undefined,
-	max = MAX_PREVIEW_LINES,
+	max = MAX_RENDER_LINES,
 	dc: DiffColors = DEFAULT_DIFF_COLORS,
 	width = termW(),
 ): Promise<string> {
-	const tw = width;
-	if (!shouldUseSplit(diff, tw, max)) return renderUnified(diff, language, max, dc, width);
 	if (!diff.lines.length) return "";
+	const vis = diff.lines.slice(0, max);
+	const { oldSrc, newSrc } = unifiedHighlightSources(vis);
+	const canHL = canHighlightDiff(diff, vis);
+	const [oldHL, newHL] = canHL
+		? await Promise.all([hlBlock(oldSrc.join("\n"), language), hlBlock(newSrc.join("\n"), language)])
+		: [oldSrc, newSrc];
+	return renderUnifiedRows(diff, vis, width, dc, oldHL, newHL, canHL);
+}
 
-	type Row = { left: DiffLine | null; right: DiffLine | null };
-	const rows: Row[] = [];
+/**
+ * The same unified diff with no syntax highlighting, rendered synchronously so a row can take
+ * its final height on the first frame instead of waiting one behind Shiki (and instead of a
+ * short placeholder that reflows the transcript when the highlighted body replaces it).
+ */
+function renderUnifiedPlain(
+	diff: ParsedDiff,
+	max = MAX_RENDER_LINES,
+	dc: DiffColors = DEFAULT_DIFF_COLORS,
+	width = termW(),
+): string {
+	if (!diff.lines.length) return "";
+	const vis = diff.lines.slice(0, max);
+	const { oldSrc, newSrc } = unifiedHighlightSources(vis);
+	return renderUnifiedRows(diff, vis, width, dc, oldSrc, newSrc, canHighlightDiff(diff, vis));
+}
+
+type SplitRow = { left: DiffLine | null; right: DiffLine | null };
+
+/** Pair deleted/added lines into the two columns a split diff draws. */
+function buildSplitRows(lines: DiffLine[]): SplitRow[] {
+	const rows: SplitRow[] = [];
 	let i = 0;
-	while (i < diff.lines.length) {
-		const line = diff.lines[i];
+	while (i < lines.length) {
+		const line = lines[i];
 		if (line.type === "sep" || line.type === "ctx") {
 			rows.push({ left: line, right: line });
 			i++;
@@ -6236,28 +6294,45 @@ async function renderSplit(
 		}
 		const dels: DiffLine[] = [];
 		const adds: DiffLine[] = [];
-		while (i < diff.lines.length && diff.lines[i].type === "del") dels.push(diff.lines[i++]);
-		while (i < diff.lines.length && diff.lines[i].type === "add") adds.push(diff.lines[i++]);
+		while (i < lines.length && lines[i].type === "del") dels.push(lines[i++]);
+		while (i < lines.length && lines[i].type === "add") adds.push(lines[i++]);
 		const n = Math.max(dels.length, adds.length);
 		for (let j = 0; j < n; j++) rows.push({ left: dels[j] ?? null, right: adds[j] ?? null });
 	}
+	return rows;
+}
 
-	const vis = rows.slice(0, max);
-	const half = Math.floor((tw - 1) / 2);
-	const nw = Math.max(2, String(maxLineNumber(diff.lines)).length);
-	const gw = nw + 4;
-	const cw = Math.max(12, half - gw);
-	const canHL = diff.chars <= MAX_HL_CHARS && vis.length * 2 <= MAX_RENDER_LINES * 2;
-
+/** Source lines the highlighter needs for each column of a split diff. */
+function splitHighlightSources(vis: SplitRow[]): { leftSrc: string[]; rightSrc: string[] } {
 	const leftSrc: string[] = [];
 	const rightSrc: string[] = [];
 	for (const row of vis) {
 		if (row.left && row.left.type !== "sep") leftSrc.push(row.left.content);
 		if (row.right && row.right.type !== "sep") rightSrc.push(row.right.content);
 	}
-	const [leftHL, rightHL] = canHL
-		? await Promise.all([hlBlock(leftSrc.join("\n"), language), hlBlock(rightSrc.join("\n"), language)])
-		: [leftSrc, rightSrc];
+	return { leftSrc, rightSrc };
+}
+
+/**
+ * Rows for a two-column diff. Like `renderUnifiedRows`, highlighting is done by the callers so
+ * an unhighlighted render can go through this same code path: identical rows and height, only
+ * the colors differ (see the note there).
+ */
+function renderSplitRows(
+	diff: ParsedDiff,
+	vis: SplitRow[],
+	allRows: SplitRow[],
+	width: number,
+	dc: DiffColors,
+	leftHL: string[],
+	rightHL: string[],
+	emphasize: boolean,
+): string {
+	const tw = width;
+	const half = Math.floor((tw - 1) / 2);
+	const nw = Math.max(2, String(maxLineNumber(diff.lines)).length);
+	const gw = nw + 4;
+	const cw = Math.max(12, half - gw);
 
 	let leftIndex = 0;
 	let rightIndex = 0;
@@ -6307,10 +6382,10 @@ async function renderSplit(
 		const wd = paired && leftLine && rightLine ? wordDiffAnalysis(leftLine.content, rightLine.content) : null;
 		let leftResult: HalfResult;
 		let rightResult: HalfResult;
-		if (paired && wd && leftLine && rightLine && wd.similarity >= WORD_DIFF_MIN_SIM && canHL) {
+		if (paired && wd && leftLine && rightLine && wd.similarity >= WORD_DIFF_MIN_SIM && emphasize) {
 			leftResult = halfBuild(leftLine, leftHL[leftIndex++] ?? leftLine.content, wd.oldRanges, "left");
 			rightResult = halfBuild(rightLine, rightHL[rightIndex++] ?? rightLine.content, wd.newRanges, "right");
-		} else if (paired && wd && leftLine && rightLine && wd.similarity >= WORD_DIFF_MIN_SIM && !canHL) {
+		} else if (paired && wd && leftLine && rightLine && wd.similarity >= WORD_DIFF_MIN_SIM && !emphasize) {
 			const pwd = plainWordDiff(leftLine.content, rightLine.content);
 			leftIndex++;
 			rightIndex++;
@@ -6341,8 +6416,45 @@ async function renderSplit(
 	}
 
 	out.push(`${diffRule(half)}${FG_RULE}┊${D_RST}${diffRule(half)}`);
-	if (rows.length > vis.length) out.push(`${BG_BASE}${FG_DIM}  ${collapsedDiffHint(rows.length - vis.length, 0)}${D_RST}`);
+	if (allRows.length > vis.length) out.push(`${BG_BASE}${FG_DIM}  ${collapsedDiffHint(allRows.length - vis.length, 0)}${D_RST}`);
 	return out.join("\n");
+}
+
+async function renderSplit(
+	diff: ParsedDiff,
+	language: BundledLanguage | undefined,
+	max = MAX_PREVIEW_LINES,
+	dc: DiffColors = DEFAULT_DIFF_COLORS,
+	width = termW(),
+): Promise<string> {
+	if (!shouldUseSplit(diff, width, max)) return renderUnified(diff, language, max, dc, width);
+	if (!diff.lines.length) return "";
+	const allRows = buildSplitRows(diff.lines);
+	const vis = allRows.slice(0, max);
+	const { leftSrc, rightSrc } = splitHighlightSources(vis);
+	const canHL = canHighlightDiff(diff, vis);
+	const [leftHL, rightHL] = canHL
+		? await Promise.all([hlBlock(leftSrc.join("\n"), language), hlBlock(rightSrc.join("\n"), language)])
+		: [leftSrc, rightSrc];
+	return renderSplitRows(diff, vis, allRows, width, dc, leftHL, rightHL, canHL);
+}
+
+/**
+ * The same split diff with no syntax highlighting, rendered synchronously: identical rows and
+ * height to the highlighted body, so replacing one with the other cannot reflow the transcript.
+ */
+function renderSplitPlain(
+	diff: ParsedDiff,
+	max = MAX_PREVIEW_LINES,
+	dc: DiffColors = DEFAULT_DIFF_COLORS,
+	width = termW(),
+): string {
+	if (!shouldUseSplit(diff, width, max)) return renderUnifiedPlain(diff, max, dc, width);
+	if (!diff.lines.length) return "";
+	const allRows = buildSplitRows(diff.lines);
+	const vis = allRows.slice(0, max);
+	const { leftSrc, rightSrc } = splitHighlightSources(vis);
+	return renderSplitRows(diff, vis, allRows, width, dc, leftSrc, rightSrc, canHighlightDiff(diff, vis));
 }
 
 function getEditOperations(input: any): Array<{ oldText: string; newText: string }> {
@@ -6468,37 +6580,60 @@ interface LocalizedEditDiff {
 	line: number;
 }
 
+/** Shared projection logic; the callers supply the file contents (see the note on the wrappers). */
+function projectEditDiff(
+	operations: Array<{ oldText: string; newText: string }>,
+	rawContent: string,
+): ParsedDiff | null {
+	const normalizedContent = normalizeToLf(stripBomText(rawContent));
+	const normalizedOps = operations.map((edit) => ({
+		oldText: normalizeToLf(edit.oldText),
+		newText: normalizeToLf(edit.newText),
+	}));
+	const baseContent = normalizedOps.some((edit) => findEditMatch(normalizedContent, edit.oldText).usedFuzzyMatch)
+		? normalizeTextForFuzzyMatch(normalizedContent)
+		: normalizedContent;
+	const matches = normalizedOps.map((edit) => {
+		const match = findEditMatch(baseContent, edit.oldText);
+		if (!match.found || countFuzzyOccurrences(baseContent, edit.oldText) !== 1) return null;
+		return { matchIndex: match.index, matchLength: match.matchLength, newText: edit.newText };
+	});
+	if (matches.some((match) => match === null)) return null;
+	const ordered = [...(matches as Array<{ matchIndex: number; matchLength: number; newText: string }>)]
+		.sort((a, b) => a.matchIndex - b.matchIndex);
+	for (let index = 1; index < ordered.length; index++) {
+		const previous = ordered[index - 1];
+		const current = ordered[index];
+		if (previous.matchIndex + previous.matchLength > current.matchIndex) return null;
+	}
+	let projected = baseContent;
+	for (let index = ordered.length - 1; index >= 0; index--) {
+		const match = ordered[index];
+		projected = `${projected.slice(0, match.matchIndex)}${match.newText}${projected.slice(match.matchIndex + match.matchLength)}`;
+	}
+	return parseDiff(baseContent, projected);
+}
+
 async function computeProjectedEditDiff(filePath: string, operations: Array<{ oldText: string; newText: string }>, cwd: string): Promise<ParsedDiff | null> {
 	if (!filePath || operations.length === 0) return null;
 	try {
-		const rawContent = await readFileAsync(resolve(cwd, filePath), "utf8");
-		const normalizedContent = normalizeToLf(stripBomText(rawContent));
-		const normalizedOps = operations.map((edit) => ({
-			oldText: normalizeToLf(edit.oldText),
-			newText: normalizeToLf(edit.newText),
-		}));
-		const baseContent = normalizedOps.some((edit) => findEditMatch(normalizedContent, edit.oldText).usedFuzzyMatch)
-			? normalizeTextForFuzzyMatch(normalizedContent)
-			: normalizedContent;
-		const matches = normalizedOps.map((edit) => {
-			const match = findEditMatch(baseContent, edit.oldText);
-			if (!match.found || countFuzzyOccurrences(baseContent, edit.oldText) !== 1) return null;
-			return { matchIndex: match.index, matchLength: match.matchLength, newText: edit.newText };
-		});
-		if (matches.some((match) => match === null)) return null;
-		const ordered = [...(matches as Array<{ matchIndex: number; matchLength: number; newText: string }>)]
-			.sort((a, b) => a.matchIndex - b.matchIndex);
-		for (let index = 1; index < ordered.length; index++) {
-			const previous = ordered[index - 1];
-			const current = ordered[index];
-			if (previous.matchIndex + previous.matchLength > current.matchIndex) return null;
-		}
-		let projected = baseContent;
-		for (let index = ordered.length - 1; index >= 0; index--) {
-			const match = ordered[index];
-			projected = `${projected.slice(0, match.matchIndex)}${match.newText}${projected.slice(match.matchIndex + match.matchLength)}`;
-		}
-		return parseDiff(baseContent, projected);
+		return projectEditDiff(operations, await readFileAsync(resolve(cwd, filePath), "utf8"));
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Same projection, read synchronously.
+ *
+ * The renderer needs the diff *on this frame* to draw a body whose height already matches the
+ * highlighted one; the asynchronous read otherwise forces a short placeholder frame first, and
+ * the row shrinking and growing again is what reflows the transcript while the reader scrolls.
+ */
+function computeProjectedEditDiffSync(filePath: string, operations: Array<{ oldText: string; newText: string }>, cwd: string): ParsedDiff | null {
+	if (!filePath || operations.length === 0) return null;
+	try {
+		return projectEditDiff(operations, readFileSync(resolve(cwd, filePath), "utf8"));
 	} catch {
 		return null;
 	}
@@ -6541,6 +6676,35 @@ async function computeLocalizedEditDiffs(filePath: string, operations: Array<{ o
 	}
 }
 
+/** Number of terminal rows a rendered diff body occupies. */
+function diffBodyRowCount(body: string): number {
+	return body.split("\n").length;
+}
+
+/**
+ * Highlighted body for a diff, but only when it occupies exactly as many rows as the plain one.
+ *
+ * `wrapAnsi` re-slices text that carries ANSI colors, so a highlighted line can fit fewer
+ * characters per row than the same plain line and wrap into more rows (Shiki long lines do this).
+ * Swapping that body in changes the row's height, which reflows the transcript under the reader —
+ * the scrolling jump this whole path avoids — and it also desynchronises the body from its gutters
+ * and tint. The plain body is already on screen, so preferring it costs only the colors.
+ */
+async function renderDiffBody(
+	plainBody: string,
+	diff: ParsedDiff,
+	language: BundledLanguage | undefined,
+	max: number,
+	dc: DiffColors,
+	width: number,
+	mode: "split" | "unified",
+): Promise<string> {
+	const highlighted = mode === "split"
+		? await renderSplit(diff, language, max, dc, width)
+		: await renderUnified(diff, language, max, dc, width);
+	return diffBodyRowCount(highlighted) === diffBodyRowCount(plainBody) ? highlighted : plainBody;
+}
+
 function renderPendingWritePreviewBody(
 	ctx: any,
 	key: string,
@@ -6558,8 +6722,13 @@ function renderPendingWritePreviewBody(
 	const summary = diffSummaryWithMeta(diff.added, diff.removed, hunks, mode);
 	const action = theme.fg("muted", existedBefore ? "pending overwrite" : "pending create");
 	const dc = resolveDiffColors(theme);
-	const render = mode === "split" ? renderSplit : renderUnified;
-	render(diff, lang(filePath), previewLines, dc, diffWidth)
+	// Synchronous, unhighlighted first: the highlighted pass below changes only colors, so the row
+	// takes its final height immediately instead of showing a shorter body while Shiki loads.
+	const renderPlain = mode === "split" ? renderSplitPlain : renderUnifiedPlain;
+	const plainBody = renderPlain(diff, previewLines, dc, diffWidth);
+	ctx.state._pendingWritePreviewBody = `${action} ${summary}\n${plainBody}`;
+	ctx.state._pendingWritePreviewDisplay = indentBranchBlock(withBranch(ctx.state._pendingWritePreviewBody, theme, false, true));
+	renderDiffBody(plainBody, diff, lang(filePath), previewLines, dc, diffWidth, mode)
 		.then((rendered) => {
 			if (ctx.state._pendingWritePreviewKey !== key) return;
 			ctx.state._pendingWritePreviewBody = `${action} ${summary}\n${rendered}`;
@@ -6595,8 +6764,13 @@ function renderProjectedEditPreviewBody(
 	const mode = stickyUseSplit(ctx.state, `projected-edit:${key}`, diff, diffWidth, previewLines) ? "split" : "unified";
 	const summary = diffSummaryWithMeta(diff.added, diff.removed, hunks, mode);
 	const dc = resolveDiffColors(theme);
-	const render = mode === "split" ? renderSplit : renderUnified;
-	render(diff, language, previewLines, dc, diffWidth)
+	// Synchronous, unhighlighted first: the highlighted pass below changes only colors, so the row
+	// takes its final height immediately instead of showing a shorter body while Shiki loads.
+	const renderPlain = mode === "split" ? renderSplitPlain : renderUnifiedPlain;
+	const plainBody = renderPlain(diff, previewLines, dc, diffWidth);
+	ctx.state._ptBody = `${summary}\n${plainBody}`;
+	ctx.state._ptDisplay = indentBranchBlock(withBranch(ctx.state._ptBody, theme, false, true));
+	renderDiffBody(plainBody, diff, language, previewLines, dc, diffWidth, mode)
 		.then((rendered) => {
 			if (ctx.state._pk !== key) return;
 			ctx.state._ptBody = `${summary}\n${rendered}`;
@@ -6638,7 +6812,13 @@ function renderEditPreviewBody(
 	const branchWidth = contextDiffWidth(ctx, 3);
 	if (operations.length === 1) {
 		const [diff] = diffs;
-		renderSplit(diff, language, ctx.expanded ? MAX_PREVIEW_LINES : 32, dc, branchWidth)
+		// Synchronous, unhighlighted first: same rows and height as the highlighted pass below, so
+		// the row is complete on this frame instead of short while Shiki loads (see renderUnifiedRows).
+		const previewLineCap = ctx.expanded ? MAX_PREVIEW_LINES : 32;
+		const plainBody = renderSplitPlain(diff, previewLineCap, dc, branchWidth);
+		ctx.state._ptBody = `${summarizeDiff(diff.added, diff.removed)}\n${plainBody}`;
+		ctx.state._ptDisplay = indentBranchBlock(withBranch(ctx.state._ptBody, theme, false, true));
+		renderDiffBody(plainBody, diff, language, previewLineCap, dc, branchWidth, "split")
 			.then((rendered) => {
 				if (ctx.state._pk !== key) return;
 				ctx.state._ptBody = `${summarizeDiff(diff.added, diff.removed)}\n${rendered}`;
@@ -6658,16 +6838,21 @@ function renderEditPreviewBody(
 	}
 	const maxShown = operations.length;
 	const previewLines = Math.max(8, Math.floor(MAX_RENDER_LINES / Math.max(1, maxShown)));
-	mapWithConcurrency(diffs.slice(0, maxShown), DIFF_RENDER_CONCURRENCY, async (diff) => {
-		return renderSplit(diff, language, previewLines, dc, branchWidth)
+	const remainder = operations.length - maxShown;
+	const suffix = remainder > 0
+		? `\n${theme.fg("muted", `… ${remainder} more edit blocks${toolOutputDetailHint(theme, ctx.expanded, true)}`)}`
+		: "";
+	// Synchronous, unhighlighted first (see renderUnifiedRows): the highlighted pass below
+	// replaces only the colors, so this frame already carries the final row count.
+	const plainSections = diffs.slice(0, maxShown).map((diff) => renderSplitPlain(diff, previewLines, dc, branchWidth));
+	ctx.state._ptBody = `${operations.length} edits ${summary}\n${joinEditDiffSections(plainSections)}${suffix}`;
+	ctx.state._ptDisplay = indentBranchBlock(withBranch(ctx.state._ptBody, theme, false, true));
+	mapWithConcurrency(diffs.slice(0, maxShown), DIFF_RENDER_CONCURRENCY, async (diff, index) => {
+		return renderDiffBody(plainSections[index], diff, language, previewLines, dc, branchWidth, "split")
 			.catch(() => summarizeDiff(diff.added, diff.removed));
 	})
 		.then((sections) => {
 			if (ctx.state._pk !== key) return;
-			const remainder = operations.length - maxShown;
-			const suffix = remainder > 0
-				? `\n${theme.fg("muted", `… ${remainder} more edit blocks${toolOutputDetailHint(theme, ctx.expanded, true)}`)}`
-				: "";
 			ctx.state._ptBody = `${operations.length} edits ${summary}\n${joinEditDiffSections(sections)}${suffix}`;
 			ctx.state._ptDisplay = indentBranchBlock(withBranch(ctx.state._ptBody, theme, false, true));
 			safeInvalidate(ctx);
@@ -7504,19 +7689,20 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 	const key = `apply-preview:${ctx.state._applyPatchMetaKey ?? hashText(patchText)}:${diffWidth}:${ctx.expanded ? 1 : 0}`;
 	if (ctx.state._applyPatchPreviewKey !== key) {
 		ctx.state._applyPatchPreviewKey = key;
-		// Only a row with nothing on screen yet gets the placeholder: a rebuild keeps the previous
-		// preview so the row cannot shrink (see beginDiffPreviewBuild).
-		if (!ctx.state._applyPatchPreviewDisplay) {
-			ctx.state._applyPatchPreviewBody = theme.fg("muted", "(rendering…)");
-			ctx.state._applyPatchPreviewDisplay = withBranch(ctx.state._applyPatchPreviewBody, theme, false, true);
-		}
+		// No placeholder: both branches below publish an unhighlighted body synchronously.
 		const dc = resolveDiffColors(theme);
 		if (preview.changes.length === 1) {
 			const [change] = preview.changes;
-			renderSplit(change.diff, change.language, ctx.expanded ? MAX_PREVIEW_LINES : 32, dc, diffWidth)
+			const heading = `${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}`;
+			// Synchronous, unhighlighted first: same rows and height as the highlighted pass below.
+			const patchLineCap = ctx.expanded ? MAX_PREVIEW_LINES : 32;
+			const plainBody = renderSplitPlain(change.diff, patchLineCap, dc, diffWidth);
+			ctx.state._applyPatchPreviewBody = `${heading}\n${plainBody}`;
+			ctx.state._applyPatchPreviewDisplay = withBranch(ctx.state._applyPatchPreviewBody, theme, false, true);
+			renderDiffBody(plainBody, change.diff, change.language, patchLineCap, dc, diffWidth, "split")
 				.then((rendered) => {
 					if (ctx.state._applyPatchPreviewKey !== key) return;
-					ctx.state._applyPatchPreviewBody = `${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}\n${rendered}`;
+					ctx.state._applyPatchPreviewBody = `${heading}\n${rendered}`;
 					ctx.state._applyPatchPreviewDisplay = withBranch(ctx.state._applyPatchPreviewBody, theme, false, true);
 					safeInvalidate(ctx);
 				})
@@ -7534,19 +7720,25 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 			const previewLines = ctx.expanded
 				? Math.max(6, Math.floor(MAX_RENDER_LINES / Math.max(1, maxShown)))
 				: Math.max(8, Math.floor(MAX_PREVIEW_LINES / Math.max(1, maxShown)));
-			mapWithConcurrency(preview.changes.slice(0, maxShown), DIFF_RENDER_CONCURRENCY, async (change, index) =>
-				renderSplit(change.diff, change.language, previewLines, dc, diffWidth)
-					.then((rendered) => `${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}\n${rendered}`)
-					.catch(() => `${index + 1}. ${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}`),
+			const shown = preview.changes.slice(0, maxShown);
+			const remainder = preview.changes.length - maxShown;
+			const suffix = remainder > 0
+				? `\n${theme.fg("muted", `… ${remainder} more file patches${toolOutputDetailHint(theme, ctx.expanded, true)}`)}`
+				: "";
+			const fileSummary = `${preview.changes.length} files ${preview.summary}`;
+			const sectionHeading = (change: ApplyPatchChangePreview) => `${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}`;
+			// Synchronous, unhighlighted first: same rows and height as the highlighted pass below.
+			const plainSections = shown.map((change) => renderSplitPlain(change.diff, previewLines, dc, diffWidth));
+			ctx.state._applyPatchPreviewBody = `${fileSummary}\n\n${shown.map((change, index) => `${sectionHeading(change)}\n${plainSections[index]}`).join("\n\n")}${suffix}`;
+			ctx.state._applyPatchPreviewDisplay = withBranch(ctx.state._applyPatchPreviewBody, theme, false, true);
+			mapWithConcurrency(shown, DIFF_RENDER_CONCURRENCY, async (change, index) =>
+				renderDiffBody(plainSections[index], change.diff, change.language, previewLines, dc, diffWidth, "split")
+					.then((rendered) => `${sectionHeading(change)}\n${rendered}`)
+					.catch(() => `${index + 1}. ${sectionHeading(change)}`),
 			)
 				.then((sections) => {
 					if (ctx.state._applyPatchPreviewKey !== key) return;
-					const remainder = preview.changes.length - maxShown;
-					const suffix = remainder > 0
-						? `\n${theme.fg("muted", `… ${remainder} more file patches${toolOutputDetailHint(theme, ctx.expanded, true)}`)}`
-						: "";
-					const summary = `${preview.changes.length} files ${preview.summary}`;
-					ctx.state._applyPatchPreviewBody = `${summary}\n\n${sections.join("\n\n")}${suffix}`;
+					ctx.state._applyPatchPreviewBody = `${fileSummary}\n\n${sections.join("\n\n")}${suffix}`;
 					ctx.state._applyPatchPreviewDisplay = withBranch(ctx.state._applyPatchPreviewBody, theme, false, true);
 					safeInvalidate(ctx);
 				})
@@ -8646,13 +8838,8 @@ export default function (pi: ExtensionAPI) {
 			const key = `pending-write:${fp}:${hashText(baseline.content ?? "")}:${hashText(content)}:${diffWidth}:${ctx.expanded ? 1 : 0}`;
 			if (ctx.state._pendingWritePreviewKey !== key) {
 				ctx.state._pendingWritePreviewKey = key;
-				// Only a row with nothing on screen yet gets the placeholder: a rebuild keeps the
-				// previous preview so the row cannot shrink (see beginDiffPreviewBuild).
-				if (!ctx.state._pendingWritePreviewDisplay) {
-					const action = theme.fg("muted", baseline.existed ? "pending overwrite" : "pending create");
-					ctx.state._pendingWritePreviewBody = `${action}\n${theme.fg("muted", "rendering diff…")}`;
-					ctx.state._pendingWritePreviewDisplay = indentBranchBlock(withBranch(ctx.state._pendingWritePreviewBody, theme, false, true));
-				}
+				// No placeholder: the builder publishes an unhighlighted body synchronously and then
+				// upgrades it to the highlighted one, which has the same rows (see renderUnifiedRows).
 				renderPendingWritePreviewBody(ctx, key, theme, fp, baseline.content ?? "", content, baseline.existed);
 			}
 			const body = ctx.state._pendingWritePreviewDisplay as string | undefined;
@@ -8689,7 +8876,10 @@ export default function (pi: ExtensionAPI) {
 					ctx.state._wdk = key;
 					const token = beginDiffPreviewBuild(ctx.state, "_wdToken");
 					const dc = resolveDiffColors(theme);
-					renderSplit(d.diff, d.language, previewLines, dc, diffWidth)
+					// Synchronous, unhighlighted first: same rows and height as the highlighted pass below.
+					const plainWdt = renderSplitPlain(d.diff, previewLines, dc, diffWidth);
+					ctx.state._wdt = withFinalBranchBlock(`${richSummary}\n${plainWdt}`, theme);
+					renderDiffBody(plainWdt, d.diff, d.language, previewLines, dc, diffWidth, mode)
 						.then((rendered) => {
 							if (!isDiffPreviewBuildCurrent(ctx.state, "_wdToken", token)) return;
 							ctx.state._wdt = withFinalBranchBlock(`${richSummary}\n${rendered}`, theme);
@@ -8702,7 +8892,7 @@ export default function (pi: ExtensionAPI) {
 							safeInvalidate(ctx);
 						});
 				}
-				const wdBody = (ctx.state._wdt as string | undefined) ?? withFinalBranchBlock(`${richSummary}\n${theme.fg("muted", "rendering diff…")}`, theme);
+				const wdBody = (ctx.state._wdt as string | undefined) ?? withFinalBranchBlock(`${richSummary}\n${renderSplitPlain(d.diff, previewLines, resolveDiffColors(theme), diffWidth)}`, theme);
 				return makeResponsiveDiffText(ctx, ctx.lastComponent, wdBody);
 			}
 			if (d?._type === "noChange") return makeText(ctx.lastComponent, withBranch(theme.fg("muted", "✓ no changes"), theme));
@@ -8719,7 +8909,10 @@ export default function (pi: ExtensionAPI) {
 					ctx.state._nfk = pk;
 					const token = beginDiffPreviewBuild(ctx.state, "_nfToken");
 					const dc = resolveDiffColors(theme);
-					renderUnified(syntheticDiff, lang(d.filePath), previewLines, dc, diffWidth)
+					// Synchronous, unhighlighted first: same rows and height as the highlighted pass below.
+					const plainNft = renderUnifiedPlain(syntheticDiff, previewLines, dc, diffWidth);
+					ctx.state._nft = withFinalBranchBlock(`${richSummary}\n${plainNft}`, theme);
+					renderDiffBody(plainNft, syntheticDiff, lang(d.filePath), previewLines, dc, diffWidth, "unified")
 						.then((rendered) => {
 							if (!isDiffPreviewBuildCurrent(ctx.state, "_nfToken", token)) return;
 							ctx.state._nft = withFinalBranchBlock(`${richSummary}\n${rendered}`, theme);
@@ -8732,7 +8925,7 @@ export default function (pi: ExtensionAPI) {
 							safeInvalidate(ctx);
 						});
 				}
-				const nfBody = (ctx.state._nft as string | undefined) ?? withFinalBranchBlock(`${richSummary}\n${theme.fg("muted", "rendering diff…")}`, theme);
+				const nfBody = (ctx.state._nft as string | undefined) ?? withFinalBranchBlock(`${richSummary}\n${renderUnifiedPlain(syntheticDiff, previewLines, resolveDiffColors(theme), diffWidth)}`, theme);
 				return makeResponsiveDiffText(ctx, ctx.lastComponent, nfBody);
 			}
 			return makeText(ctx.lastComponent, withBranch(theme.fg("success", "Written"), theme));
@@ -8800,7 +8993,11 @@ export default function (pi: ExtensionAPI) {
 				ctx.state._pk = key;
 				// The previous preview stays on screen while this one is built: a one-line
 				// placeholder collapses the row and reflows the transcript (see beginDiffPreviewBuild).
+				// When the projection can be computed synchronously the row takes its final height on
+				// this very frame, unhighlighted; the asynchronous pass below refines the same diff.
 				const lg = lang(fp);
+				const immediate = computeProjectedEditDiffSync(fp, operations, cwd);
+				if (immediate) renderProjectedEditPreviewBody(ctx, key, theme, lg, immediate);
 				void computeProjectedEditDiff(fp, operations, cwd)
 					.then(async (projectedDiff) => {
 						if (ctx.state._pk !== key) return;

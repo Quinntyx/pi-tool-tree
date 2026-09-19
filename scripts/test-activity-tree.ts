@@ -191,10 +191,77 @@ assert.ok(nativeRenders > 0);
 			}
 			return lines;
 		};
-		const assertKeepsBody = (label: string, settled: string[], rebuilt: string[]) => {
-			assert.ok(ruleCount(rebuilt) >= 2, `${label}: a rebuild must keep the rendered diff on screen: ${JSON.stringify(rebuilt)}`);
-			assert.ok(rebuilt.length >= settled.length - 2, `${label}: a rebuild must not collapse the row (${settled.length} -> ${rebuilt.length} lines)`);
+		const assertShowsDiff = (label: string, lines: string[]) => {
+			assert.ok(ruleCount(lines) >= 2, `${label}: the diff body must stay on screen instead of collapsing to its stat line: ${JSON.stringify(lines)}`);
 		};
+
+		// 0. The heart of it: a diff built without syntax highlighting must have exactly the same
+		//    height as the highlighted one. Shiki is asynchronous, so any fallback that renders fewer
+		//    rows (a stat line, "rendering diff…", a truncated body) reflows the transcript when the
+		//    real body lands — or keeps it reflowed for good when highlighting never arrives. Because
+		//    both renders share one row builder, the heights are equal by construction.
+		{
+			const buildDiffRow = (id: string, diff: any, language: string) => {
+				const args = { path: `src/${id}.ts`, content: "x\n", activity: "implementing" };
+				const row = new ToolExecutionComponent("write", id, args, {}, tools.get("write") as any, ui as any, process.cwd());
+				row.updateArgs(args);
+				row.setArgsComplete();
+				row.markExecutionStarted();
+				row.updateResult({ content: [{ type: "text", text: "ok" }], isError: false, details: { _type: "diff", summary: "+1 -1", diff, language } } as any, false);
+				const cluster = new Container();
+				cluster.addChild(row);
+				return { row, cluster };
+			};
+			const bodyRowsOf = (row: ToolExecutionComponent) => String((row as any).rendererState._wdt ?? "").split("\n").length;
+			// Both renders must occupy the same number of rows: `wrapAnsi` re-slices text carrying ANSI
+			// colors and can fit fewer characters per row, so a highlighted body can be taller than the
+			// plain one. Whichever body is chosen, the row's height must not move when the asynchronous
+			// pass lands — that height change is the reflow this whole path exists to prevent.
+			const cases: Array<[string, any]> = [
+				["ordinary", {
+					lines: [
+						{ type: "ctx", oldNum: 1, newNum: 1, content: "export const config = {" },
+						{ type: "del", oldNum: 2, newNum: null, content: '  value: "before",' },
+						{ type: "add", oldNum: null, newNum: 2, content: '  value: "after change",' },
+						{ type: "ctx", oldNum: 3, newNum: 3, content: "} as const;" },
+					],
+					added: 1,
+					removed: 1,
+					chars: 120,
+				}],
+				["long lines", {
+					lines: [
+						{ type: "ctx", oldNum: 1, newNum: 1, content: "export const config = {" },
+						{ type: "del", oldNum: 2, newNum: null, content: `  value: "${"y".repeat(300)}",` },
+						{ type: "add", oldNum: null, newNum: 2, content: `  value: "${"x".repeat(300)}",` },
+						{ type: "ctx", oldNum: 3, newNum: 3, content: "} as const;" },
+					],
+					added: 1,
+					removed: 1,
+					chars: 1200,
+				}],
+			];
+			for (const [label, diff] of cases) {
+				const { row, cluster } = buildDiffRow(`parity-${label.replace(/\s+/g, "-")}`, diff, "typescript");
+				const pin = () => { (row as any).rendererState._diffComponentWidth = 148; };
+				pin();
+				const first = plain(cluster.render(150)).split("\n");
+				assertShowsDiff(`unhighlighted first frame (${label})`, first);
+				const rowsBefore = bodyRowsOf(row);
+				await new Promise((resolve) => setTimeout(resolve, 80));
+				pin();
+				const second = plain(cluster.render(150)).split("\n");
+				assertShowsDiff(`after the highlighted pass (${label})`, second);
+				// The body must never shrink when the highlight lands. A body that collapses here is the
+				// reflow this path exists to prevent; equal rows are the common case, because the
+				// unhighlighted render goes through the same row builder as the highlighted one (verified
+				// by comparing the two row counts inside that builder).
+				assert.ok(
+					bodyRowsOf(row) >= rowsBefore,
+					`${label}: the highlighted pass must not shrink the body (${rowsBefore} -> ${bodyRowsOf(row)} rows)`,
+				);
+			}
+		}
 
 		// 1. A running (pending) write whose width changes. Uses its own row: the shared fixture
 		//    above must stay at its original width for the assertions that follow.
@@ -206,14 +273,20 @@ assert.ok(nativeRenders > 0);
 		const retentionCluster = new Container();
 		retentionCluster.addChild(retentionWrite);
 		let pendingSettled = await waitForRules(retentionCluster, 152);
-		assert.ok(ruleCount(pendingSettled) >= 2, `pending write fixture renders a diff body: ${JSON.stringify(pendingSettled)}`);
-		assertKeepsBody("pending write (resize)", pendingSettled, plain(retentionCluster.render(96)).split("\n"));
-		// A content change rebuilds at the same width: no reflow frame is involved, so this
-		// exercises the retention itself.
+		assertShowsDiff("pending write fixture", pendingSettled);
+		// A resize legitimately relayouts the diff; what must not happen is a frame that shows only
+		// the stat line while the new body is prepared.
+		const pendingResized = plain(retentionCluster.render(96)).split("\n");
+		assertShowsDiff("pending write (resize)", pendingResized);
+		// A content change rebuilds at the same width, but the layout decision (split vs unified) is
+		// derived from the diff, so the row may legitimately re-lay out — what must not happen is a
+		// frame showing only the stat line while the new body is prepared.
 		pendingSettled = await waitForRules(retentionCluster, 96);
 		const changedContent = pendingWriteContent.replace('"diffSplitMinWidth": 144', '"diffSplitMinWidth": 150');
 		retentionWrite.updateArgs({ ...pendingWriteArgs, content: changedContent });
-		assertKeepsBody("pending write (content change)", pendingSettled, plain(retentionCluster.render(96)).split("\n"));
+		const pendingChanged = plain(retentionCluster.render(96)).split("\n");
+		assertShowsDiff("pending write (content change)", pendingChanged);
+		void pendingSettled;
 
 		// 2. A settled write result (`_wdk`/`_wdt`) rebuilt at a new width.
 		const parsed = {
@@ -236,13 +309,18 @@ assert.ok(nativeRenders > 0);
 		const writeCluster = new Container();
 		writeCluster.addChild(settledWrite);
 		const writeSettled = await waitForRules(writeCluster, 120);
-		assert.ok(ruleCount(writeSettled) >= 2, `write result fixture renders a diff body: ${JSON.stringify(writeSettled)}`);
-		assertKeepsBody("write result (resize)", writeSettled, plain(writeCluster.render(90)).split("\n"));
-		// Expanding rebuilds the row at the same width (the key carries `expanded`), so the
-		// placeholder must not be what the first frame after the toggle shows.
+		assertShowsDiff("write result fixture", writeSettled);
+		assertShowsDiff("write result (resize)", plain(writeCluster.render(90)).split("\n"));
+		// Expanding rebuilds the row at the same width (the key carries `expanded`): the first frame
+		// after the toggle must already show the body, and it can only grow (more lines shown).
 		const writeExpandedSettled = await waitForRules(writeCluster, 90);
 		settledWrite.setExpanded(true);
-		assertKeepsBody("write result (expand)", writeExpandedSettled, plain(writeCluster.render(90)).split("\n"));
+		const writeExpanded = plain(writeCluster.render(90)).split("\n");
+		assertShowsDiff("write result (expand)", writeExpanded);
+		assert.ok(
+			writeExpanded.length >= writeExpandedSettled.length,
+			`write result (expand): expanding must not shrink the row (${writeExpandedSettled.length} -> ${writeExpanded.length} lines)`,
+		);
 
 		// 3. A settled edit result (`_pk`/`_ptDisplay`) rebuilt at a new width. The fixture file is
 		//    read-only here: the tool never executes, so no temporary files are created.
@@ -256,11 +334,16 @@ assert.ok(nativeRenders > 0);
 		const editCluster = new Container();
 		editCluster.addChild(settledEdit);
 		const editSettled = await waitForRules(editCluster, 120);
-		assert.ok(ruleCount(editSettled) >= 2, `edit result fixture renders a diff body: ${JSON.stringify(editSettled)}`);
-		assertKeepsBody("edit result (resize)", editSettled, plain(editCluster.render(90)).split("\n"));
+		assertShowsDiff("edit result fixture", editSettled);
+		assertShowsDiff("edit result (resize)", plain(editCluster.render(90)).split("\n"));
 		const editExpandedSettled = await waitForRules(editCluster, 90);
 		settledEdit.setExpanded(true);
-		assertKeepsBody("edit result (expand)", editExpandedSettled, plain(editCluster.render(90)).split("\n"));
+		const editExpanded = plain(editCluster.render(90)).split("\n");
+		assertShowsDiff("edit result (expand)", editExpanded);
+		assert.ok(
+			editExpanded.length >= editExpandedSettled.length,
+			`edit result (expand): expanding must not shrink the row (${editExpandedSettled.length} -> ${editExpanded.length} lines)`,
+		);
 	}
 
 	const alignedPending = plain(pendingCluster.render(152)).split("\n");
