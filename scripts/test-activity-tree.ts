@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { AssistantMessageComponent, ToolExecutionComponent, UserMessageComponent } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text, visibleWidth } from "@earendil-works/pi-tui";
 import { initTheme, theme } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
@@ -174,6 +174,93 @@ assert.ok(nativeRenders > 0);
 			await new Promise((resolve) => setTimeout(resolve, 10));
 		}
 		assert.ok(resized.includes(`• ${mode}`) && resized.includes("previewLayout"), `resize to ${width} must finish reflowing the ${mode} diff: ${JSON.stringify(resized)}`);
+	}
+
+	// Anti-flicker: a diff that is already on screen must survive a rebuild. The placeholder
+	// that stands in for a pending build is one or two lines tall, so replacing a rendered diff
+	// with it collapses the row by dozens of lines and reflows the transcript under the reader —
+	// which is what made scrolling jump onto whichever row was rebuilding.
+	{
+		const ruleCount = (lines: string[]) => lines.filter((line) => /─{10,}/.test(line)).length;
+		const waitForRules = async (container: Container, width: number) => {
+			let lines: string[] = [];
+			for (let attempt = 0; attempt < 50; attempt++) {
+				lines = plain(container.render(width)).split("\n");
+				if (ruleCount(lines) >= 2) return lines;
+				await new Promise((resolve) => setTimeout(resolve, 10));
+			}
+			return lines;
+		};
+		const assertKeepsBody = (label: string, settled: string[], rebuilt: string[]) => {
+			assert.ok(ruleCount(rebuilt) >= 2, `${label}: a rebuild must keep the rendered diff on screen: ${JSON.stringify(rebuilt)}`);
+			assert.ok(rebuilt.length >= settled.length - 2, `${label}: a rebuild must not collapse the row (${settled.length} -> ${rebuilt.length} lines)`);
+		};
+
+		// 1. A running (pending) write whose width changes. Uses its own row: the shared fixture
+		//    above must stay at its original width for the assertions that follow.
+		const retentionWrite = new ToolExecutionComponent("write", "retention-pending-write", pendingWriteArgs, {}, tools.get("write") as any, ui as any, process.cwd());
+		retentionWrite.updateArgs(pendingWriteArgs);
+		retentionWrite.setArgsComplete();
+		retentionWrite.markExecutionStarted();
+		retentionWrite.updateResult({ content: [{ type: "text", text: "" }], isError: false } as any, true);
+		const retentionCluster = new Container();
+		retentionCluster.addChild(retentionWrite);
+		let pendingSettled = await waitForRules(retentionCluster, 152);
+		assert.ok(ruleCount(pendingSettled) >= 2, `pending write fixture renders a diff body: ${JSON.stringify(pendingSettled)}`);
+		assertKeepsBody("pending write (resize)", pendingSettled, plain(retentionCluster.render(96)).split("\n"));
+		// A content change rebuilds at the same width: no reflow frame is involved, so this
+		// exercises the retention itself.
+		pendingSettled = await waitForRules(retentionCluster, 96);
+		const changedContent = pendingWriteContent.replace('"diffSplitMinWidth": 144', '"diffSplitMinWidth": 150');
+		retentionWrite.updateArgs({ ...pendingWriteArgs, content: changedContent });
+		assertKeepsBody("pending write (content change)", pendingSettled, plain(retentionCluster.render(96)).split("\n"));
+
+		// 2. A settled write result (`_wdk`/`_wdt`) rebuilt at a new width.
+		const parsed = {
+			lines: [
+				{ type: "ctx", oldNum: 1, newNum: 1, content: "alpha" },
+				{ type: "del", oldNum: 2, newNum: null, content: "beta" },
+				{ type: "add", oldNum: null, newNum: 2, content: "beta changed" },
+				{ type: "ctx", oldNum: 3, newNum: 3, content: "gamma" },
+			],
+			added: 1,
+			removed: 1,
+			chars: 40,
+		} as any;
+		const writeArgs = { path: "src/retention.ts", content: "x\n", activity: "implementing" };
+		const settledWrite = new ToolExecutionComponent("write", "retention-write", writeArgs, {}, tools.get("write") as any, ui as any, process.cwd());
+		settledWrite.updateArgs(writeArgs);
+		settledWrite.setArgsComplete();
+		settledWrite.markExecutionStarted();
+		settledWrite.updateResult({ content: [{ type: "text", text: "ok" }], isError: false, details: { _type: "diff", summary: "+1 -1", diff: parsed, language: "typescript" } } as any, false);
+		const writeCluster = new Container();
+		writeCluster.addChild(settledWrite);
+		const writeSettled = await waitForRules(writeCluster, 120);
+		assert.ok(ruleCount(writeSettled) >= 2, `write result fixture renders a diff body: ${JSON.stringify(writeSettled)}`);
+		assertKeepsBody("write result (resize)", writeSettled, plain(writeCluster.render(90)).split("\n"));
+		// Expanding rebuilds the row at the same width (the key carries `expanded`), so the
+		// placeholder must not be what the first frame after the toggle shows.
+		const writeExpandedSettled = await waitForRules(writeCluster, 90);
+		settledWrite.setExpanded(true);
+		assertKeepsBody("write result (expand)", writeExpandedSettled, plain(writeCluster.render(90)).split("\n"));
+
+		// 3. A settled edit result (`_pk`/`_ptDisplay`) rebuilt at a new width.
+		const editTarget = `/tmp/tree-retention-edit-${Date.now()}.txt`;
+		writeFileSync(editTarget, Array.from({ length: 40 }, (_, i) => `retention line ${i + 1}`).join("\n"));
+		const editArgs = { path: editTarget, edits: [{ oldText: "retention line 20", newText: "retention line 20 edited" }], activity: "implementing" };
+		const settledEdit = new ToolExecutionComponent("edit", "retention-edit", editArgs, {}, tools.get("edit") as any, ui as any, process.cwd());
+		settledEdit.updateArgs(editArgs);
+		settledEdit.setArgsComplete();
+		settledEdit.markExecutionStarted();
+		settledEdit.updateResult({ content: [{ type: "text", text: "ok" }], isError: false, details: { _type: "editInfo", summary: "+1 -1", editLine: 20, hunks: 1, added: 1, removed: 1 } } as any, false);
+		const editCluster = new Container();
+		editCluster.addChild(settledEdit);
+		const editSettled = await waitForRules(editCluster, 120);
+		assert.ok(ruleCount(editSettled) >= 2, `edit result fixture renders a diff body: ${JSON.stringify(editSettled)}`);
+		assertKeepsBody("edit result (resize)", editSettled, plain(editCluster.render(90)).split("\n"));
+		const editExpandedSettled = await waitForRules(editCluster, 90);
+		settledEdit.setExpanded(true);
+		assertKeepsBody("edit result (expand)", editExpandedSettled, plain(editCluster.render(90)).split("\n"));
 	}
 
 	const alignedPending = plain(pendingCluster.render(152)).split("\n");

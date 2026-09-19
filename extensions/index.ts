@@ -4505,15 +4505,24 @@ class ToolText extends Text {
 	}
 
 	render(width: number): string[] {
-		// A split diff is an ANSI string laid out for one exact width. On the first
-		// frame after a pane resize, do not wrap that stale two-column grid into a
-		// corrupted intermediate frame. Notify the renderer and show only its stable
-		// tool heading until the width-keyed diff has been rebuilt.
+		// A split diff is an ANSI string laid out for one exact width, so the frame after a
+		// resize must not re-wrap it: the width-keyed diff is rebuilt below and swapped in.
+		// Keep the *previous* lines (re-padded) rather than collapsing to the heading: a
+		// one-line frame shrinks the row by dozens of lines, which reflows the transcript
+		// under the reader and is what makes scrolling jump. The stale layout is clipped to
+		// the new width for a single frame instead.
 		const reflowing = this.responsiveDiff && this.observedWidth !== undefined && this.observedWidth !== width;
 		this.observeWidth(width);
 		if (reflowing) {
-			const heading = this.value.split("\n", 1)[0] ?? "";
-			return heading ? [padToWidth(heading, width)] : [];
+			// Keep the row's shape: one output line per body line, clipped to the new width. Falling
+			// back to the heading here collapsed the row to a single line whenever the width changed
+			// in the same frame a freshly built diff landed (that invalidates the line cache), and a
+			// row that shrinks by dozens of lines reflows the transcript under the reader. The
+			// internal wrap/clip markers are consumed by the normal path, so drop them here too.
+			const source = this.toolCachedLines && this.toolCachedLines.length > 1
+				? this.toolCachedLines
+				: this.value.split("\n");
+			return source.map((line) => padToWidth(line.replaceAll(WRAP_MARK, "").replaceAll(CLIP_MARK, ""), width));
 		}
 		const branchKey = toolBranchRenderCacheKey();
 		if (
@@ -4541,6 +4550,32 @@ class ToolText extends Text {
 		(this as any)._toolBranchCacheEpoch = _toolBranchVisualEpoch;
 		return rendered;
 	}
+}
+
+/**
+ * Number the pending build for a mutation row.
+ *
+ * Diff previews are built in the background (Shiki highlighting is async), and the stand-in
+ * shown while one is pending is one or two lines tall. Two rules keep that from moving the
+ * transcript under the reader:
+ *
+ * 1. A row keeps whatever diff it already shows until the new one is ready — only a row with
+ *    nothing to show yet renders the placeholder, and a failed build leaves the previous body
+ *    alone. Replacing a rendered diff with the placeholder is what collapsed rows to their
+ *    red/green stat line and made scrolling jump.
+ * 2. A slow build that has already been superseded must not land last. The old guard compared
+ *    the row's build key, which also carried the diff width, so a width change mid-build threw
+ *    the render away and left the row on its placeholder; a token only advances for a newer
+ *    build of the same row.
+ */
+function beginDiffPreviewBuild(state: any, tokenName: string): number {
+	const token = (typeof state?.[tokenName] === "number" ? state[tokenName] : 0) + 1;
+	if (state) state[tokenName] = token;
+	return token;
+}
+
+function isDiffPreviewBuildCurrent(state: any, tokenName: string, token: number): boolean {
+	return state?.[tokenName] === token;
 }
 
 function makeText(last: unknown, text: string): Text {
@@ -6533,8 +6568,11 @@ function renderPendingWritePreviewBody(
 		})
 		.catch(() => {
 			if (ctx.state._pendingWritePreviewKey !== key) return;
-			ctx.state._pendingWritePreviewBody = `${action} ${summary}`;
-			ctx.state._pendingWritePreviewDisplay = indentBranchBlock(withBranch(ctx.state._pendingWritePreviewBody, theme, false, true));
+			// Keep any preview that is already on screen: the action line alone shrinks the row.
+			if (!ctx.state._pendingWritePreviewDisplay) {
+				ctx.state._pendingWritePreviewBody = `${action} ${summary}`;
+				ctx.state._pendingWritePreviewDisplay = indentBranchBlock(withBranch(ctx.state._pendingWritePreviewBody, theme, false, true));
+			}
 			safeInvalidate(ctx);
 		});
 }
@@ -6567,8 +6605,11 @@ function renderProjectedEditPreviewBody(
 		})
 		.catch(() => {
 			if (ctx.state._pk !== key) return;
-			ctx.state._ptBody = summary;
-			ctx.state._ptDisplay = indentBranchBlock(withBranch(summary, theme, false, true));
+			// Keep any diff that is already on screen: the summary line alone shrinks the row.
+			if (!ctx.state._ptDisplay) {
+				ctx.state._ptBody = summary;
+				ctx.state._ptDisplay = indentBranchBlock(withBranch(summary, theme, false, true));
+			}
 			safeInvalidate(ctx);
 		});
 }
@@ -6606,8 +6647,11 @@ function renderEditPreviewBody(
 			})
 			.catch(() => {
 				if (ctx.state._pk !== key) return;
-				ctx.state._ptBody = summarizeDiff(diff.added, diff.removed);
-				ctx.state._ptDisplay = indentBranchBlock(withBranch(ctx.state._ptBody, theme, false, true));
+				// Keep any diff that is already on screen: the summary line alone shrinks the row.
+				if (!ctx.state._ptDisplay) {
+					ctx.state._ptBody = summarizeDiff(diff.added, diff.removed);
+					ctx.state._ptDisplay = indentBranchBlock(withBranch(ctx.state._ptBody, theme, false, true));
+				}
 				safeInvalidate(ctx);
 			});
 		return;
@@ -6630,8 +6674,11 @@ function renderEditPreviewBody(
 		})
 		.catch(() => {
 			if (ctx.state._pk !== key) return;
-			ctx.state._ptBody = `${operations.length} edits ${summary}`;
-			ctx.state._ptDisplay = indentBranchBlock(withBranch(ctx.state._ptBody, theme, false, true));
+			// Keep any diff that is already on screen: the summary line alone shrinks the row.
+			if (!ctx.state._ptDisplay) {
+				ctx.state._ptBody = `${operations.length} edits ${summary}`;
+				ctx.state._ptDisplay = indentBranchBlock(withBranch(ctx.state._ptBody, theme, false, true));
+			}
 			safeInvalidate(ctx);
 		});
 }
@@ -7457,8 +7504,12 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 	const key = `apply-preview:${ctx.state._applyPatchMetaKey ?? hashText(patchText)}:${diffWidth}:${ctx.expanded ? 1 : 0}`;
 	if (ctx.state._applyPatchPreviewKey !== key) {
 		ctx.state._applyPatchPreviewKey = key;
-		ctx.state._applyPatchPreviewBody = theme.fg("muted", "(rendering…)");
-		ctx.state._applyPatchPreviewDisplay = withBranch(ctx.state._applyPatchPreviewBody, theme, false, true);
+		// Only a row with nothing on screen yet gets the placeholder: a rebuild keeps the previous
+		// preview so the row cannot shrink (see beginDiffPreviewBuild).
+		if (!ctx.state._applyPatchPreviewDisplay) {
+			ctx.state._applyPatchPreviewBody = theme.fg("muted", "(rendering…)");
+			ctx.state._applyPatchPreviewDisplay = withBranch(ctx.state._applyPatchPreviewBody, theme, false, true);
+		}
 		const dc = resolveDiffColors(theme);
 		if (preview.changes.length === 1) {
 			const [change] = preview.changes;
@@ -7471,8 +7522,11 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 				})
 				.catch(() => {
 					if (ctx.state._applyPatchPreviewKey !== key) return;
-					ctx.state._applyPatchPreviewBody = `${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}`;
-					ctx.state._applyPatchPreviewDisplay = withBranch(ctx.state._applyPatchPreviewBody, theme, false, true);
+					// Keep any diff that is already on screen: the summary line alone shrinks the row.
+					if (!ctx.state._applyPatchPreviewDisplay) {
+						ctx.state._applyPatchPreviewBody = `${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}`;
+						ctx.state._applyPatchPreviewDisplay = withBranch(ctx.state._applyPatchPreviewBody, theme, false, true);
+					}
 					safeInvalidate(ctx);
 				});
 		} else {
@@ -7498,8 +7552,11 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 				})
 				.catch(() => {
 					if (ctx.state._applyPatchPreviewKey !== key) return;
-					ctx.state._applyPatchPreviewBody = `${preview.changes.length} files ${preview.summary}`;
-					ctx.state._applyPatchPreviewDisplay = withBranch(ctx.state._applyPatchPreviewBody, theme, false, true);
+					// Keep any diff that is already on screen: the summary line alone shrinks the row.
+					if (!ctx.state._applyPatchPreviewDisplay) {
+						ctx.state._applyPatchPreviewBody = `${preview.changes.length} files ${preview.summary}`;
+						ctx.state._applyPatchPreviewDisplay = withBranch(ctx.state._applyPatchPreviewBody, theme, false, true);
+					}
 					safeInvalidate(ctx);
 				});
 		}
@@ -8589,9 +8646,13 @@ export default function (pi: ExtensionAPI) {
 			const key = `pending-write:${fp}:${hashText(baseline.content ?? "")}:${hashText(content)}:${diffWidth}:${ctx.expanded ? 1 : 0}`;
 			if (ctx.state._pendingWritePreviewKey !== key) {
 				ctx.state._pendingWritePreviewKey = key;
-				const action = theme.fg("muted", baseline.existed ? "pending overwrite" : "pending create");
-				ctx.state._pendingWritePreviewBody = `${action}\n${theme.fg("muted", "rendering diff…")}`;
-				ctx.state._pendingWritePreviewDisplay = indentBranchBlock(withBranch(ctx.state._pendingWritePreviewBody, theme, false, true));
+				// Only a row with nothing on screen yet gets the placeholder: a rebuild keeps the
+				// previous preview so the row cannot shrink (see beginDiffPreviewBuild).
+				if (!ctx.state._pendingWritePreviewDisplay) {
+					const action = theme.fg("muted", baseline.existed ? "pending overwrite" : "pending create");
+					ctx.state._pendingWritePreviewBody = `${action}\n${theme.fg("muted", "rendering diff…")}`;
+					ctx.state._pendingWritePreviewDisplay = indentBranchBlock(withBranch(ctx.state._pendingWritePreviewBody, theme, false, true));
+				}
 				renderPendingWritePreviewBody(ctx, key, theme, fp, baseline.content ?? "", content, baseline.existed);
 			}
 			const body = ctx.state._pendingWritePreviewDisplay as string | undefined;
@@ -8626,21 +8687,23 @@ export default function (pi: ExtensionAPI) {
 				const richSummary = diffSummaryWithMeta(d.diff.added, d.diff.removed, hunks, mode);
 				if (ctx.state._wdk !== key) {
 					ctx.state._wdk = key;
-					ctx.state._wdt = withFinalBranchBlock(`${richSummary}\n${theme.fg("muted", "rendering diff…")}`, theme);
+					const token = beginDiffPreviewBuild(ctx.state, "_wdToken");
 					const dc = resolveDiffColors(theme);
 					renderSplit(d.diff, d.language, previewLines, dc, diffWidth)
 						.then((rendered) => {
-							if (ctx.state._wdk !== key) return;
+							if (!isDiffPreviewBuildCurrent(ctx.state, "_wdToken", token)) return;
 							ctx.state._wdt = withFinalBranchBlock(`${richSummary}\n${rendered}`, theme);
 							safeInvalidate(ctx);
 						})
 						.catch(() => {
-							if (ctx.state._wdk !== key) return;
-							ctx.state._wdt = withBranch(richSummary, theme);
+							if (!isDiffPreviewBuildCurrent(ctx.state, "_wdToken", token)) return;
+							// Keep a diff that is already on screen: the stat line alone shrinks the row.
+							if (!ctx.state._wdt) ctx.state._wdt = withBranch(richSummary, theme);
 							safeInvalidate(ctx);
 						});
 				}
-				return makeResponsiveDiffText(ctx, ctx.lastComponent, ctx.state._wdt ?? withBranch(richSummary, theme));
+				const wdBody = (ctx.state._wdt as string | undefined) ?? withFinalBranchBlock(`${richSummary}\n${theme.fg("muted", "rendering diff…")}`, theme);
+				return makeResponsiveDiffText(ctx, ctx.lastComponent, wdBody);
 			}
 			if (d?._type === "noChange") return makeText(ctx.lastComponent, withBranch(theme.fg("muted", "✓ no changes"), theme));
 			if (d?._type === "new") {
@@ -8654,21 +8717,23 @@ export default function (pi: ExtensionAPI) {
 				const pk = `nf:${d.filePath}:${contentHash}:${diffWidth}:${ctx.expanded ? 1 : 0}`;
 				if (ctx.state._nfk !== pk) {
 					ctx.state._nfk = pk;
-					ctx.state._nft = withFinalBranchBlock(`${richSummary}\n${theme.fg("muted", "rendering diff…")}`, theme);
+					const token = beginDiffPreviewBuild(ctx.state, "_nfToken");
 					const dc = resolveDiffColors(theme);
 					renderUnified(syntheticDiff, lang(d.filePath), previewLines, dc, diffWidth)
 						.then((rendered) => {
-							if (ctx.state._nfk !== pk) return;
+							if (!isDiffPreviewBuildCurrent(ctx.state, "_nfToken", token)) return;
 							ctx.state._nft = withFinalBranchBlock(`${richSummary}\n${rendered}`, theme);
 							safeInvalidate(ctx);
 						})
 						.catch(() => {
-							if (ctx.state._nfk !== pk) return;
-							ctx.state._nft = withBranch(`${richSummary} ${theme.fg("muted", `(${lineTotal} lines)`)}`, theme);
+							if (!isDiffPreviewBuildCurrent(ctx.state, "_nfToken", token)) return;
+							// Keep a diff that is already on screen: the stat line alone shrinks the row.
+							if (!ctx.state._nft) ctx.state._nft = withBranch(`${richSummary} ${theme.fg("muted", `(${lineTotal} lines)`)}`, theme);
 							safeInvalidate(ctx);
 						});
 				}
-				return makeResponsiveDiffText(ctx, ctx.lastComponent, ctx.state._nft ?? withBranch(`${richSummary} ${theme.fg("muted", `(${lineTotal} lines)`)}`, theme));
+				const nfBody = (ctx.state._nft as string | undefined) ?? withFinalBranchBlock(`${richSummary}\n${theme.fg("muted", "rendering diff…")}`, theme);
+				return makeResponsiveDiffText(ctx, ctx.lastComponent, nfBody);
 			}
 			return makeText(ctx.lastComponent, withBranch(theme.fg("success", "Written"), theme));
 		},
@@ -8733,8 +8798,8 @@ export default function (pi: ExtensionAPI) {
 			const { diffs: fallbackDiffs, summary: editSummary } = getCachedEditOperationSummary(ctx, key, operations);
 			if (ctx.state._pk !== key) {
 				ctx.state._pk = key;
-				ctx.state._ptBody = theme.fg("muted", "(rendering…)");
-				ctx.state._ptDisplay = indentBranchBlock(withBranch(ctx.state._ptBody, theme, false, true));
+				// The previous preview stays on screen while this one is built: a one-line
+				// placeholder collapses the row and reflows the transcript (see beginDiffPreviewBuild).
 				const lg = lang(fp);
 				void computeProjectedEditDiff(fp, operations, cwd)
 					.then(async (projectedDiff) => {
@@ -8754,7 +8819,9 @@ export default function (pi: ExtensionAPI) {
 					});
 			}
 			const body = liveBranchDisplay(ctx.state, theme) ?? (ctx.state._ptDisplay as string | undefined);
-			return makeResponsiveDiffText(ctx, ctx.lastComponent, body ? `${hdr}\n${body}` : hdr);
+			if (body) return makeResponsiveDiffText(ctx, ctx.lastComponent, `${hdr}\n${body}`);
+			// Nothing rendered yet for this row: the placeholder is the only thing to show.
+			return makeResponsiveDiffText(ctx, ctx.lastComponent, `${hdr}\n${indentBranchBlock(withBranch(theme.fg("muted", "(rendering…)"), theme, false, true))}`);
 		},
 		renderResult(result, { expanded, isPartial }, theme, ctx) {
 			if (isPartial) {
@@ -8778,8 +8845,8 @@ export default function (pi: ExtensionAPI) {
 				const key = `completed-edit:${fp}:${operationsHash}:${diffWidth}:${ctx.expanded ? 1 : 0}`;
 				if (ctx.state._pk !== key) {
 					ctx.state._pk = key;
-					ctx.state._ptBody = theme.fg("muted", "(rendering diff…)");
-					ctx.state._ptDisplay = indentBranchBlock(withBranch(ctx.state._ptBody, theme, false, true));
+					// The previous preview stays on screen while this one is built: a one-line
+					// placeholder collapses the row and reflows the transcript (see beginDiffPreviewBuild).
 					const projectedDiff = (result as any).details?._treeDiff as ParsedDiff | undefined;
 					if (projectedDiff && Array.isArray(projectedDiff.lines)) {
 						renderProjectedEditPreviewBody(ctx, key, theme, lang(fp), projectedDiff);
