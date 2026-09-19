@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { AssistantMessageComponent, ToolExecutionComponent, UserMessageComponent } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text, visibleWidth } from "@earendil-works/pi-tui";
 import { initTheme, theme } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
@@ -244,10 +244,10 @@ assert.ok(nativeRenders > 0);
 		settledWrite.setExpanded(true);
 		assertKeepsBody("write result (expand)", writeExpandedSettled, plain(writeCluster.render(90)).split("\n"));
 
-		// 3. A settled edit result (`_pk`/`_ptDisplay`) rebuilt at a new width.
-		const editTarget = `/tmp/tree-retention-edit-${Date.now()}.txt`;
-		writeFileSync(editTarget, Array.from({ length: 40 }, (_, i) => `retention line ${i + 1}`).join("\n"));
-		const editArgs = { path: editTarget, edits: [{ oldText: "retention line 20", newText: "retention line 20 edited" }], activity: "implementing" };
+		// 3. A settled edit result (`_pk`/`_ptDisplay`) rebuilt at a new width. The fixture file is
+		//    read-only here: the tool never executes, so no temporary files are created.
+		const editTarget = "config/config.example.json";
+		const editArgs = { path: editTarget, edits: [{ oldText: '"diffSplitMinWidth": 132', newText: '"diffSplitMinWidth": 144' }], activity: "implementing" };
 		const settledEdit = new ToolExecutionComponent("edit", "retention-edit", editArgs, {}, tools.get("edit") as any, ui as any, process.cwd());
 		settledEdit.updateArgs(editArgs);
 		settledEdit.setArgsComplete();
