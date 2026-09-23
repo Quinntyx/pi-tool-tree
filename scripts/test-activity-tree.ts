@@ -176,6 +176,42 @@ assert.ok(nativeRenders > 0);
 		assert.ok(resized.includes(`• ${mode}`) && resized.includes("previewLayout"), `resize to ${width} must finish reflowing the ${mode} diff: ${JSON.stringify(resized)}`);
 	}
 
+	// A preview must use the width its row actually has. The diff width was clamped to a
+	// terminal-derived cap (210 columns), so on a wide pane the body was laid out at 210 no matter
+	// how much room the row had and dozens of columns went unused.
+	{
+		const wideArgs = { path: "config/config.example.json", edits: [{ oldText: '"diffSplitMinWidth": 132', newText: '"diffSplitMinWidth": 144' }], activity: "implementing" };
+		const wideEdit = new ToolExecutionComponent("edit", "wide-edit", wideArgs, {}, tools.get("edit") as any, ui as any, process.cwd());
+		wideEdit.updateArgs(wideArgs);
+		wideEdit.setArgsComplete();
+		wideEdit.markExecutionStarted();
+		wideEdit.updateResult({ content: [{ type: "text", text: "ok" }], isError: false, details: { _type: "editInfo", summary: "+1 -1", editLine: 22, hunks: 1, added: 1, removed: 1 } } as any, false);
+		const wideCluster = new Container();
+		wideCluster.addChild(wideEdit);
+		const wideWidth = 300;
+		// The grouped row renderer seeds the component width before the tool's first frame, so the
+		// build does not have to fall back to the terminal guess. The diff is measured through the row
+		// it produces (a split diff's rule is only half the body wide, so the run length alone says
+		// nothing about the width used).
+		let widestRule = 0;
+		for (let frame = 0; frame < 4; frame++) {
+			wideEdit.rendererState._diffComponentWidth = wideWidth - 5;
+			const wideRows = plain(wideCluster.render(wideWidth)).split("\n");
+			for (const line of wideRows) {
+				// A rule line spans the diff: one run in unified mode, two halves in split mode. The row's
+				// padding fills the rest of the width, so the rule is what shows how wide the body is.
+				const ruleWidth = (line.match(/─+/g) ?? []).reduce((sum, run) => sum + run.length, 0);
+				widestRule = Math.max(widestRule, ruleWidth);
+			}
+			await new Promise((resolve) => setTimeout(resolve, 30));
+		}
+		assert.ok(
+			widestRule >= wideWidth - 20,
+			`a mutation preview must use the width its row has, not a terminal cap (diff body ${widestRule} of ${wideWidth} columns)`,
+		);
+		assert.ok(widestRule <= wideWidth, `the preview must stay inside its row (${widestRule} of ${wideWidth} columns)`);
+	}
+
 	// Anti-flicker: a diff that is already on screen must survive a rebuild. The placeholder
 	// that stands in for a pending build is one or two lines tall, so replacing a rendered diff
 	// with it collapses the row by dozens of lines and reflows the transcript under the reader —

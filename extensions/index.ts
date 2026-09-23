@@ -5621,14 +5621,18 @@ function termW(): number {
 // column before it or their add/remove tint paints underneath the thumb.
 const FULLSCREEN_SCROLLBAR_GUTTER = 1;
 
-function branchDiffWidth(componentWidth?: number, chromeWidth = 2): number {
-	const width = typeof componentWidth === "number" && Number.isFinite(componentWidth)
-		? Math.floor(componentWidth)
-		: termW();
-	return Math.max(20, Math.min(width - chromeWidth - FULLSCREEN_SCROLLBAR_GUTTER, MAX_TERM_WIDTH));
+function branchDiffWidth(componentWidth?: number, chromeWidth = 0): number {
+	// A width that came from the component itself is authoritative: it is the width the row will
+	// actually be drawn at, so it is not clamped to the terminal-wide cap. Clamping it there
+	// silently wasted dozens of columns on a wide pane — the diff was laid out at MAX_TERM_WIDTH
+	// no matter how much room the row had. The cap stays on the environment-derived fallback,
+	// where the number is only a guess (termW() applies it itself).
+	const known = typeof componentWidth === "number" && Number.isFinite(componentWidth);
+	const width = known ? Math.floor(componentWidth) : termW();
+	return Math.max(20, width - chromeWidth - FULLSCREEN_SCROLLBAR_GUTTER);
 }
 
-function contextDiffWidth(ctx: any, chromeWidth = 2): number {
+function contextDiffWidth(ctx: any, chromeWidth = 0): number {
 	return branchDiffWidth(ctx.state?._diffComponentWidth, chromeWidth);
 }
 
@@ -6716,7 +6720,7 @@ function renderPendingWritePreviewBody(
 ): void {
 	const diff = getCachedParsedDiff(ctx, `pending-write-diff:${key}`, previousContent, nextContent);
 	const hunks = countDiffHunks(diff);
-	const diffWidth = contextDiffWidth(ctx, 3);
+	const diffWidth = contextDiffWidth(ctx);
 	const previewLines = ctx.expanded ? MAX_RENDER_LINES : diffCollapsedLimit();
 	const mode = existedBefore && stickyUseSplit(ctx.state, `pending-write:${key}`, diff, diffWidth, previewLines) ? "split" : "unified";
 	const summary = diffSummaryWithMeta(diff.added, diff.removed, hunks, mode);
@@ -6753,7 +6757,7 @@ function renderProjectedEditPreviewBody(
 	language: BundledLanguage | undefined,
 	diff: ParsedDiff,
 ): void {
-	const diffWidth = contextDiffWidth(ctx, 3);
+	const diffWidth = contextDiffWidth(ctx);
 	// File mutations are intentionally not reduced to a stat line in the activity
 	// tree. Keep every hunk (with structuredPatch's three context lines) up to the
 	// normal safety cap; Ctrl+O remains available for exceptionally large diffs.
@@ -6809,7 +6813,7 @@ function renderEditPreviewBody(
 	summary: string,
 ): void {
 	const dc = resolveDiffColors(theme);
-	const branchWidth = contextDiffWidth(ctx, 3);
+	const branchWidth = contextDiffWidth(ctx);
 	if (operations.length === 1) {
 		const [diff] = diffs;
 		// Synchronous, unhighlighted first: same rows and height as the highlighted pass below, so
@@ -8834,7 +8838,7 @@ export default function (pi: ExtensionAPI) {
 				const notice = indentBranchBlock(withBranch(theme.fg("warning", baseline.notice), theme, false, true));
 				return makeText(ctx.lastComponent, `${hdr}\n${notice}`);
 			}
-			const diffWidth = contextDiffWidth(ctx, 3);
+			const diffWidth = contextDiffWidth(ctx);
 			const key = `pending-write:${fp}:${hashText(baseline.content ?? "")}:${hashText(content)}:${diffWidth}:${ctx.expanded ? 1 : 0}`;
 			if (ctx.state._pendingWritePreviewKey !== key) {
 				ctx.state._pendingWritePreviewKey = key;
@@ -8986,7 +8990,7 @@ export default function (pi: ExtensionAPI) {
 			syncToolCallStatus(ctx);
 			const hdr = toolHeader("edit", summary, theme, ` ${toolStatusDot(ctx, theme)}`, liveLineCountTrailing(ctx, theme));
 			if (!(ctx.argsComplete && ctx.isPartial && operations.length > 0)) return makeText(ctx.lastComponent, hdr);
-			const diffWidth = contextDiffWidth(ctx, 3);
+			const diffWidth = contextDiffWidth(ctx);
 			const key = `edit:${fp}:${hashText(operations.map((edit) => `${edit.oldText}\u0000${edit.newText}`).join("\u0001"))}:${diffWidth}:${ctx.expanded ? 1 : 0}`;
 			const { diffs: fallbackDiffs, summary: editSummary } = getCachedEditOperationSummary(ctx, key, operations);
 			if (ctx.state._pk !== key) {
@@ -9037,7 +9041,7 @@ export default function (pi: ExtensionAPI) {
 			const operations = getEditOperations(ctx.args);
 			if (operations.length > 0) {
 				const fp = ctx.args?.path ?? ctx.args?.file_path ?? "";
-				const diffWidth = contextDiffWidth(ctx, 3);
+				const diffWidth = contextDiffWidth(ctx);
 				const operationsHash = hashText(operations.map((edit) => `${edit.oldText}\u0000${edit.newText}`).join("\u0001"));
 				const key = `completed-edit:${fp}:${operationsHash}:${diffWidth}:${ctx.expanded ? 1 : 0}`;
 				if (ctx.state._pk !== key) {
