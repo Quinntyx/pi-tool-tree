@@ -1319,6 +1319,16 @@ interface ActivityApi {
 	subscribe(listener: ActivityListener): () => void;
 	/** The transcript's own duration formatting (`<1s`, `12s`, `3m 05s`, `1h 02m`). */
 	formatDuration(ms: number): string;
+	/**
+	 * Paint `text` with the live activity label's shimmer: the same highlight band,
+	 * cosine falloff and thinking-level color the grouped transcript sweeps across a
+	 * running group's label. `theme` optionally adopts the caller's theme, so callers
+	 * that render outside this extension's transcript still track the active palette.
+	 * Time-phased: repaint on `shimmerIntervalMs` and the band advances on its own.
+	 */
+	shimmerText(text: string, theme?: unknown): string;
+	/** The repaint cadence the label sweep expects (see `shimmerText`). */
+	readonly shimmerIntervalMs: number;
 }
 
 interface ActivityCallState {
@@ -1765,6 +1775,14 @@ function publishActivityApi(): void {
 		getStats: activitySessionStats,
 		subscribe: activitySubscribe,
 		formatDuration: formatBashDuration,
+		// The label sweep as a public painter, so another surface that wants the same
+		// animation (the PTC subagent panel) does not have to re-implement a cheaper
+		// approximation of it — which is what read as a hard-edged band next to this one.
+		shimmerText: (text: string, shimmerTheme?: unknown): string => {
+			if (shimmerTheme) _toolBranchThemeHint = shimmerTheme as Theme | undefined;
+			return shimmerTextAnsi(text);
+		},
+		shimmerIntervalMs: SHIMMER_INTERVAL_MS,
 	};
 	// One object, two keys: plugins written against either name share the same
 	// state and subscriptions.

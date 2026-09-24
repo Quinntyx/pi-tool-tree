@@ -24,6 +24,7 @@ The object is published on `globalThis` under two keys, both pointing at the
 - [`getStats()`](#getstats)
 - [`subscribe(listener)`](#subscribelistener)
 - [`formatDuration(ms)`](#formatdurationms)
+- [`shimmerText(text, theme?)`](#shimmertexttext-theme)
 - [`wrapTool(tool)`](#wraptooltool)
 - [What the numbers mean](#what-the-numbers-mean)
 - [What drives the state](#what-drives-the-state)
@@ -155,6 +156,28 @@ api.subscribe((activity, change) => {
 
 The transcript's own duration formatting, so extension output can match it:
 `"<1s"`, `"12s"`, `"3m 05s"`, `"1h 02m"`.
+
+## `shimmerText(text, theme?)`
+
+Paints `text` with the live activity label's shimmer — the same highlight band,
+cosine falloff, period and thinking-level color the grouped transcript sweeps
+across a running group's label. Use it when a surface of yours wants the same
+animation instead of a cheaper approximation of it:
+
+```ts
+const api = (globalThis as any)[Symbol.for("pi-tool-tree:api")];
+const word = api?.shimmerText ? api.shimmerText(action, theme) : theme.fg("muted", action);
+```
+
+- Time-phased: repaint on `api.shimmerIntervalMs` (80ms) and the band advances
+  on its own; no timer of ours has to drive it.
+- `theme` is optional but recommended for callers that render outside this
+  extension's transcript: it adopts the caller's palette, so the sweep tracks
+  `/thinking` and `Shift+Tab` exactly like the tree's own labels.
+- Respect `activityShimmer` (`/cc-tools shimmer`) if your surface mirrors the
+  tree's behavior; the painter itself does not gate on it.
+
+Also on the object: `shimmerIntervalMs` — the repaint cadence the sweep expects.
 
 ## `wrapTool(tool)`
 
@@ -325,5 +348,7 @@ export interface ActivityApi {
 	getStats(): ActivitySessionStats;
 	subscribe(listener: ActivityListener): () => void;
 	formatDuration(ms: number): string;
+	shimmerText(text: string, theme?: unknown): string;
+	readonly shimmerIntervalMs: number;
 }
 ```

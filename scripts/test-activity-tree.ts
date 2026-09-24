@@ -1405,6 +1405,25 @@ console.log("OK: flush-left prose, blank-line block spacing, tool-only call coun
 		await fire("agent_end");
 		await fire("tool_execution_end", { toolCallId: "never-started", toolName: "bash", isError: true });
 		assert.equal(api.getStats().toolCalls, 7, "an unmatched end still counts as a settled call");
+
+		// The label sweep as a published painter: another surface that wants the same animation (the
+		// PTC subagent panel) sweeps with this code instead of a cheaper approximation of it, which
+		// read as a hard-edged band next to the tree's own sweep.
+		{
+			assert.ok(api.shimmerIntervalMs > 0 && api.shimmerIntervalMs < 1000, `the sweep cadence must be documented in ms: ${api.shimmerIntervalMs}`);
+			assert.equal(api.shimmerText("", apiCtx.ui.theme), "", "an empty word paints nothing");
+			now += 500;
+			const swept = api.shimmerText("testing", apiCtx.ui.theme);
+			assert.ok(/\x1b\[38;2;\d+;\d+;\d+m/.test(swept), `the sweep paints the word in truecolor: ${JSON.stringify(swept.slice(0, 40))}`);
+			const colors = new Set(swept.match(/\x1b\[38;2;\d+;\d+;\d+m/g) ?? []);
+			assert.ok(colors.size >= 3, `the published sweep must be a gradient like the label's (${colors.size} colors)`);
+			now += Math.round(api.shimmerIntervalMs * 1.5);
+			assert.notEqual(
+				api.shimmerText("testing", apiCtx.ui.theme),
+				swept,
+				"the published painter must animate over time, like the label sweep",
+			);
+		}
 	} finally {
 		Date.now = realNow;
 	}
