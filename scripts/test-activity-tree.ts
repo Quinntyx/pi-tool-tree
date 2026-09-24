@@ -1430,6 +1430,62 @@ console.log("OK: flush-left prose, blank-line block spacing, tool-only call coun
 	console.log("OK  activity API: live phase, labels, running calls, session stats, subscriptions, seeding");
 }
 
+// A split diff's rail chrome is baked into the body AFTER the layout width is chosen, so the
+// layout width must reserve it. When 2026-09-24's width change dropped that reservation, every
+// diff row landed one column wider than the ToolText showing it and ToolText re-wrapped each
+// row — shredding the two-column alignment into interleaved text/hatch fragments.
+{
+	const writeDefinition = tools.get("write");
+	const oldLines = Array.from({ length: 40 }, (_, i) => `// removed line ${i + 1} with enough width to need wrapping at narrow widths`);
+	const newLines = Array.from({ length: 4 }, (_, i) => `// added line ${i + 1}`);
+	const lines = [
+		...oldLines.slice(0, 6).map((content, i) => ({ type: "del", oldNum: i + 1, newNum: null, content })),
+		...newLines.map((content, i) => ({ type: "add", oldNum: null, newNum: i + 1, content })),
+	];
+	const wrapDiff = { lines, added: 4, removed: 6, chars: 1000 };
+	const wrapWrite = new ToolExecutionComponent("write", "wrap-regression", { path: "src/example.ts" }, {}, writeDefinition as any, ui as any, process.cwd());
+	wrapWrite.setArgsComplete();
+	wrapWrite.markExecutionStarted();
+	wrapWrite.updateResult({ content: [{ type: "text", text: "ok" }], isError: false, details: { _type: "diff", diff: wrapDiff, summary: "", language: "typescript" } } as any, false);
+	const wrapCluster = new Container();
+	wrapCluster.addChild(wrapWrite);
+	// Settle: the width-keyed body rebuilds after the first observed width. The grouped row
+	// renderer seeds the component width the way toolActivityLines does: row - tree rail(3)
+	// - shell padding(2). Settle on the rebuilt body (a stable build key), not the first
+	// frame's terminal-guess fallback.
+	let rows: string[] = [];
+	let lastKey = "";
+	for (let attempt = 0; attempt < 50; attempt++) {
+		wrapWrite.rendererState._diffComponentWidth = 155 - 3 - 2;
+		rows = plain(wrapCluster.render(155)).split("\n");
+		const key = String(wrapWrite.rendererState._wdk ?? "");
+		if (key && key === lastKey) break;
+		lastKey = key;
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	assert.ok(lastKey.startsWith("wd:"), "the body must rebuild at a component-derived width");
+	const dataRows = rows.filter((line) => /╱|removed line|added line/.test(line));
+	// The invariant: the ToolText shows one physical line per body line. A row that re-wraps
+	// pushes its overflow onto a fragment line with no gutter, and every row after it shifts.
+	let toolText: any;
+	const walkForToolText = (c: any): void => {
+		if (!c) return;
+		if (c.constructor?.name === "ToolText" || typeof c.toolCachedLines !== "undefined") toolText = c;
+		for (const child of c.children ?? []) walkForToolText(child);
+		if (c.child) walkForToolText(c.child);
+	};
+	walkForToolText(wrapWrite);
+	assert.ok(toolText, "the write row must render through ToolText");
+	assert.ok(
+		toolText.toolCachedLines.length === toolText.value.split("\n").length,
+		`a split diff body must never re-wrap inside its row (${toolText.toolCachedLines.length} rendered lines vs ${toolText.value.split("\n").length} body lines)`,
+	);
+	// And the two columns must stay paired: an add row's text rides beside its del partner.
+	const pairRow = rows.filter((line) => line.includes("added line"))[0] ?? "";
+	assert.ok(/removed line/.test(pairRow) && /added line/.test(pairRow), `paired del/add text must share a row: ${JSON.stringify(pairRow)}`);
+	console.log("OK  diff width: rail chrome reserved, split rows never re-wrapped");
+}
+
 process.env.HOME = realHome;
 const { execFileSync } = await import("node:child_process");
 execFileSync("trash", [tmpHome]);

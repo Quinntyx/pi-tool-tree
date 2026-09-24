@@ -5,6 +5,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Split diff rows no longer shred when the rail chrome is baked in** — the 1.0.81 width change removed the branch-rail reservation along with the terminal cap, but `withBranch`/`withFinalBranchBlock` still prepend a 2-column `├/│` rail (3 with the extra indent at the pending-write/edit sites) to every body line AFTER the layout width is chosen. Every diff row therefore landed 1–2 columns wider than the ToolText showing it, and ToolText re-wrapped each row — splitting every diff line into interleaved text/hatch fragments that destroyed the two-column alignment (hatch running through the deleted column, add text pushed onto gutter-less fragment lines). The layout width now reserves the rail chrome again (2 default, 3 at the sites that add the extra indent) while keeping the cap removal, and a regression test asserts a split body renders one physical line per body line, never re-wrapped.
+
 ### Added
 
 - **Streaming tool arguments** — while the model is still writing a bash call, the partial command grows a block token by token (with a typing cursor) instead of waiting silently for the call to start; while the call runs, the whole command stays visible; once it settles the row collapses back to its one-line headline (errors keep the 8-line preview, expansions show everything). Streaming rows keep the pending light instead of a settled `✓`. Single-line commands still stream through the header headline; rebuilt history rows never fake a stream.
