@@ -3,6 +3,16 @@
 > [!IMPORTANT]
 > **1.0.69 — package rename (permanent).** Canonical npm name is now [`pi-claude-code-ui`](https://www.npmjs.com/package/pi-claude-code-ui). `pi-claude-style-tools` is legacy and will not receive further releases. Install with `pi install npm:pi-claude-code-ui` or `npm i pi-claude-code-ui`.
 
+## Unreleased
+
+### Added
+
+- **Streaming tool arguments** — while the model is still writing a bash call, the partial command grows a block token by token (with a typing cursor) instead of waiting silently for the call to start; while the call runs, the whole command stays visible; once it settles the row collapses back to its one-line headline (errors keep the 8-line preview, expansions show everything). Streaming rows keep the pending light instead of a settled `✓`. Single-line commands still stream through the header headline; rebuilt history rows never fake a stream.
+
+### Changed
+
+- **Activity labels clamp on a word boundary** — the group label cap no longer cuts mid-word ("checking ptc streaming u" → "checking ptc"), and the `activity` param description now states the two-word limit much more firmly.
+
 ## 1.0.80 — 2026-08-24
 
 ### Fixed

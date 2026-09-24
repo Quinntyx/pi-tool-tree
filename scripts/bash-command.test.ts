@@ -104,3 +104,25 @@ test("normalizes line endings and unsafe control characters without changing ind
 	assert.deepEqual(presentation.sourceLines, ["   printf 'one'", "  printf 'two'"]);
 	assert.equal(presentation.headline, "printf 'one' · 2 lines");
 });
+
+test("treats mid-stream command cuts as ordinary partial input", () => {
+	// A stream cut inside a quoted argument: the partial line headlines verbatim.
+	const partial = buildBashCommandPresentation('rg -n "partial match');
+	assert.equal(partial.headline, 'rg -n "partial match');
+	assert.equal(partial.sourceLineCount, 1);
+	assert.deepEqual(partial.sourceLines, ['rg -n "partial match']);
+
+	// A cut escape sequence or dangling backslash stays verbatim in the block.
+	const escapeCut = buildBashCommandPresentation("printf '%s\\\\' one two");
+	assert.equal(escapeCut.sourceLineCount, 1);
+
+	// An empty (not-yet-started) stream falls back to a placeholder headline.
+	assert.equal(buildBashCommandPresentation("").headline, "command");
+});
+
+test("headlines a partially streamed script by its partial operative line", () => {
+	// The `cd` arrived fully but the first operative line is only partially
+	// streamed: the headline still comes from the operative line.
+	const partial = buildBashCommandPresentation("cd /workspace\nbun test scr");
+	assert.equal(partial.headline, "bun test scr · 2 lines");
+});

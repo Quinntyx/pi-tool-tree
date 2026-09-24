@@ -583,9 +583,23 @@ function isLiveThinkingMessage(comp: any, message: any): boolean {
 
 type ToolStatus = "pending" | "success" | "error";
 
+/** True while the model is still streaming a call's arguments: pi created the
+ *  component from the partial message, but the argument stream has not ended and
+ *  no execution has started. Only live in a running agent — history rows rebuilt
+ *  on resume stay isPartial=true forever and must never render a streaming view. */
+function isArgsStreaming(tool: any): boolean {
+	return tool?.isPartial === true
+		&& tool?.executionStarted === false
+		&& tool?.argsComplete === false
+		&& agentWorking();
+}
+
 function getToolStatusForGroup(tool: any): ToolStatus {
 	if (tool?.result?.isError) return "error";
 	if (tool?.result && tool?.isPartial !== true) return "success";
+	// Arguments still streaming: the call has not run yet, so keep the pending
+	// light instead of painting a settled ✓ on an in-flight row.
+	if (isArgsStreaming(tool)) return "pending";
 	// Only in-flight tools that actually started this agent run count as pending.
 	// History rows reconstructed without a matching toolResult stay isPartial=true
 	// forever; treating them as pending made interrupted tools blink again on resume.
@@ -930,9 +944,15 @@ function toolActivityLines(tool: any, width: number): string[] {
 	// Edits and writes are the model's proposed file changes, not incidental output:
 	// keep their preview below the call after settlement. The group's continuation
 	// rail is then drawn beside every preview row until the next item in the cluster.
-	const showDetails = keepsDisplay
+	// Calls with a call renderer stream their parameters live: while the model is still
+// writing the arguments, the full renderCall output shows under the branch (bash grows
+// its command block token by token) instead of the compact one-liner. Renderer-less
+// tools would fall back to a raw partial-JSON dump, so they stay compact while streaming.
+const hasCallRenderer = typeof tool?.toolDefinition?.renderCall === "function";
+const showDetails = keepsDisplay
 		|| tool.expanded === true
-		|| (tool.isPartial === true && tool.executionStarted === true);
+		|| (tool.isPartial === true && tool.executionStarted === true)
+		|| (hasCallRenderer && isArgsStreaming(tool));
 	// Rendering the actual tool component preserves native partial-result animations.
 	// Never memoize an active component: its animation can change without new text.
 	let lines = showDetails ? stripToolChrome(tool.render(childWidth), keepsDisplay) : [getCompactToolLine(tool, childWidth)];
@@ -1025,9 +1045,19 @@ function toolActivityParamEnabled(): boolean {
 	return readSettings().toolActivityParam !== false;
 }
 
+/** Hard cap for a phase label. Long enough for two words, short enough that a
+ *  rambling label cannot eat the group header. */
+const ACTIVITY_LABEL_MAX = 24;
+
 function normalizeActivityLabel(raw: unknown): string {
 	if (typeof raw !== "string") return "";
-	return raw.trim().toLowerCase().replace(/\s+/g, " ").slice(0, 24);
+	const label = raw.trim().toLowerCase().replace(/\s+/g, " ");
+	if (label.length <= ACTIVITY_LABEL_MAX) return label;
+	// Truncate on a word boundary: a mid-word cut ("checking ptc streaming u")
+	// reads broken, dropping the last words reads intentional.
+	const cut = label.slice(0, ACTIVITY_LABEL_MAX);
+	const lastSpace = cut.lastIndexOf(" ");
+	return (lastSpace > 0 ? cut.slice(0, lastSpace) : cut).replace(/[\s.,;:!-]+$/, "");
 }
 
 function activityLabelOf(tool: any): string {
@@ -1112,9 +1142,11 @@ function withActivityParam(parameters: any): any | undefined {
 			...parameters.properties,
 			[ACTIVITY_PARAM]: Type.String({
 				description:
-					"Always include one or two lowercase words naming the activity this call belongs to " +
-					"(e.g. exploring, implementing, testing). Reuse the previous call's word when continuing " +
-					"the same activity.",
+					"REQUIRED tag for this call: at most TWO lowercase words naming the current phase. " +
+					"NEVER a phrase, sentence, or description — anything over two words is cut off. " +
+					"Good: 'exploring', 'implementing', 'fixing-types'. " +
+					"Bad: 'checking the streaming usage' (five words). " +
+					"Reuse the previous call's label when continuing the same activity.",
 				default: DEFAULT_ACTIVITY_LABEL,
 			}),
 		},
@@ -4652,18 +4684,30 @@ function bashCommandPreviewLimit(): number {
 
 function renderBashCommandBlock(
 	command: string,
-	expanded: boolean,
+	options: { expanded?: boolean; full?: boolean; streaming?: boolean },
 	theme: Theme,
 ): string {
 	const presentation = buildBashCommandPresentation(command);
+	const expanded = options.expanded === true;
+	const full = options.full === true && !expanded;
+	const streaming = options.streaming === true;
 	const limit = bashCommandPreviewLimit();
-	if (!expanded && (limit === 0 || presentation.sourceLineCount < 2)) return "";
+	// A single-line command streams through the header's own headline — a one-line
+	// block would only repeat it. `bashCommandPreviewLines: 0` disables command
+	// blocks everywhere, streaming included.
+	if (limit === 0 || presentation.sourceLineCount < 2) return "";
 	const sourceLimit = expandedPreviewLimit();
-	const lines = expanded ? presentation.sourceLines.slice(0, sourceLimit) : buildBashPreview(presentation.sourceLines, limit);
+	// Running/streaming/expanded show the whole command (the "visualizer" phase);
+	// the 8-line preview stays for collapsed error rows.
+	const lines = expanded || full || streaming
+		? presentation.sourceLines.slice(0, sourceLimit)
+		: buildBashPreview(presentation.sourceLines, limit);
 	if (lines.length === 0) return "";
-	if (expanded && presentation.sourceLines.length > sourceLimit) {
+	if ((expanded || full) && presentation.sourceLines.length > sourceLimit) {
 		lines.push(`... ${presentation.sourceLines.length - sourceLimit} more command lines`);
 	}
+	// Streaming input: a cursor rides the last line so the row visibly "types".
+	if (streaming) lines[lines.length - 1] += theme.fg("muted", " ▌");
 	const body = lines.map((line) => theme.fg("accent", line || " ")).join("\n");
 	return expanded ? withBranch(body, theme, false, true) : withClippedBranch(body, theme, true);
 }
@@ -8621,9 +8665,25 @@ export default function (pi: ExtensionAPI) {
 			const summary = stableCallSummary(ctx, "_bashHeadline", () => presentation.headline);
 			const rtkBadge = rewrite ? theme.fg("muted", " (RTK)") : "";
 			const status = ctx?.state?._toolStatus;
-			const showCommand = ctx.argsComplete === true && (status === "pending" || status === "error" || ctx.expanded === true);
-			const commandBlock = showCommand ? renderBashCommandBlock(command, ctx.expanded === true, theme) : "";
-			const headerSummary = ctx.expanded === true && commandBlock ? describeBashSource(presentation) : summary;
+			// Three phases, gated on a live agent so rebuilt history rows (resume,
+			// compaction) never fake a stream: while the model streams the arguments,
+			// the partial command grows a block token by token; while the call runs,
+			// the whole command stays visible; once it settles the row collapses back
+			// to its one-line headline (errors keep the 8-line preview, expansions
+			// show everything).
+			const agentLive = currentAgentWorkStartMs !== undefined;
+			const streaming = !ctx.argsComplete && ctx.executionStarted !== true && command.length > 0 && agentLive;
+			const ready = ctx.argsComplete === true && ctx.executionStarted !== true && agentLive;
+			const running = status === "pending";
+			const showCommand = streaming || ready || running || status === "error" || ctx.expanded === true;
+			const commandBlock = showCommand
+				? renderBashCommandBlock(command, {
+					expanded: ctx.expanded === true,
+					full: (running || ready) && ctx.expanded !== true,
+					streaming,
+				}, theme)
+				: "";
+			const headerSummary = (ctx.expanded === true || (streaming && commandBlock)) ? describeBashSource(presentation) : summary;
 			const header = toolHeader(
 				"bash",
 				`${headerSummary}${rtkBadge}`,
