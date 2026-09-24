@@ -452,6 +452,12 @@ function terminalColumnCeiling(): number {
 	return Number.isFinite(cols) && (cols as number) > 0 ? (cols as number) : 0;
 }
 
+/** The viewport height, for deciding whether an animated row is actually visible. */
+function terminalRows(): number {
+	const rows = typeof process !== "undefined" ? process.stdout?.rows : undefined;
+	return Number.isFinite(rows) && (rows as number) > 0 ? (rows as number) : 40;
+}
+
 /**
  * Memo for clampLineWidth. A grouped transcript re-emits every line on every repaint, and
  * measuring grapheme clusters costs ~30µs per line — so the same thousands of lines were
@@ -2035,14 +2041,20 @@ function renderActivityTranscript(parent: any, width: number): string[] | undefi
 		// A reading of 0 still prints (`<1s`): a call that just started is a measurement,
 		// while a group with no timing data at all prints none.
 		if (timed > 0 || thought > 0) parts.push(formatBashDuration(elapsedMs));
-		// While the chunk is live its label shimmers; once it closes the label returns to the
-		// ambient color. The status light stays what it always was — a per-call indicator
-		// that stops blinking the moment every individual call has settled. Counts are
-		// static metadata either way.
-		const shimmering = live && !!label && activityShimmerEnabled();
+		// While the chunk is live its label shimmers; once it closes the label returns to
+		// the ambient color. A live group whose content is taller than the viewport puts
+		// its header above the fold: pi's main-screen renderer diffs frames and falls back
+		// to a full redraw (clearing the scrollback) when the first changed row is above
+		// the viewport top. Repainting the sweep every 80ms with a 500-line reasoning
+		// trace below the label flickered the whole pane. So: sweep and run the fast loop
+		// only while the group fits the viewport; past that the header holds plain and
+		// the loop is not armed.
+		const groupHeight = items.reduce((sum, item) => sum + item.lines.length, 0);
+		const onScreen = groupHeight <= terminalRows() + 2;
+		const shimmering = live && onScreen && !!label && activityShimmerEnabled();
 		// The transcript owns this row's light and label, so it also owns the repaint:
 		// ~80ms while the sweep runs, 500ms for a bare live duration.
-		if (live && count > 0) {
+		if (live && onScreen && count > 0) {
 			armedLive = true;
 			const running: any[] = [];
 			for (let i = 0; i < tools.length; i++) {
