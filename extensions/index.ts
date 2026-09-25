@@ -3341,7 +3341,12 @@ function frameToolLikeLines(lines: string[], width: number): string[] {
 }
 
 function formatSubagentNotification(lines: string[], width: number): string[] {
-	const core = trimRenderedBlankLines(lines).map(normalizeLeadingCheckGlyph);
+	// Pi's default custom-message rendering prefixes the content with a
+	// "[subagent-notification]" label line; drop it so only the workflow rows
+	// are framed.
+	const core = trimRenderedBlankLines(lines)
+		.map(normalizeLeadingCheckGlyph)
+		.filter((line) => !/^\[subagent-notification\]\s*$/i.test(stripAnsi(line).trim()));
 	if (core.length === 0) return lines;
 	const formatted = splitSubagentNotificationGroups(core).flatMap((group, index) => {
 		const groupLines = formatSubagentNotificationGroup(group);
