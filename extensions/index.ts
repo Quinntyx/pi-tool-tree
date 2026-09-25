@@ -142,22 +142,43 @@ interface SettingsFile {
 let _settingsCache: { value: SettingsFile; timestamp: number } | null = null;
 const SETTINGS_CACHE_TTL_MS = 5_000;
 
+/** The pi global settings file for this run. Pi resolves its settings directory
+ *  through $PI_CODING_AGENT_DIR (profile launchers like `ppi` set it to the active
+ *  profile), so extension settings live beside pi's own settings.json there.
+ *  Without the env var, fall back to the legacy home location. */
+function activeGlobalSettingsPath(): string {
+	const agentDir = process.env.PI_CODING_AGENT_DIR?.trim();
+	if (agentDir) return `${agentDir.replace(/\/+$/, "")}/settings.json`;
+	return `${process.env.HOME ?? ""}/.pi/settings.json`;
+}
+
+function readSettingsFile(path: string): Partial<SettingsFile> | undefined {
+	try {
+		if (!path || !existsSync(path)) return undefined;
+		const raw = JSON.parse(readFileSync(path, "utf8"));
+		return raw && typeof raw === "object" ? (raw as Partial<SettingsFile>) : undefined;
+	} catch {
+		return undefined; // ignore invalid settings files
+	}
+}
+
 function readSettings(): SettingsFile {
 	const now = Date.now();
 	if (_settingsCache && now - _settingsCache.timestamp < SETTINGS_CACHE_TTL_MS) {
 		return _settingsCache.value;
 	}
-	const cwdPath = `${process.cwd()}/.pi/settings.json`;
-	const homePath = `${process.env.HOME ?? ""}/.pi/settings.json`;
+	const projectPath = `${process.cwd()}/.pi/settings.json`;
+	const legacyHomePath = `${process.env.HOME ?? ""}/.pi/settings.json`;
+	const globalPath = activeGlobalSettingsPath();
+	// Precedence (later wins): project < legacy home (kept so pre-profile installs
+	// keep working) < the active profile's global settings — matching pi itself,
+	// which reads $PI_CODING_AGENT_DIR/settings.json for this run.
+	const paths = globalPath === legacyHomePath
+		? [projectPath, legacyHomePath]
+		: [projectPath, legacyHomePath, globalPath];
 	const merged: SettingsFile = {};
-	for (const path of [cwdPath, homePath]) {
-		try {
-			if (!path || !existsSync(path)) continue;
-			const raw = JSON.parse(readFileSync(path, "utf8"));
-			if (raw && typeof raw === "object") Object.assign(merged, raw as SettingsFile);
-		} catch {
-			// ignore invalid settings files
-		}
+	for (const path of paths) {
+		Object.assign(merged, readSettingsFile(path) ?? {});
 	}
 	_settingsCache = { value: merged, timestamp: now };
 	return merged;
@@ -165,10 +186,8 @@ function readSettings(): SettingsFile {
 
 function writeSettingsKey(key: string, value: unknown): void {
 	_settingsCache = null; // invalidate cache on write
-	const home = process.env.HOME ?? "";
-	if (!home) return;
-	const dir = `${home}/.pi`;
-	const path = `${dir}/settings.json`;
+	const path = activeGlobalSettingsPath();
+	const dir = path.slice(0, path.lastIndexOf("/")) || ".";
 	let settings: Record<string, unknown> = {};
 	try {
 		if (existsSync(path)) settings = JSON.parse(readFileSync(path, "utf8")) ?? {};

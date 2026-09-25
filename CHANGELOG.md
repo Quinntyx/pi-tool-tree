@@ -5,6 +5,10 @@
 
 ## Unreleased
 
+### Changed
+
+- **Extension settings follow `$PI_CODING_AGENT_DIR`** — pi resolves its settings directory through that env var (profile launchers like `ppi` set it to the active profile), and the extension now reads its settings from `$PI_CODING_AGENT_DIR/settings.json` the same way, with the project `.pi/settings.json` and the legacy `~/.pi/settings.json` as lower-precedence fallbacks. `/cc-tools` toggles persist into the active global file instead of always writing `~/.pi/settings.json`. Existing `~/.pi/settings.json` values keep working (fallback), and `groupToolCalls: true` has been propagated into each profile that loads this extension.
+
 ### Fixed
 
 - **Split diff rows no longer shred when the rail chrome is baked in** — the 1.0.81 width change removed the branch-rail reservation along with the terminal cap, but `withBranch`/`withFinalBranchBlock` still prepend a 2-column `├/│` rail (3 with the extra indent at the pending-write/edit sites) to every body line AFTER the layout width is chosen. Every diff row therefore landed 1–2 columns wider than the ToolText showing it, and ToolText re-wrapped each row — splitting every diff line into interleaved text/hatch fragments that destroyed the two-column alignment (hatch running through the deleted column, add text pushed onto gutter-less fragment lines). The layout width now reserves the rail chrome again (2 default, 3 at the sites that add the extra indent) while keeping the cap removal, and a regression test asserts a split body renders one physical line per body line, never re-wrapped.

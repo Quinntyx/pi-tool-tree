@@ -193,8 +193,12 @@ async function loadToolDefinitions(cwd: string, benchMode: Mode): Promise<Map<st
 
 	const pi = new FakePi();
 	if (benchMode === "full") {
-		const spinner = await import("../extensions/spinner.ts");
-		spinner.default(pi as any);
+		try {
+			const spinner = await import("../extensions/spinner.ts");
+			spinner.default(pi as any);
+		} catch {
+			// spinner.ts was removed from this fork; skip it.
+		}
 	}
 	const extension = await import("../extensions/index.ts");
 	extension.default(pi as any);

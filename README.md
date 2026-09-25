@@ -46,7 +46,7 @@ Claude Code inspired tool rendering for Pi — Shiki-powered diffs, status dots,
 
 ## Configuration
 
-Set in `.pi/settings.json` or `~/.pi/settings.json`:
+Settings are read from the project (`.pi/settings.json` in the working directory) and from pi's global settings for the current run: `$PI_CODING_AGENT_DIR/settings.json` when set (profile launchers like `ppi` point it at the active profile), falling back to the legacy `~/.pi/settings.json` at lower precedence. `/cc-tools` toggles persist into the active global file:
 
 ```json
 {

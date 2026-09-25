@@ -14,7 +14,8 @@ const pi = {
 	registerCommand(name: string, command: any) { commands.set(name, command); }, registerShortcut() {},
 	on(name: string, handler: any) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
 };
-// Isolate settings: the activity param reads `toolActivityParam` from ~/.pi/settings.json.
+// Isolate settings: the extension reads its settings from $PI_CODING_AGENT_DIR/settings.json
+// when set, else the legacy ~/.pi/settings.json (this harness leaves the env unset).
 const realHome = process.env.HOME;
 const tmpHome = `${realHome}/.pi-activity-test-home-${Date.now()}`;
 process.env.HOME = tmpHome;
@@ -1484,6 +1485,46 @@ console.log("OK: flush-left prose, blank-line block spacing, tool-only call coun
 	const pairRow = rows.filter((line) => line.includes("added line"))[0] ?? "";
 	assert.ok(/removed line/.test(pairRow) && /added line/.test(pairRow), `paired del/add text must share a row: ${JSON.stringify(pairRow)}`);
 	console.log("OK  diff width: rail chrome reserved, split rows never re-wrapped");
+}
+
+// ---------------------------------------------------------------------------
+// Settings paths: extension settings follow $PI_CODING_AGENT_DIR/settings.json
+// (the active ppi profile) with the legacy ~/.pi/settings.json as a
+// lower-precedence fallback, and /cc-tools toggles persist into the active one.
+// ---------------------------------------------------------------------------
+{
+	const fsmod = await import("node:fs");
+	const agentDir = `${tmpHome}/agent-dir`;
+	fsmod.mkdirSync(agentDir, { recursive: true });
+	fsmod.mkdirSync(`${tmpHome}/.pi`, { recursive: true });
+	const legacyPath = `${tmpHome}/.pi/settings.json`;
+	const agentSettingsPath = `${agentDir}/settings.json`;
+	// Legacy says grouped; the active profile says ungrouped — the profile wins.
+	fsmod.writeFileSync(legacyPath, JSON.stringify({ groupToolCalls: true }));
+	fsmod.writeFileSync(agentSettingsPath, JSON.stringify({ groupToolCalls: false }));
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+
+	const groupedRender = () => {
+		const c = new Container();
+		c.addChild(tool("settings-a"));
+		c.addChild(tool("settings-b"));
+		return plain(c.render(100));
+	};
+	const settingsCtx = { hasUI: true, ui: { theme, notify() {}, getToolsExpanded: () => false, setToolsExpanded() {} } };
+	const ccToolsCmd = commands.get("cc-tools");
+	assert.ok(ccToolsCmd, "cc-tools command must be registered");
+	// Toggling also busts the settings cache deterministically before the read asserts.
+	await ccToolsCmd.handler("group off", settingsCtx);
+	assert.ok(!/calls/.test(groupedRender()), "the active profile's groupToolCalls=false must win over the legacy home file");
+	assert.equal(JSON.parse(fsmod.readFileSync(agentSettingsPath, "utf8")).groupToolCalls, false, "toggles must persist into $PI_CODING_AGENT_DIR/settings.json");
+	assert.equal(JSON.parse(fsmod.readFileSync(legacyPath, "utf8")).groupToolCalls, true, "toggles must not touch the legacy home file");
+
+	await ccToolsCmd.handler("group on", settingsCtx);
+	assert.equal(JSON.parse(fsmod.readFileSync(agentSettingsPath, "utf8")).groupToolCalls, true, "toggling back on persists to the profile file");
+	assert.ok(/calls/.test(groupedRender()), "grouping must re-enable after the toggle");
+
+	delete process.env.PI_CODING_AGENT_DIR;
+	console.log("OK  settings paths: $PI_CODING_AGENT_DIR wins over legacy home, toggles persist there");
 }
 
 process.env.HOME = realHome;
