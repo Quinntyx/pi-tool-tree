@@ -1,23 +1,23 @@
-# pi-claude-code-ui
+# pi-tool-tree
 
 > [!NOTE]
 > **Upstream:** the canonical, community-facing home of this project is [github.com/Quinntyx/pi-tool-tree](https://github.com/Quinntyx/pi-tool-tree). This git.quinntyx.dev copy is the author's development fork — day-to-day churn lands here and is PR'd to GitHub on release. Install instructions below point at GitHub.
 
-This fork leaves user-message styling, the prompt editor, and footer/status UI to
-Pi or other extensions such as `pi-opencode-prompt`. The upstream user-message
-patch and spinner/working-message extension have been removed. After updating,
-restart Pi fully: `/reload` cannot undo previously installed prototype patches.
+> [!WARNING]
+> **Under construction.** This README is being rewritten for the 2.x line — treat the sections below as historical reference until then.
 
 > [!IMPORTANT]
-> **Package renamed in 1.0.69.** This project is now published as [`pi-claude-code-ui`](https://www.npmjs.com/package/pi-claude-code-ui) (was `pi-claude-style-tools`).
->
-> Install / migrate:
-> ```bash
-> pi install npm:pi-claude-code-ui
-> # or
-> npm i pi-claude-code-ui
-> ```
-> See [CHANGELOG 1.0.69](./CHANGELOG.md#1069--2026-07-17) for the full release notes (status dots, bare branch connectors, and more).
+> **Experimental plugin.** Expect rendering bugs and breaking changes between versions.
+
+> [!NOTE]
+> **Attribution.** This project is a fork of the Claude Code-style tool rendering
+> work in [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff)
+> (published as [`pi-claude-code-ui`](https://www.npmjs.com/package/pi-claude-code-ui),
+> formerly `pi-claude-style-tools`). Without that groundwork none of this exists.
+> The canonical copy of this fork lives at
+> [github.com/Quinntyx/pi-tool-tree](https://github.com/Quinntyx/pi-tool-tree);
+> [git.quinntyx.dev/quinntyx/pi-tool-tree](https://git.quinntyx.dev/quinntyx/pi-tool-tree)
+> is the author's development fork where day-to-day work happens first.
 
 Claude Code inspired tool rendering for Pi — Shiki-powered diffs, status dots, branch connectors, file icons, and configurable output modes.
 
