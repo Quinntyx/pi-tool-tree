@@ -935,7 +935,9 @@ function assistantActivityRows(component: any, width: number): ActivityTreeRow[]
 
 function toolKeepsDisplayInActivityTree(tool: any): boolean {
 	const name = getToolName(tool);
-	return name === "edit" || name === "write";
+	// PTC exec_cell results are self-capped to a bounded preview (~12k chars) by the
+	// extension, so they render like edit/write previews instead of collapsing.
+	return name === "edit" || name === "write" || name === "exec_cell";
 }
 
 // The outer tree uses ` glyph ` for both first and continuation rows. Keeping
@@ -3348,7 +3350,15 @@ function formatSubagentNotification(lines: string[], width: number): string[] {
 		.map(normalizeLeadingCheckGlyph)
 		.filter((line) => !/^\[subagent-notification\]\s*$/i.test(stripAnsi(line).trim()));
 	if (core.length === 0) return lines;
-	const formatted = splitSubagentNotificationGroups(core).flatMap((group, index) => {
+	// The default CustomMessageComponent wraps content in a Box painted with
+	// theme.bg("customMessageBg") — a solid slab that clashes with transparent/
+	// outlined tool rows. In non-default background modes, strip the box's
+	// background paint (the notification's own styling is foreground-only, so a
+	// full background strip is safe) and drop the padding whitespace it leaves.
+	const cleaned = toolBackgroundMode === "default"
+		? core
+		: core.map((line) => stripBackgroundAnsi(line).trimEnd());
+	const formatted = splitSubagentNotificationGroups(cleaned).flatMap((group, index) => {
 		const groupLines = formatSubagentNotificationGroup(group);
 		return index === 0 ? groupLines : ["", ...groupLines];
 	});

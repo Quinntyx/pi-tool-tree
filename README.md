@@ -1,5 +1,8 @@
 # pi-claude-code-ui
 
+> [!NOTE]
+> **Upstream:** the canonical, community-facing home of this project is [github.com/Quinntyx/pi-tool-tree](https://github.com/Quinntyx/pi-tool-tree). This git.quinntyx.dev copy is the author's development fork — day-to-day churn lands here and is PR'd to GitHub on release. Install instructions below point at GitHub.
+
 This fork leaves user-message styling, the prompt editor, and footer/status UI to
 Pi or other extensions such as `pi-opencode-prompt`. The upstream user-message
 patch and spinner/working-message extension have been removed. After updating,
