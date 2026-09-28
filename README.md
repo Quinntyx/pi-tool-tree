@@ -10,11 +10,10 @@
 > **Experimental plugin.** Expect rendering bugs and breaking changes between versions.
 
 > [!NOTE]
-> **Attribution.** This project is a fork of the Claude Code-style tool rendering
-> work in [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff)
-> (published as [`pi-claude-code-ui`](https://www.npmjs.com/package/pi-claude-code-ui),
-> formerly `pi-claude-style-tools`). Without that groundwork none of this exists.
-> The canonical copy of this fork lives at
+> **Attribution.** This project is a fork of
+> [`pi-claude-code-ui`](https://www.npmjs.com/package/pi-claude-code-ui)
+> (formerly `pi-claude-style-tools`) — the Claude Code-style tool rendering for
+> pi. The canonical copy of this fork lives at
 > [github.com/Quinntyx/pi-tool-tree](https://github.com/Quinntyx/pi-tool-tree);
 > [git.quinntyx.dev/quinntyx/pi-tool-tree](https://git.quinntyx.dev/quinntyx/pi-tool-tree)
 > is the author's development fork where day-to-day work happens first.
